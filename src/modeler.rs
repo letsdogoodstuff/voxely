@@ -15,10 +15,13 @@ const FLOOR: u32 = 6;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
-    /// Corner position; w unused.
+    /// Corner position; w = corner within the face (bit 0 along the
+    /// face's first tangent, bit 1 along the second).
     pub pos: [u16; 4],
     /// Bits 0-2 face kind (+x -x +y -y +z -z floor), 8-15 color index,
-    /// 16-17 ambient occlusion (0 = fully occluded, 3 = open).
+    /// 16-17 ambient occlusion (0 = fully occluded, 3 = open), 18 selected,
+    /// 19-22 which face edges are outline edges (tangent 1 at 0 / 1,
+    /// tangent 2 at 0 / 1).
     pub data: u32,
 }
 
@@ -27,7 +30,7 @@ fn pack(kind: u32, color: u8, ao: u32) -> u32 {
 }
 
 /// Exposed faces of every voxel as triangles, plus the ground quad.
-pub fn build_mesh(v: &Volume) -> Vec<Vertex> {
+pub fn build_mesh(v: &Volume, sel: Option<&[bool]>) -> Vec<Vertex> {
     let mut out = Vec::new();
     let solid = |p: IVec3| v.get(p) != 0;
     for (i, &c) in v.cells.iter().enumerate() {
@@ -35,6 +38,7 @@ pub fn build_mesh(v: &Volume) -> Vec<Vertex> {
             continue;
         }
         let p = v.position(i);
+        let selected = (sel.is_some_and(|s| s[i]) as u32) << 18;
         for axis in 0..3 {
             for (side, sign) in [(0u32, 1), (1, -1)] {
                 let mut n = IVec3::ZERO;
@@ -54,12 +58,23 @@ pub fn build_mesh(v: &Volume) -> Vec<Vertex> {
                 }
                 let base = p + if sign > 0 { n } else { IVec3::ZERO };
                 let front = p + n;
+                // An edge is an outline unless the surface continues flat
+                // in the same color past it.
+                let mut edges = 0;
+                for (bit, d) in [(0, -eu), (1, eu), (2, -ew), (3, ew)] {
+                    let q = p + d;
+                    if !(v.get(q) == c && !solid(q + n)) {
+                        edges |= 1 << bit;
+                    }
+                }
+                let edges = edges << 19;
                 let verts = corners.map(|(a, b)| {
                     let (du, dw) = (eu * (2 * a - 1), ew * (2 * b - 1));
                     let (s1, s2, k) = (solid(front + du), solid(front + dw), solid(front + du + dw));
                     let ao = if s1 && s2 { 0 } else { 3 - (s1 as u32 + s2 as u32 + k as u32) };
                     let q = base + eu * a + ew * b;
-                    (Vertex { pos: [q.x as u16, q.y as u16, q.z as u16, 0], data: pack(axis as u32 * 2 + side, c, ao) }, ao)
+                    let corner = (a | b << 1) as u16;
+                    (Vertex { pos: [q.x as u16, q.y as u16, q.z as u16, corner], data: pack(axis as u32 * 2 + side, c, ao) | selected | edges }, ao)
                 });
                 // Split along the brighter diagonal so AO interpolates evenly.
                 let order = if verts[0].1 + verts[2].1 >= verts[1].1 + verts[3].1 { [0, 1, 2, 0, 2, 3] } else { [1, 2, 3, 1, 3, 0] };
@@ -77,6 +92,8 @@ pub fn build_mesh(v: &Volume) -> Vec<Vertex> {
 #[derive(Clone, Copy, Debug)]
 pub struct ModelerOptions {
     pub ao: bool,
+    /// Outline voxel edges where the surface changes [Edge].
+    pub edge: bool,
     pub grid: bool,
     pub constant: bool,
     pub frame: bool,
@@ -90,11 +107,12 @@ impl Default for ModelerOptions {
     fn default() -> Self {
         ModelerOptions {
             ao: true,
+            edge: false,
             grid: false,
             constant: false,
-            frame: true,
+            frame: false,
             bounds: true,
-            background: Vec3::new(0.32, 0.32, 0.34),
+            background: Vec3::new(0.17, 0.17, 0.17),
             // `ambient_color` from MagicaVoxel's config.txt.
             ambient: Vec3::new(0.19, 0.18, 0.26),
         }
@@ -111,6 +129,10 @@ struct Uniforms {
     grid: [f32; 4],
     floor: [f32; 4],
     opts: [f32; 4],
+    /// rgb outline color, w = outlines on.
+    edge: [f32; 4],
+    /// Bounding box line color (with alpha).
+    line: [f32; 4],
     palette: [[f32; 4]; 256],
 }
 
@@ -120,6 +142,10 @@ pub struct Modeler {
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     vertices: wgpu::Buffer,
+    /// Bounding box edges, depth-tested so voxels hide the back edges.
+    line_pipeline: wgpu::RenderPipeline,
+    line_bind_group: wgpu::BindGroup,
+    bounds: wgpu::Buffer,
     vertex_count: u32,
     palette: [[f32; 4]; 256],
     dims: Vec3,
@@ -163,6 +189,41 @@ impl Modeler {
             multiview_mask: None,
             cache: None,
         });
+        let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("modeler_lines"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_line"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Uint16x4, 1 => Uint32],
+                })],
+            },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_line"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("modeler_uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -174,13 +235,21 @@ impl Modeler {
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
         });
-        let (vertices, vertex_count) = vertex_buffer(device, volume);
+        let line_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("modeler_lines"),
+            layout: &line_pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
+        });
+        let (vertices, vertex_count) = vertex_buffer(device, volume, None);
         let mut m = Modeler {
             options: ModelerOptions::default(),
             pipeline,
             uniforms,
             bind_group,
             vertices,
+            line_pipeline,
+            line_bind_group,
+            bounds: bounds_buffer(device, volume.dims),
             vertex_count,
             palette: [[0.0; 4]; 256],
             dims: volume.dims.as_vec3(),
@@ -190,8 +259,11 @@ impl Modeler {
         m
     }
 
-    pub fn upload_volume(&mut self, device: &wgpu::Device, volume: &Volume) {
-        (self.vertices, self.vertex_count) = vertex_buffer(device, volume);
+    pub fn upload_volume(&mut self, device: &wgpu::Device, volume: &Volume, sel: Option<&[bool]>) {
+        (self.vertices, self.vertex_count) = vertex_buffer(device, volume, sel);
+        if volume.dims.as_vec3() != self.dims {
+            self.bounds = bounds_buffer(device, volume.dims);
+        }
         self.dims = volume.dims.as_vec3();
     }
 
@@ -237,8 +309,10 @@ impl Modeler {
             light: light.extend(0.0).to_array(),
             ambient: o.ambient.extend(0.0).to_array(),
             grid: [0.0, 0.0, 0.0, 0.75],
-            floor: (o.background * 0.8).extend(10.0).to_array(),
+            floor: (o.background * 1.25 + 0.02).extend(10.0).to_array(),
             opts: [o.grid as u32 as f32, o.ao as u32 as f32, o.constant as u32 as f32, o.frame as u32 as f32],
+            edge: [0.0, 0.0, 0.0, o.edge as u32 as f32],
+            line: [1.0, 1.0, 1.0, 0.45],
             palette: self.palette,
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
@@ -269,14 +343,44 @@ impl Modeler {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
-            pass.draw(0..self.vertex_count, 0..1);
+            // The ground quad (the last 6 vertices) shows with grid lines.
+            let n = if o.grid || o.frame { self.vertex_count } else { self.vertex_count - 6 };
+            pass.draw(0..n, 0..1);
+            if o.bounds {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_bind_group(0, &self.line_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.bounds.slice(..));
+                pass.draw(0..24, 0..1);
+            }
         }
         queue.submit([enc.finish()]);
     }
 }
 
-fn vertex_buffer(device: &wgpu::Device, volume: &Volume) -> (wgpu::Buffer, u32) {
-    let mesh = build_mesh(volume);
+/// The 12 edges of the canvas box as a line list.
+fn bounds_buffer(device: &wgpu::Device, dims: IVec3) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    let corner = |i: u32| {
+        let p = IVec3::new((i & 1) as i32, ((i >> 1) & 1) as i32, (i >> 2) as i32) * dims;
+        Vertex { pos: [p.x as u16, p.y as u16, p.z as u16, 0], data: 0 }
+    };
+    let mut lines = Vec::with_capacity(24);
+    for a in 0..8u32 {
+        for bit in [1, 2, 4] {
+            if a & bit == 0 {
+                lines.extend([corner(a), corner(a | bit)]);
+            }
+        }
+    }
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("modeler_bounds"),
+        contents: bytemuck::cast_slice(&lines),
+        usage: wgpu::BufferUsages::VERTEX,
+    })
+}
+
+fn vertex_buffer(device: &wgpu::Device, volume: &Volume, sel: Option<&[bool]>) -> (wgpu::Buffer, u32) {
+    let mesh = build_mesh(volume, sel);
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("modeler_mesh"),
         size: std::mem::size_of_val(mesh.as_slice()) as u64,
@@ -333,9 +437,9 @@ mod tests {
         let mut v = Volume::new(IVec3::new(3, 3, 3));
         let i = v.index(IVec3::ONE);
         v.set_index(i, 7);
-        let mesh = build_mesh(&v);
+        let mesh = build_mesh(&v, None);
         assert_eq!(mesh.len(), 6 * 6 + 6);
-        assert!(mesh[..36].iter().all(|m| m.data >> 16 == 3 && (m.data >> 8) & 255 == 7));
+        assert!(mesh[..36].iter().all(|m| (m.data >> 16) & 3 == 3 && (m.data >> 8) & 255 == 7));
     }
 
     #[test]
@@ -345,10 +449,10 @@ mod tests {
             let i = v.index(p);
             v.set_index(i, 1);
         }
-        let mesh = build_mesh(&v);
+        let mesh = build_mesh(&v, None);
         // 3 cubes, 18 faces, minus 2 shared pairs.
         assert_eq!(mesh.len(), (18 - 4) * 6 + 6);
         // The top of (2,1,0) touches the cube above (1,1,1) along one edge.
-        assert!(mesh.iter().any(|m| m.data & 7 == 4 && m.data >> 16 < 3));
+        assert!(mesh.iter().any(|m| m.data & 7 == 4 && (m.data >> 16) & 3 < 3));
     }
 }

@@ -11,6 +11,8 @@ use crate::scene::{GpuLight, GpuMaterial, Projection, RenderSettings, Scene, Vol
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 const PATHTRACE_WGSL: &str = include_str!("shaders/pathtrace.wgsl");
 const DISPLAY_WGSL: &str = include_str!("shaders/display.wgsl");
+/// Frames after loading during which a view resize re-frames the camera.
+const REFRAME_FRAMES: u32 = 3;
 
 /// Orbit camera around a target point, Z up like MagicaVoxel.
 #[derive(Clone, Copy, Debug)]
@@ -22,12 +24,17 @@ pub struct Camera {
 }
 
 impl Camera {
-    pub fn framing(dims: Vec3) -> Self {
+    /// A three-quarter view that fits the whole canvas in a view with the
+    /// given vertical field of view (degrees) and aspect ratio.
+    pub fn framing(dims: Vec3, fov: f32, aspect: f32) -> Self {
+        let half_v = fov.to_radians() * 0.5;
+        let half_h = (half_v.tan() * aspect).atan();
+        let radius = dims.length() * 0.5;
         Camera {
-            target: dims * Vec3::new(0.5, 0.5, 0.4),
+            target: dims * 0.5,
             yaw: 45f32.to_radians() + std::f32::consts::PI,
             pitch: 25f32.to_radians(),
-            dist: dims.length() * 1.4,
+            dist: radius / half_v.min(half_h).sin() * 1.05,
         }
     }
 
@@ -203,6 +210,9 @@ pub struct Renderer {
     pub modeler: Option<Modeler>,
     /// Show the modeler instead of the path tracer (F1).
     pub modeling: bool,
+    /// Canvas to re-frame if the view is resized within the next few
+    /// frames (the panels are laid out after a scene loads).
+    reframe: Option<(Vec3, u32)>,
 }
 
 fn compute_pipeline(device: &wgpu::Device, module: &wgpu::ShaderModule, entry: &str) -> wgpu::ComputePipeline {
@@ -301,7 +311,8 @@ impl Renderer {
             device,
             queue,
             settings: scene.settings.clone(),
-            camera: Camera::framing(v.dims.as_vec3()),
+            camera: Camera::framing(v.dims.as_vec3(), scene.settings.fov, width as f32 / height.max(1) as f32),
+            reframe: Some((v.dims.as_vec3(), REFRAME_FRAMES)),
             frame: 0,
             dims,
             light_count: scene.lights.len() as u32,
@@ -410,6 +421,28 @@ impl Renderer {
     pub fn set_viewport(&mut self, x: u32, y: u32, w: u32, h: u32) {
         self.offset = (x, y);
         self.resize(w, h);
+        if let Some((dims, _)) = self.reframe {
+            self.fit_camera(dims);
+        }
+    }
+
+    fn fit_camera(&mut self, dims: Vec3) {
+        let (w, h) = self.size();
+        self.camera = Camera::framing(dims, self.settings.fov, w as f32 / h.max(1) as f32);
+        self.reset();
+    }
+
+    /// Point the camera at a canvas of size `dims`, fitting it in the view.
+    pub fn frame(&mut self, dims: Vec3) {
+        self.fit_camera(dims);
+        self.reframe = Some((dims, REFRAME_FRAMES));
+    }
+
+    /// Use an explicit camera, cancelling any pending re-frame.
+    pub fn set_camera(&mut self, camera: Camera) {
+        self.camera = camera;
+        self.reframe = None;
+        self.reset();
     }
 
     pub fn viewport(&self) -> (u32, u32, u32, u32) {
@@ -423,10 +456,21 @@ impl Renderer {
         }
     }
 
-    /// Re-upload voxels after edits (dimensions must not change).
-    pub fn upload_volume(&mut self, v: &Volume) {
+    /// Re-upload voxels after edits, reallocating if the size changed.
+    /// `sel` marks selected cells for the modeler.
+    pub fn upload_volume(&mut self, v: &Volume, sel: Option<&[bool]>) {
         if let Some(m) = self.modeler.as_mut() {
-            m.upload_volume(&self.device, v);
+            m.upload_volume(&self.device, v, sel);
+        }
+        let dims = [v.dims.x as u32, v.dims.y as u32, v.dims.z as u32];
+        if dims != self.dims {
+            let bdims = [v.brick_dims.x as u32, v.brick_dims.y as u32, v.brick_dims.z as u32];
+            self.vox_tex = upload_3d(&self.device, &self.queue, "voxels", dims, &v.cells);
+            self.brick_tex = upload_3d(&self.device, &self.queue, "bricks", bdims, &v.bricks);
+            self.vox_view = self.vox_tex.create_view(&Default::default());
+            self.brick_view = self.brick_tex.create_view(&Default::default());
+            (self.dims, self.brick_dims) = (dims, bdims);
+            self.rebuild_targets(self.targets.width, self.targets.height);
         }
         write_3d(&self.queue, &self.vox_tex, self.dims, &v.cells);
         write_3d(&self.queue, &self.brick_tex, self.brick_dims, &v.bricks);
@@ -600,6 +644,24 @@ impl Renderer {
         }
     }
 
+    /// Refresh only the modeler's selection highlight.
+    pub fn upload_selection(&mut self, v: &Volume, sel: Option<&[bool]>) {
+        if let Some(m) = self.modeler.as_mut() {
+            m.upload_volume(&self.device, v, sel);
+        }
+    }
+
+    /// Show a different scene: voxels, materials, lights and settings.
+    pub fn load_scene(&mut self, scene: &Scene) {
+        self.settings = scene.settings.clone();
+        self.upload_volume(&scene.volume, None);
+        self.upload_materials(&scene.materials);
+        self.set_palette(&scene.palette);
+        self.set_lights(&scene.lights, scene.light_power);
+        self.frame(scene.volume.dims.as_vec3());
+        self.reset();
+    }
+
     pub fn set_palette(&mut self, palette: &[[u8; 4]]) {
         if let Some(m) = self.modeler.as_mut() {
             m.set_palette(palette);
@@ -614,6 +676,7 @@ impl Renderer {
     /// Draw the modeler, or accumulate samples and draw the tone-mapped
     /// path-traced image, into `view` (of size `target`).
     pub fn render_to_view(&mut self, view: &wgpu::TextureView, target: (u32, u32), samples: u32) {
+        self.reframe = self.reframe.and_then(|(d, n)| (n > 1).then_some((d, n - 1)));
         if self.modeling {
             if let Some(m) = self.modeler.as_mut() {
                 let viewport = (self.offset.0, self.offset.1, self.targets.width, self.targets.height);

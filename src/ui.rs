@@ -1,21 +1,71 @@
-//! Render settings panel, laid out like MagicaVoxel's render tabs
-//! (Light, Camera/Film, Sample, Display).
+//! The panels: file and brush controls with the palette on the left; in
+//! the modeler, MagicaVoxel's Edit / Selection / Canvas / Project / Display
+//! panels on the right, and in the renderer its render settings.
 
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use egui::{CollapsingHeader, ComboBox, Slider, Ui};
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
 use crate::edit::{Brush, Editor, Tool};
 use crate::env::EnvMode;
+use crate::modeler::ModelerOptions;
 use crate::scene::{GpuMaterial, MaterialKind, Projection, RenderSettings, Scene};
 
-/// Things the panel asks the app to do this frame.
+/// Whole-model edits (see `ops`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Op {
+    Full,
+    Fill,
+    Clear,
+    Reverse,
+    Double,
+    Half,
+    Flip(usize),
+    Rotate(usize),
+    /// Shrink the canvas to the model.
+    Fit,
+    /// Shift by one voxel along an axis, wrapping around.
+    Loop(usize, i32),
+    Mirror(usize),
+    Shape(crate::ops::Shape),
+    Hull,
+    Flood,
+    Dilate,
+    Erode,
+}
+
+/// Something a button or hotkey asks the app to do.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    New,
+    Open,
+    OpenPath(PathBuf),
+    Save,
+    SaveAs,
+    Undo,
+    Redo,
+    Op(Op),
+    SelectAll,
+    SelectNone,
+    SelectInvert,
+    Copy,
+    Cut,
+    Paste,
+    Resize(IVec3),
+    ResetCamera,
+    /// Center the camera on the selection, or the model [5].
+    Focus,
+    Snapshot,
+    /// Replace the palette with a 256x1 palette image.
+    LoadPalette(PathBuf),
+}
+
+/// Things the panels ask the app to do this frame.
 #[derive(Default)]
 pub struct Actions {
-    pub reset_camera: bool,
-    pub snapshot: bool,
+    pub commands: Vec<Command>,
     /// Area left between the panels for the 3D view, in points.
     pub viewport: Option<egui::Rect>,
 }
@@ -42,14 +92,10 @@ fn color(ui: &mut Ui, label: &str, c: &mut Vec3) {
     });
 }
 
-pub fn settings_panel(ui: &mut Ui, s: &mut RenderSettings, state: &PanelState, spp: u32, size: (u32, u32)) -> Actions {
-    let mut actions = Actions::default();
+pub fn settings_panel(ui: &mut Ui, s: &mut RenderSettings, state: &PanelState, spp: u32, size: (u32, u32), cmds: &mut Vec<Command>) {
     ui.horizontal(|ui| {
         ui.label(format!("{spp} spp · {}×{}", size.0, size.1));
-    });
-    ui.horizontal(|ui| {
-        actions.reset_camera = ui.button("Reset camera").clicked();
-        actions.snapshot = ui.button("Snapshot").clicked();
+        command(ui, cmds, "Snapshot", "6", Command::Snapshot);
     });
     ui.separator();
 
@@ -148,20 +194,24 @@ pub fn settings_panel(ui: &mut Ui, s: &mut RenderSettings, state: &PanelState, s
             color(ui, "Ground color", &mut s.ground_color);
         });
     });
-    actions
 }
 
 // ------------------------------------------------------------ editor panel
 
 
-/// What the editor panel changed or asked for this frame.
+/// What the editor panel changed this frame.
 #[derive(Default)]
 pub struct EditActions {
-    pub undo: bool,
-    pub redo: bool,
-    pub save: bool,
     /// Palette or material edits that need uploading.
     pub materials_changed: bool,
+}
+
+fn command(ui: &mut Ui, cmds: &mut Vec<Command>, label: &str, hint: &str, cmd: Command) {
+    let b = ui.button(label);
+    let b = if hint.is_empty() { b } else { b.on_hover_text(hint) };
+    if b.clicked() {
+        cmds.push(cmd);
+    }
 }
 
 const KINDS: [(MaterialKind, &str); 6] = [
@@ -201,56 +251,110 @@ fn material_editor(ui: &mut Ui, m: &mut GpuMaterial) {
     }
 }
 
-/// Left panel. Brushes only show in the modeler and materials only in the
-/// renderer, like MagicaVoxel's two modes.
-pub fn editor_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: bool) -> EditActions {
-    let mut a = EditActions::default();
-    if modeling {
-        brush_controls(ui, e);
-    }
-    ui.horizontal(|ui| {
-        a.undo = ui.add_enabled(e.can_undo(), egui::Button::new("Undo")).clicked();
-        a.redo = ui.add_enabled(e.can_redo(), egui::Button::new("Redo")).clicked();
-        a.save = ui.button("Save").on_hover_text("Ctrl+S").clicked();
-    });
+fn heading(ui: &mut Ui, text: &str) {
+    ui.vertical_centered(|ui| ui.label(egui::RichText::new(text).strong()));
     ui.separator();
-    palette_controls(ui, e, scene, modeling, &mut a);
-    a
 }
 
-fn brush_controls(ui: &mut Ui, e: &mut Editor) {
+/// Top bar: mode tabs, project name, history and file commands.
+pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, e: &Editor, cmds: &mut Vec<Command>) {
     ui.horizontal(|ui| {
-        ui.selectable_value(&mut e.tool, Tool::Attach, "Attach").on_hover_text("T");
-        ui.selectable_value(&mut e.tool, Tool::Erase, "Erase").on_hover_text("R");
-        ui.selectable_value(&mut e.tool, Tool::Paint, "Paint").on_hover_text("G");
+        ui.selectable_value(modeling, true, egui::RichText::new("Model").size(16.0)).on_hover_text("F1");
+        ui.selectable_value(modeling, false, egui::RichText::new("Render").size(16.0)).on_hover_text("F1");
+        ui.add_space(24.0);
+        ui.label(egui::RichText::new(name).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            command(ui, cmds, "Save As", "Ctrl+Shift+S", Command::SaveAs);
+            command(ui, cmds, "Save", "Ctrl+S", Command::Save);
+            command(ui, cmds, "Open", "Ctrl+O", Command::Open);
+            command(ui, cmds, "New", "Ctrl+P", Command::New);
+            ui.separator();
+            if ui.add_enabled(e.can_redo(), egui::Button::new("Redo")).on_hover_text("Ctrl+Y").clicked() {
+                cmds.push(Command::Redo);
+            }
+            if ui.add_enabled(e.can_undo(), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() {
+                cmds.push(Command::Undo);
+            }
+        });
     });
+}
+
+/// What the bottom bar shows and changes.
+pub struct Status<'a> {
+    pub options: Option<&'a mut ModelerOptions>,
+    /// Hovered voxel and its color index.
+    pub hover: Option<(IVec3, u8)>,
+    pub projection: &'a mut Projection,
+    pub iso: bool,
+    pub hint: &'a str,
+}
+
+/// Bottom bar: view toggles, hovered voxel, camera modes and a hint.
+/// Returns true when the isometric view was asked for.
+pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
+    let mut iso = false;
     ui.horizontal(|ui| {
-        ui.selectable_value(&mut e.brush, Brush::Voxel, "Voxel").on_hover_text("V");
-        ui.selectable_value(&mut e.brush, Brush::Face, "Face").on_hover_text("F");
-        ui.selectable_value(&mut e.brush, Brush::Box, "Box").on_hover_text("B");
-        ui.selectable_value(&mut e.brush, Brush::Line, "Line").on_hover_text("L");
-    });
-    ui.horizontal(|ui| {
-        ui.label("Mirror");
-        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-            ui.toggle_value(&mut e.mirror[i], *n).on_hover_text(format!("F{}", 5 + i));
+        if let Some(o) = s.options {
+            ui.toggle_value(&mut o.bounds, "BO").on_hover_text("Bounding box [Ctrl+B]");
+            ui.toggle_value(&mut o.edge, "Edge").on_hover_text("Voxel outlines [Ctrl+E]");
+            ui.toggle_value(&mut o.grid, "Grid").on_hover_text("Grid lines [Ctrl+G]");
+            ui.toggle_value(&mut o.frame, "Frame").on_hover_text("Ground frame lines [Ctrl+F]");
+            ui.toggle_value(&mut o.ao, "AO").on_hover_text("Ambient occlusion");
+            ui.separator();
         }
+        let field = |v: Option<i32>| v.map_or("-".to_string(), |v| v.to_string());
+        let (p, i) = match s.hover {
+            Some((p, i)) => (Some(p), Some(i as i32)),
+            None => (None, None),
+        };
+        ui.monospace(format!(
+            "x:{:<4} y:{:<4} z:{:<4} i:{:<4}",
+            field(p.map(|p| p.x)),
+            field(p.map(|p| p.y)),
+            field(p.map(|p| p.z)),
+            field(i)
+        ));
+        ui.separator();
+        let pers = *s.projection == Projection::Perspective;
+        if ui.selectable_label(pers, "Pers").clicked() {
+            *s.projection = Projection::Perspective;
+        }
+        if ui.selectable_label(!pers && !s.iso && *s.projection == Projection::Orthographic, "Orth").clicked() {
+            *s.projection = Projection::Orthographic;
+        }
+        iso = ui.selectable_label(s.iso, "Iso").on_hover_text("Isometric view").clicked();
+        command(ui, cmds, "Reset", "Reset camera [F12]", Command::ResetCamera);
+        ui.separator();
+        ui.weak(s.hint);
     });
-    ui.separator();
+    iso
 }
 
-fn palette_controls(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: bool, a: &mut EditActions) {
-
-    // Palette: 8 columns like MagicaVoxel, color index 1..=255.
-    let swatch = 16.0;
-    egui::Grid::new("palette").spacing([2.0, 2.0]).min_col_width(swatch).show(ui, |ui| {
+/// Left column: palette pages, swatches, the color editor, and in the
+/// renderer the material of the selected color.
+pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: bool, pages: &[PathBuf], cmds: &mut Vec<Command>) -> EditActions {
+    let mut a = EditActions::default();
+    heading(ui, "Palette");
+    if !pages.is_empty() {
+        ui.horizontal(|ui| {
+            for (k, p) in pages.iter().enumerate() {
+                let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if ui.small_button(k.to_string()).on_hover_text(format!("Load palette {name}")).clicked() {
+                    cmds.push(Command::LoadPalette(p.clone()));
+                }
+            }
+        });
+    }
+    // 8 columns like MagicaVoxel, color index 1..=255.
+    let swatch = 14.0;
+    egui::Grid::new("palette").spacing([1.0, 1.0]).min_col_width(swatch).show(ui, |ui| {
         for i in 1..=255usize {
             let p = scene.palette[i];
             let fill = egui::Color32::from_rgb(p[0], p[1], p[2]);
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(swatch, swatch), egui::Sense::click());
-            ui.painter().rect_filled(rect, 2.0, fill);
+            ui.painter().rect_filled(rect, 1.0, fill);
             if e.color as usize == i {
-                ui.painter().rect_stroke(rect.expand(1.0), 2.0, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
+                ui.painter().rect_stroke(rect.expand(1.0), 1.0, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
             }
             if resp.clicked() {
                 e.color = i as u8;
@@ -262,7 +366,6 @@ fn palette_controls(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: bo
         }
     });
     ui.separator();
-
     let i = e.color as usize;
     ui.horizontal(|ui| {
         let mut rgb = [scene.palette[i][0], scene.palette[i][1], scene.palette[i][2]];
@@ -271,7 +374,7 @@ fn palette_controls(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: bo
             scene.sync_color(i);
             a.materials_changed = true;
         }
-        ui.label(format!("Color #{i}"));
+        ui.label(format!("#{i}"));
     });
     if !modeling {
         let before = scene.materials[i];
@@ -280,27 +383,181 @@ fn palette_controls(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: bo
             a.materials_changed = true;
         }
     }
+    a
 }
 
-/// Right panel in the modeler: MagicaVoxel's modeler "Display" options.
-pub fn display_panel(ui: &mut Ui, o: &mut crate::modeler::ModelerOptions) -> Actions {
-    let mut actions = Actions::default();
-    ui.horizontal(|ui| {
-        actions.reset_camera = ui.button("Reset camera").on_hover_text("F12").clicked();
+/// Second left column in the modeler: brush, tool, selection tools and
+/// mirroring.
+pub fn brush_panel(ui: &mut Ui, e: &mut Editor) {
+    heading(ui, "Brush");
+    egui::Grid::new("brushes").num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
+        ui.selectable_value(&mut e.brush, Brush::Voxel, "Voxel").on_hover_text("V");
+        ui.selectable_value(&mut e.brush, Brush::Face, "Face").on_hover_text("F · drag to extrude");
+        ui.end_row();
+        ui.selectable_value(&mut e.brush, Brush::Box, "Box").on_hover_text("B");
+        ui.selectable_value(&mut e.brush, Brush::Line, "Line").on_hover_text("L");
+        ui.end_row();
     });
     ui.separator();
-    CollapsingHeader::new("Display").default_open(true).show(ui, |ui| {
-        ui.checkbox(&mut o.ao, "Ambient occlusion");
-        ui.checkbox(&mut o.grid, "Grid").on_hover_text("Ctrl+G");
-        ui.checkbox(&mut o.frame, "Frame").on_hover_text("Ctrl+F");
-        ui.checkbox(&mut o.bounds, "Bounding box").on_hover_text("Ctrl+B");
-        ui.checkbox(&mut o.constant, "Constant shading");
-        let mut bg = o.background.to_array();
-        ui.horizontal(|ui| {
-            ui.color_edit_button_rgb(&mut bg);
-            ui.label("Background");
-        });
-        o.background = bg.into();
+    ui.vertical_centered_justified(|ui| {
+        ui.selectable_value(&mut e.tool, Tool::Attach, "Attach").on_hover_text("T");
+        ui.selectable_value(&mut e.tool, Tool::Erase, "Erase").on_hover_text("R");
+        ui.selectable_value(&mut e.tool, Tool::Paint, "Paint").on_hover_text("G");
     });
-    actions
+    ui.separator();
+    egui::Grid::new("select_tools").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
+        ui.selectable_value(&mut e.tool, Tool::Move, "Move").on_hover_text("Drag the selection, or the model");
+        ui.selectable_value(&mut e.tool, Tool::Marquee, "Rect").on_hover_text("Marquee select [M] : Add [Shift] : Remove [Shift+Alt]");
+        ui.selectable_value(&mut e.tool, Tool::Region, "Region").on_hover_text("Region select [N] : Add [Shift] : Remove [Shift+Alt]");
+        ui.end_row();
+        ui.selectable_value(&mut e.tool, Tool::Pick, "Pick").on_hover_text("Pick voxel color [Alt+LButton]");
+        ui.selectable_value(&mut e.tool, Tool::RegionRemove, "Remove").on_hover_text("Region remove");
+        ui.selectable_value(&mut e.tool, Tool::RegionReplace, "Replace").on_hover_text("Region replace with the current color");
+        ui.end_row();
+    });
+    if matches!(e.tool, Tool::Region | Tool::RegionRemove | Tool::RegionReplace) {
+        ui.separator();
+        ui.label("Region");
+        let r = &mut e.region;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut r.same_color, true, "Color").on_hover_text("Same palette color, anywhere");
+            ui.selectable_value(&mut r.same_color, false, "Connected").on_hover_text("Connected region");
+        });
+        if !r.same_color {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut r.by_color, true, "Color").on_hover_text("Connect through the same color");
+                ui.selectable_value(&mut r.by_color, false, "Geo").on_hover_text("Connect through any voxel");
+            });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut r.diagonal, false, "4").on_hover_text("Connect through faces");
+                ui.selectable_value(&mut r.diagonal, true, "8").on_hover_text("Also connect through edges and corners");
+            });
+        }
+    }
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Mirror");
+        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+            ui.toggle_value(&mut e.mirror[i], *n).on_hover_text(format!("F{}", 5 + i));
+        }
+    });
+}
+
+fn axis_row(ui: &mut Ui, cmds: &mut Vec<Command>, op: fn(usize) -> Op) {
+    ui.horizontal(|ui| {
+        for (axis, n) in ["X", "Y", "Z"].iter().enumerate() {
+            command(ui, cmds, n, "", Command::Op(op(axis)));
+        }
+    });
+}
+
+/// Right column in the modeler: MagicaVoxel's Edit panel.
+pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, cmds: &mut Vec<Command>) {
+    use crate::ops::Shape;
+    heading(ui, "Edit");
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        CollapsingHeader::new("Tool").default_open(true).show(ui, |ui| {
+            egui::Grid::new("tool_ops").num_columns(2).show(ui, |ui| {
+                command(ui, cmds, "Full", "Fill the whole canvas [U]", Command::Op(Op::Full));
+                command(ui, cmds, "Fill", "Recolor voxels with the current color [I]", Command::Op(Op::Fill));
+                ui.end_row();
+                command(ui, cmds, "Clear", "Delete voxels [Delete]", Command::Op(Op::Clear));
+                command(ui, cmds, "Rev", "Swap empty and solid space", Command::Op(Op::Reverse));
+                ui.end_row();
+                command(ui, cmds, "2X", "Double size", Command::Op(Op::Double));
+                command(ui, cmds, "1/2", "Half size", Command::Op(Op::Half));
+                ui.end_row();
+            });
+        });
+        CollapsingHeader::new("Select").default_open(true).show(ui, |ui| {
+            ui.weak(match e.selected_count() {
+                0 => "nothing selected".to_string(),
+                n => format!("{n} selected"),
+            });
+            egui::Grid::new("select_ops").num_columns(2).show(ui, |ui| {
+                command(ui, cmds, "All", "Ctrl+A", Command::SelectAll);
+                command(ui, cmds, "Inv", "Ctrl+I", Command::SelectInvert);
+                ui.end_row();
+                command(ui, cmds, "None", "Ctrl+D", Command::SelectNone);
+                ui.end_row();
+                command(ui, cmds, "Copy", "Ctrl+C", Command::Copy);
+                command(ui, cmds, "Cut", "Ctrl+X", Command::Cut);
+                ui.end_row();
+                if ui.add_enabled(e.has_clipboard(), egui::Button::new("Paste")).on_hover_text("Ctrl+V").clicked() {
+                    cmds.push(Command::Paste);
+                }
+                ui.end_row();
+            });
+        });
+        CollapsingHeader::new("Rot").show(ui, |ui| axis_row(ui, cmds, Op::Rotate));
+        CollapsingHeader::new("Flip").show(ui, |ui| axis_row(ui, cmds, Op::Flip));
+        CollapsingHeader::new("Loop").show(ui, |ui| {
+            for (axis, n) in ["X", "Y", "Z"].iter().enumerate() {
+                ui.horizontal(|ui| {
+                    command(ui, cmds, &format!("-{n}"), "", Command::Op(Op::Loop(axis, -1)));
+                    command(ui, cmds, &format!("+{n}"), "", Command::Op(Op::Loop(axis, 1)));
+                });
+            }
+        });
+        CollapsingHeader::new("Mirror").show(ui, |ui| axis_row(ui, cmds, Op::Mirror));
+        CollapsingHeader::new("Shape").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                command(ui, cmds, "Sphere", "Add an ellipsoid filling the canvas", Command::Op(Op::Shape(Shape::Ellipsoid)));
+                command(ui, cmds, "Cyli", "Add a cylinder", Command::Op(Op::Shape(Shape::Cylinder)));
+                command(ui, cmds, "Cone", "Add a cone", Command::Op(Op::Shape(Shape::Cone)));
+            });
+        });
+        CollapsingHeader::new("Modify").show(ui, |ui| {
+            egui::Grid::new("modify_ops").num_columns(2).show(ui, |ui| {
+                command(ui, cmds, "Hull", "Remove all invisible voxels", Command::Op(Op::Hull));
+                command(ui, cmds, "Flood", "Fill all enclosed space", Command::Op(Op::Flood));
+                ui.end_row();
+                command(ui, cmds, "Dilate", "Grow by one voxel", Command::Op(Op::Dilate));
+                command(ui, cmds, "Erode", "Shrink by one voxel", Command::Op(Op::Erode));
+                ui.end_row();
+            });
+        });
+        CollapsingHeader::new("View").show(ui, |ui| {
+            ui.checkbox(&mut o.constant, "Constant shading");
+            let mut bg = o.background.to_array();
+            ui.horizontal(|ui| {
+                ui.color_edit_button_rgb(&mut bg);
+                ui.label("Background");
+            });
+            o.background = bg.into();
+        });
+    });
+}
+
+/// Far-right column in the modeler: the project list.
+pub fn project_panel(ui: &mut Ui, projects: &[PathBuf], current: &Path, cmds: &mut Vec<Command>) {
+    heading(ui, "Project");
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        if projects.is_empty() {
+            ui.weak("Open a .vox file to list its folder here");
+        }
+        for p in projects {
+            let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if ui.selectable_label(p == current, name).clicked() {
+                cmds.push(Command::OpenPath(p.clone()));
+            }
+        }
+    });
+}
+
+/// Strip above the 3D view: canvas size and fit.
+pub fn view_bar(ui: &mut Ui, dims: IVec3, canvas: &mut IVec3, cmds: &mut Vec<Command>) {
+    ui.horizontal(|ui| {
+        command(ui, cmds, "Fit", "Shrink the canvas to the model", Command::Op(Op::Fit));
+        ui.separator();
+        for axis in 0..3 {
+            ui.add(egui::DragValue::new(&mut canvas[axis]).range(1..=crate::ops::MAX_DIM));
+        }
+        if ui.add_enabled(*canvas != dims, egui::Button::new("Resize")).on_hover_text("Change the canvas size").clicked() {
+            cmds.push(Command::Resize(*canvas));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            command(ui, cmds, "Focus", "Center the view on the selection or model [5]", Command::Focus);
+        });
+    });
 }

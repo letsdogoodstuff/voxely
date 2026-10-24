@@ -12,6 +12,10 @@ struct U {
     floor: vec4<f32>,
     // x grid, y ambient occlusion, z constant shading, w frame lines.
     opts: vec4<f32>,
+    // rgb outline color, w = outlines on.
+    edge: vec4<f32>,
+    // Bounding box line color.
+    line: vec4<f32>,
     palette: array<vec4<f32>, 256>,
 }
 
@@ -22,6 +26,8 @@ struct VsOut {
     @location(0) pos: vec3<f32>,
     @location(1) ao: f32,
     @location(2) @interpolate(flat) data: u32,
+    // Position within the face, 0..1 along each tangent.
+    @location(3) local: vec2<f32>,
 }
 
 const NORMALS = array<vec3<f32>, 7>(
@@ -37,6 +43,7 @@ fn vs_main(@location(0) pos: vec4<u32>, @location(1) data: u32) -> VsOut {
     o.pos = vec3<f32>(pos.xyz);
     o.clip = u.view_proj * vec4<f32>(o.pos, 1.0);
     o.ao = f32((data >> 16u) & 3u) / 3.0;
+    o.local = vec2<f32>(f32(pos.w & 1u), f32((pos.w >> 1u) & 1u));
     o.data = data;
     return o;
 }
@@ -58,6 +65,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = vec2<f32>(dot(in.pos, n.zxy), dot(in.pos, n.yzx));
     // Derivatives must be taken in uniform control flow.
     let grad = screen_grad(uv);
+    let lgrad = max(fwidth(in.local), vec2<f32>(1e-6));
 
     if kind == 6u {
         var c = u.floor.rgb;
@@ -80,5 +88,36 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if u.opts.y > 0.0 {
         c *= mix(0.45, 1.0, in.ao);
     }
+    if u.edge.w > 0.0 {
+        // Distance in pixels to each outline edge of this face.
+        let e = (in.data >> 19u) & 15u;
+        let d0 = in.local / lgrad;
+        let d1 = (1.0 - in.local) / lgrad;
+        var d = 1e6;
+        if (e & 1u) != 0u { d = min(d, d0.x); }
+        if (e & 2u) != 0u { d = min(d, d1.x); }
+        if (e & 4u) != 0u { d = min(d, d0.y); }
+        if (e & 8u) != 0u { d = min(d, d1.y); }
+        c = mix(u.edge.rgb, c, smoothstep(0.5, 1.5, d) * 0.7 + 0.3);
+    }
+    if (in.data & (1u << 18u)) != 0u {
+        // Selected: tint toward the selection color and outline each voxel.
+        c = mix(c, vec3<f32>(0.25, 0.65, 1.0), 0.45);
+        c = mix(vec3<f32>(0.1, 0.35, 0.9), c, lines(uv, grad, 1.0));
+    }
     return vec4<f32>(c, 1.0);
+}
+
+// Bounding box edges. Pulled slightly toward the camera so edges lying on
+// voxel faces still show; voxels in front hide the rest.
+@vertex
+fn vs_line(@location(0) pos: vec4<u32>, @location(1) data: u32) -> @builtin(position) vec4<f32> {
+    var c = u.view_proj * vec4<f32>(vec3<f32>(pos.xyz), 1.0);
+    c.z -= 2e-4 * c.w;
+    return c;
+}
+
+@fragment
+fn fs_line() -> @location(0) vec4<f32> {
+    return u.line;
 }

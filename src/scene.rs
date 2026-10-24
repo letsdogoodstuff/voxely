@@ -12,6 +12,7 @@ use crate::vox::{Dict, Node, VoxFile};
 /// Edge length of the coarse occupancy bricks used to skip empty space.
 pub const BRICK: i32 = 8;
 
+#[derive(Clone)]
 pub struct Volume {
     pub dims: IVec3,
     /// Color index per cell, x-fastest then y then z.
@@ -44,6 +45,33 @@ impl Volume {
     pub fn position(&self, i: usize) -> IVec3 {
         let i = i as i32;
         IVec3::new(i % self.dims.x, (i / self.dims.x) % self.dims.y, i / (self.dims.x * self.dims.y))
+    }
+
+    /// A volume holding `cells` (x-fastest), with bricks computed.
+    pub fn from_cells(dims: IVec3, cells: Vec<u8>) -> Self {
+        let mut v = Volume::new(dims);
+        v.cells = cells;
+        v.refresh_bricks();
+        v
+    }
+
+    /// Recompute brick occupancy exactly (after bulk edits).
+    pub fn refresh_bricks(&mut self) {
+        self.bricks.fill(0);
+        for i in 0..self.cells.len() {
+            if self.cells[i] != 0 {
+                let b = self.position(i) / BRICK;
+                let bi = (b.x + self.brick_dims.x * (b.y + self.brick_dims.y * b.z)) as usize;
+                self.bricks[bi] = 1;
+            }
+        }
+    }
+
+    pub fn set(&mut self, p: IVec3, c: u8) {
+        if self.contains(p) {
+            let i = self.index(p);
+            self.set_index(i, c);
+        }
     }
 
     /// Color index at `p`, 0 outside the volume.

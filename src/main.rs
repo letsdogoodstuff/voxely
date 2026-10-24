@@ -3,6 +3,7 @@ mod edit;
 mod env;
 mod gpu;
 mod modeler;
+mod ops;
 mod scene;
 mod ui;
 mod vox;
@@ -19,7 +20,7 @@ const USAGE: &str = "\
 usage: voxely <model.vox> [options]
        voxely --new [<w>x<h>x<d>] [options]
 
-  --new [size]         start from an empty canvas (default 40x40x40)
+  --new [size]         start from a solid block (default 40x40x40)
   --out <file.vox>     where Ctrl+S saves (default export/<name>.vox)
 
   --render <out.png>   render offscreen and exit
@@ -36,13 +37,20 @@ usage: voxely <model.vox> [options]
   --cam <yaw>,<pitch>,<dist>[,<x>,<y>,<z>]
                        camera orbit in degrees/voxels, optional target
 
-editor controls (MagicaVoxel layout):
+editor controls (MagicaVoxel layout; Cmd works for Ctrl on macOS):
   left click/drag  use brush       right drag  orbit      wheel  zoom
   middle drag or space + left drag  pan                   F12    reset camera
+  W/A/S/D/Q/E move camera          Z + drag  zoom         X + click  focus point
+  5 focus selection  Ctrl+5 snap to axis    7/8 save/load camera
+  numpad 0-9 load camera slot, Ctrl+numpad saves it
   T attach  R erase  G paint       V voxel  F face  B box  L line
+  M marquee select  N region select  (Shift adds, Shift+Alt removes)
+  Ctrl+drag move selection         Ctrl+A/D/I select all/none/invert
+  Ctrl+C/X/V copy/cut/paste        U full  I fill  Delete clear
   F5/F6/F7 mirror x/y/z            1 / 2  previous/next color
-  Ctrl+Z undo  Ctrl+Y redo  Ctrl+S save   (Cmd works too on macOS)
-  F1 toggle editing (left drag orbits)    Tab  hide panels
+  Ctrl+Z undo  Ctrl+Y redo         Ctrl+S save  Ctrl+Shift+S save as
+  Ctrl+O open  Ctrl+P new          Ctrl+G grid  Ctrl+F frame  Ctrl+B bounds
+  F1 model/render                  Tab  hide panels
   arrows sun angle                 6  save a PNG snapshot to export/";
 
 #[derive(Default)]
@@ -140,7 +148,7 @@ fn parse_args() -> Result<Args> {
     }
     args.model = match (model, args.new) {
         (Some(m), _) => m,
-        (None, Some(_)) => PathBuf::from("untitled.vox"),
+        (None, Some(_)) => PathBuf::from("project.vox"),
         (None, None) => bail!("{USAGE}"),
     };
     Ok(args)
@@ -158,11 +166,23 @@ fn find_ibl(model: &Path) -> Option<PathBuf> {
     hdrs.into_iter().next()
 }
 
+/// Load a `.vox` file for the editor's Open command.
+pub fn open_vox(path: &Path) -> Result<Scene> {
+    let mut scene = Scene::from_vox(&vox::VoxFile::load(path)?)?;
+    scene.settings.ibl_path = find_ibl(path);
+    Ok(scene)
+}
+
 fn load_scene(args: &Args) -> Result<Scene> {
     let path = args.model.as_path();
     let t = std::time::Instant::now();
     let mut scene = match args.new {
-        Some(dims) => Scene::empty(dims),
+        Some(dims) => {
+            // A solid block to carve into, like MagicaVoxel's New.
+            let mut scene = Scene::empty(dims);
+            scene.volume = ops::full(&scene.volume, 1);
+            scene
+        }
         None => Scene::from_vox(&vox::VoxFile::load(path)?)?,
     };
     let s = &mut scene.settings;
@@ -207,12 +227,14 @@ pub fn save_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
 
 fn apply_cam(r: &mut Renderer, args: &Args) {
     if let Some(c) = &args.cam {
-        r.camera.yaw = c[0].to_radians();
-        r.camera.pitch = c[1].to_radians();
-        r.camera.dist = c[2];
+        let mut cam = r.camera;
+        cam.yaw = c[0].to_radians();
+        cam.pitch = c[1].to_radians();
+        cam.dist = c[2];
         if c.len() == 6 {
-            r.camera.target = glam::Vec3::new(c[3], c[4], c[5]);
+            cam.target = glam::Vec3::new(c[3], c[4], c[5]);
         }
+        r.set_camera(cam);
     }
 }
 
@@ -255,7 +277,8 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
     let ctx = egui::Context::default();
     let ppp = 2.0;
     let panel = ui::PanelState { ibl_files: list_ibl(&args.model, scene.settings.ibl_path.as_ref()) };
-    let mut ed = app::EditState { editor: edit::Editor::new(1), hover: None, enabled: r.modeling, save_path: PathBuf::new() };
+    let mut ed = app::EditState::new(1, Some(args.model.clone()), PathBuf::new());
+    ed.enabled = r.modeling;
     let mut out = None;
     // A few passes so layout and fonts settle; textures upload every pass.
     // The 3D view is fitted between the panels, then rendered.
@@ -351,13 +374,13 @@ fn main() -> Result<()> {
     if let Some(p) = &args.ui_shot {
         return ui_snapshot(&args, &mut scene, p);
     }
-    let name = args.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled.vox".into());
-    let save_path = args.out.clone().unwrap_or_else(|| PathBuf::from("export").join(&name));
+    let source = args.new.is_none().then(|| args.model.clone());
+    let save_path = args.out.clone().unwrap_or_else(|| app::default_save_path(source.as_deref()));
     println!("Ctrl+S saves to {}", save_path.display());
     let panel = ui::PanelState { ibl_files: list_ibl(&args.model, scene.settings.ibl_path.as_ref()) };
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = app::App::new(scene, format!("voxely — {name}"), panel, save_path);
+    let mut app = app::App::new(scene, panel, source, save_path);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
