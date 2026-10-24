@@ -7,6 +7,7 @@ mod ops;
 mod scene;
 mod ui;
 mod vox;
+mod xs;
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,8 @@ usage: voxely <model.vox> [options]
 
   --new [size]         start from a solid block (default 40x40x40)
   --out <file.vox>     where Ctrl+S saves (default export/<name>.vox)
+  --xs <shader.txt>    apply a MagicaVoxel voxel shader to the model first
+  --xs-args <a,b,..>   argument values for --xs (default: the file's)
 
   --render <out.png>   render offscreen and exit
   --spp <n>            samples per pixel for --render (default 256)
@@ -74,6 +77,8 @@ struct Args {
     blades: Option<u32>,
     new: Option<glam::IVec3>,
     out: Option<PathBuf>,
+    xs: Option<PathBuf>,
+    xs_args: Vec<f32>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -122,6 +127,8 @@ fn parse_args() -> Result<Args> {
             "--dof" => args.dof = Some(val()?.parse()?),
             "--blades" => args.blades = Some(val()?.parse()?),
             "--out" => args.out = Some(PathBuf::from(val()?)),
+            "--xs" => args.xs = Some(PathBuf::from(val()?)),
+            "--xs-args" => args.xs_args = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
             "--new" => args.new = Some(glam::IVec3::splat(40)),
             "--cam" => {
                 let v: Vec<f32> = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?;
@@ -251,6 +258,18 @@ fn render_headless(args: &Args, scene: &Scene) -> Result<()> {
     Ok(())
 }
 
+/// Run a voxel shader over the loaded model (color index 1, no selection).
+fn apply_xs(scene: &mut Scene, path: &Path, values: &[f32]) -> Result<()> {
+    let shader = xs::XsShader::load(path)?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let (_adapter, device, queue) = pollster::block_on(gpu::request_device(&instance, None))?;
+    let t = std::time::Instant::now();
+    scene.volume = xs::run(&device, &queue, &shader, values, &scene.volume, &scene.palette, 1, &[])?;
+    let filled = scene.volume.cells.iter().filter(|&&c| c != 0).count();
+    log::info!("xs {}: {filled} voxels in {:.1?}", shader.name, t.elapsed());
+    Ok(())
+}
+
 /// Debug aid: render the scene plus the editor and settings panels
 /// offscreen, as the window would show them, and save a PNG. The brush
 /// preview is shown for the voxel under the image center.
@@ -368,6 +387,9 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("voxely=info,wgpu=warn")).init();
     let args = parse_args()?;
     let mut scene = load_scene(&args)?;
+    if let Some(p) = &args.xs {
+        apply_xs(&mut scene, p, &args.xs_args)?;
+    }
     if args.render.is_some() {
         return render_headless(&args, &scene);
     }
