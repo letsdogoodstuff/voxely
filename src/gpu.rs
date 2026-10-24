@@ -1,0 +1,690 @@
+//! wgpu host side of the path tracer: device setup, scene upload,
+//! progressive accumulation, bloom and tone-mapped output.
+
+use anyhow::{Context, Result};
+use glam::Vec3;
+
+use crate::env::{self, EnvMap};
+use crate::modeler::Modeler;
+use crate::scene::{GpuLight, GpuMaterial, Projection, RenderSettings, Scene, Volume};
+
+const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
+const PATHTRACE_WGSL: &str = include_str!("shaders/pathtrace.wgsl");
+const DISPLAY_WGSL: &str = include_str!("shaders/display.wgsl");
+
+/// Orbit camera around a target point, Z up like MagicaVoxel.
+#[derive(Clone, Copy, Debug)]
+pub struct Camera {
+    pub target: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub dist: f32,
+}
+
+impl Camera {
+    pub fn framing(dims: Vec3) -> Self {
+        Camera {
+            target: dims * Vec3::new(0.5, 0.5, 0.4),
+            yaw: 45f32.to_radians() + std::f32::consts::PI,
+            pitch: 25f32.to_radians(),
+            dist: dims.length() * 1.4,
+        }
+    }
+
+    pub fn eye(&self) -> Vec3 {
+        let d = Vec3::new(
+            self.pitch.cos() * self.yaw.cos(),
+            self.pitch.cos() * self.yaw.sin(),
+            self.pitch.sin(),
+        );
+        self.target + d * self.dist
+    }
+
+    /// (forward, right, up)
+    pub fn basis(&self) -> (Vec3, Vec3, Vec3) {
+        let fwd = (self.target - self.eye()).normalize();
+        let right = fwd.cross(Vec3::Z).normalize();
+        let up = right.cross(fwd);
+        (fwd, right, up)
+    }
+}
+
+/// Must match `Params` in common.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Params {
+    cam_pos: [f32; 4],
+    cam_fwd: [f32; 4],
+    cam_right: [f32; 4],
+    cam_up: [f32; 4],
+    sun_dir: [f32; 4],
+    sun_col: [f32; 4],
+    fog: [f32; 4],
+    ground_col: [f32; 4],
+    film: [f32; 4],
+    misc: [f32; 4],
+    bloom: [f32; 4],
+    dims: [u32; 4],
+    frame: [u32; 4],
+    env: [u32; 4],
+    lens: [f32; 4],
+    view: [f32; 4],
+}
+
+fn storage_buffer(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data: &[u8]) -> wgpu::Buffer {
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: data.len().max(16) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buf, 0, data);
+    buf
+}
+
+fn scratch_buffer(device: &wgpu::Device, label: &str, size: u64, extra: wgpu::BufferUsages) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size.max(16),
+        usage: wgpu::BufferUsages::STORAGE | extra,
+        mapped_at_creation: false,
+    })
+}
+
+fn write_3d(queue: &wgpu::Queue, tex: &wgpu::Texture, dims: [u32; 3], data: &[u8]) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        data,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(dims[0]), rows_per_image: Some(dims[1]) },
+        wgpu::Extent3d { width: dims[0], height: dims[1], depth_or_array_layers: dims[2] },
+    );
+}
+
+fn upload_3d(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, dims: [u32; 3], data: &[u8]) -> wgpu::Texture {
+    let size = wgpu::Extent3d { width: dims[0], height: dims[1], depth_or_array_layers: dims[2] };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    write_3d(queue, &tex, dims, data);
+    tex
+}
+
+pub async fn request_device(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: surface,
+            ..Default::default()
+        })
+        .await
+        .context("no GPU adapter")?;
+    log::info!("adapter: {:?}", adapter.get_info().name);
+    let limits = adapter.limits();
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("voxely"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits {
+                max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+                max_buffer_size: limits.max_buffer_size,
+                max_texture_dimension_3d: limits.max_texture_dimension_3d,
+                max_storage_buffers_per_shader_stage: limits.max_storage_buffers_per_shader_stage.min(16),
+                ..wgpu::Limits::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    Ok((adapter, device, queue))
+}
+
+struct Pipelines {
+    trace: wgpu::ComputePipeline,
+    bloom_down: wgpu::ComputePipeline,
+    bloom_h: wgpu::ComputePipeline,
+    bloom_v: wgpu::ComputePipeline,
+    resolve: wgpu::ComputePipeline,
+    display: Option<wgpu::RenderPipeline>,
+}
+
+/// Resolution-dependent buffers and every bind group (which reference them).
+struct Targets {
+    width: u32,
+    height: u32,
+    out: wgpu::Buffer,
+    trace_bg: wgpu::BindGroup,
+    bloom_down_bg: wgpu::BindGroup,
+    bloom_h_bg: wgpu::BindGroup,
+    bloom_v_bg: wgpu::BindGroup,
+    resolve_bg: wgpu::BindGroup,
+    display_bg: Option<wgpu::BindGroup>,
+}
+
+pub struct Renderer {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub settings: RenderSettings,
+    pub camera: Camera,
+    /// Samples accumulated since the last reset.
+    pub frame: u32,
+    dims: [u32; 3],
+    light_count: u32,
+    light_power: f32,
+    params: wgpu::Buffer,
+    vox_tex: wgpu::Texture,
+    brick_tex: wgpu::Texture,
+    brick_dims: [u32; 3],
+    vox_view: wgpu::TextureView,
+    brick_view: wgpu::TextureView,
+    materials: wgpu::Buffer,
+    lights: wgpu::Buffer,
+    env_texels: wgpu::Buffer,
+    env_cdf: wgpu::Buffer,
+    env_size: (u32, u32),
+    /// Settings the current environment map was baked from.
+    env_key: String,
+    /// Sun color after atmospheric extinction.
+    sun_tint: Vec3,
+    /// Top-left of the image within the window, in pixels.
+    offset: (u32, u32),
+    pipelines: Pipelines,
+    targets: Targets,
+    /// Rasterized editing view (window renders only).
+    pub modeler: Option<Modeler>,
+    /// Show the modeler instead of the path tracer (F1).
+    pub modeling: bool,
+}
+
+fn compute_pipeline(device: &wgpu::Device, module: &wgpu::ShaderModule, entry: &str) -> wgpu::ComputePipeline {
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(entry),
+        layout: None,
+        module,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+fn bind_group(device: &wgpu::Device, label: &str, layout: &wgpu::BindGroupLayout, entries: &[(u32, wgpu::BindingResource)]) -> wgpu::BindGroup {
+    let entries: Vec<_> = entries
+        .iter()
+        .map(|(binding, resource)| wgpu::BindGroupEntry { binding: *binding, resource: resource.clone() })
+        .collect();
+    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
+}
+
+impl Renderer {
+    /// `surface_format` is `Some` when rendering to a window.
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        scene: &Scene,
+        surface_format: Option<wgpu::TextureFormat>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let v = &scene.volume;
+        let dims = [v.dims.x as u32, v.dims.y as u32, v.dims.z as u32];
+        let bdims = [v.brick_dims.x as u32, v.brick_dims.y as u32, v.brick_dims.z as u32];
+        let vox_tex = upload_3d(&device, &queue, "voxels", dims, &v.cells);
+        let brick_tex = upload_3d(&device, &queue, "bricks", bdims, &v.bricks);
+        let vox_view = vox_tex.create_view(&Default::default());
+        let brick_view = brick_tex.create_view(&Default::default());
+        let materials = storage_buffer(&device, &queue, "materials", bytemuck::cast_slice(&scene.materials));
+        let lights_data: &[GpuLight] = if scene.lights.is_empty() { &[GpuLight { corner_cdf: [0.0; 4], axis_sign_mat: [0; 4] }] } else { &scene.lights };
+        let lights = storage_buffer(&device, &queue, "lights", bytemuck::cast_slice(lights_data));
+        log::info!("{} emissive faces", scene.lights.len());
+        let modeler = surface_format.map(|f| Modeler::new(&device, f, v, &scene.palette));
+
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("params"),
+            size: std::mem::size_of::<Params>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let trace_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("pathtrace"),
+            source: wgpu::ShaderSource::Wgsl(format!("{COMMON_WGSL}\n{PATHTRACE_WGSL}").into()),
+        });
+        let post_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("display"),
+            source: wgpu::ShaderSource::Wgsl(format!("{COMMON_WGSL}\n{DISPLAY_WGSL}").into()),
+        });
+        let pipelines = Pipelines {
+            trace: compute_pipeline(&device, &trace_module, "main"),
+            bloom_down: compute_pipeline(&device, &post_module, "bloom_down"),
+            bloom_h: compute_pipeline(&device, &post_module, "bloom_h"),
+            bloom_v: compute_pipeline(&device, &post_module, "bloom_v"),
+            resolve: compute_pipeline(&device, &post_module, "resolve"),
+            display: surface_format.map(|format| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("display"),
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &post_module,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &post_module,
+                        entry_point: Some("fs_main"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(format.into())],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            }),
+        };
+
+        // Placeholders until the first environment bake.
+        let env_texels = storage_buffer(&device, &queue, "env", &[0; 16]);
+        let env_cdf = storage_buffer(&device, &queue, "env_cdf", &[0; 16]);
+        let targets = Self::placeholder_targets(&device, &pipelines, &params, &vox_view, &brick_view, &materials, &lights, &env_texels, &env_cdf, width, height);
+        let mut r = Renderer {
+            device,
+            queue,
+            settings: scene.settings.clone(),
+            camera: Camera::framing(v.dims.as_vec3()),
+            frame: 0,
+            dims,
+            light_count: scene.lights.len() as u32,
+            light_power: scene.light_power,
+            params,
+            vox_tex,
+            brick_tex,
+            brick_dims: bdims,
+            vox_view,
+            brick_view,
+            materials,
+            lights,
+            env_texels,
+            env_cdf,
+            env_size: (1, 1),
+            env_key: String::new(),
+            sun_tint: Vec3::ONE,
+            offset: (0, 0),
+            pipelines,
+            targets,
+            modeling: modeler.is_some(),
+            modeler,
+        };
+        r.update_env();
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn placeholder_targets(
+        device: &wgpu::Device,
+        p: &Pipelines,
+        params: &wgpu::Buffer,
+        vox_view: &wgpu::TextureView,
+        brick_view: &wgpu::TextureView,
+        materials: &wgpu::Buffer,
+        lights: &wgpu::Buffer,
+        env_texels: &wgpu::Buffer,
+        env_cdf: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+    ) -> Targets {
+        let pixels = (width * height) as u64;
+        let bloom_pixels = (width.div_ceil(4) * height.div_ceil(4)) as u64;
+        let accum = scratch_buffer(device, "accum", pixels * 16, wgpu::BufferUsages::empty());
+        let out = scratch_buffer(device, "out_rgba", pixels * 4, wgpu::BufferUsages::COPY_SRC);
+        let bloom_a = scratch_buffer(device, "bloom_a", bloom_pixels * 16, wgpu::BufferUsages::empty());
+        let bloom_b = scratch_buffer(device, "bloom_b", bloom_pixels * 16, wgpu::BufferUsages::empty());
+
+        let trace_bg = bind_group(
+            device,
+            "trace",
+            &p.trace.get_bind_group_layout(0),
+            &[
+                (0, params.as_entire_binding()),
+                (1, wgpu::BindingResource::TextureView(vox_view)),
+                (2, wgpu::BindingResource::TextureView(brick_view)),
+                (3, materials.as_entire_binding()),
+                (4, accum.as_entire_binding()),
+                (5, env_texels.as_entire_binding()),
+                (6, env_cdf.as_entire_binding()),
+                (7, lights.as_entire_binding()),
+            ],
+        );
+        let post = |pipe_layout: wgpu::BindGroupLayout, label: &str, bindings: &[u32]| {
+            let all = [
+                (0, params.as_entire_binding()),
+                (1, accum.as_entire_binding()),
+                (2, out.as_entire_binding()),
+                (3, bloom_a.as_entire_binding()),
+                (4, bloom_b.as_entire_binding()),
+            ];
+            let picked: Vec<_> = all.into_iter().filter(|(b, _)| bindings.contains(b)).collect();
+            bind_group(device, label, &pipe_layout, &picked)
+        };
+        Targets {
+            width,
+            height,
+            bloom_down_bg: post(p.bloom_down.get_bind_group_layout(0), "bloom_down", &[0, 1, 3]),
+            bloom_h_bg: post(p.bloom_h.get_bind_group_layout(0), "bloom_h", &[0, 3, 4]),
+            bloom_v_bg: post(p.bloom_v.get_bind_group_layout(0), "bloom_v", &[0, 3, 4]),
+            resolve_bg: post(p.resolve.get_bind_group_layout(0), "resolve", &[0, 1, 2, 3]),
+            display_bg: p.display.as_ref().map(|d| post(d.get_bind_group_layout(0), "display", &[0, 1, 3])),
+            out,
+            trace_bg,
+        }
+    }
+
+    fn rebuild_targets(&mut self, width: u32, height: u32) {
+        self.targets = Self::placeholder_targets(
+            &self.device,
+            &self.pipelines,
+            &self.params,
+            &self.vox_view,
+            &self.brick_view,
+            &self.materials,
+            &self.lights,
+            &self.env_texels,
+            &self.env_cdf,
+            width,
+            height,
+        );
+        self.reset();
+    }
+
+    /// Render into the window rectangle at (`x`, `y`) of size `w` x `h`.
+    pub fn set_viewport(&mut self, x: u32, y: u32, w: u32, h: u32) {
+        self.offset = (x, y);
+        self.resize(w, h);
+    }
+
+    pub fn viewport(&self) -> (u32, u32, u32, u32) {
+        (self.offset.0, self.offset.1, self.targets.width, self.targets.height)
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        let (width, height) = (width.max(1), height.max(1));
+        if width != self.targets.width || height != self.targets.height {
+            self.rebuild_targets(width, height);
+        }
+    }
+
+    /// Re-upload voxels after edits (dimensions must not change).
+    pub fn upload_volume(&mut self, v: &Volume) {
+        if let Some(m) = self.modeler.as_mut() {
+            m.upload_volume(&self.device, v);
+        }
+        write_3d(&self.queue, &self.vox_tex, self.dims, &v.cells);
+        write_3d(&self.queue, &self.brick_tex, self.brick_dims, &v.bricks);
+        self.reset();
+    }
+
+    pub fn upload_materials(&mut self, mats: &[GpuMaterial]) {
+        self.queue.write_buffer(&self.materials, 0, bytemuck::cast_slice(mats));
+        self.reset();
+    }
+
+    pub fn set_lights(&mut self, lights: &[GpuLight], power: f32) {
+        let data: &[GpuLight] = if lights.is_empty() { &[GpuLight { corner_cdf: [0.0; 4], axis_sign_mat: [0; 4] }] } else { lights };
+        self.lights = storage_buffer(&self.device, &self.queue, "lights", bytemuck::cast_slice(data));
+        self.light_count = lights.len() as u32;
+        self.light_power = power;
+        self.rebuild_targets(self.targets.width, self.targets.height);
+    }
+
+    /// World-space ray through pixel (`x`, `y`) of the image, matching the
+    /// shader for perspective and orthographic projections.
+    pub fn camera_ray(&self, x: f32, y: f32) -> (Vec3, Vec3) {
+        let (w, h) = (self.targets.width as f32, self.targets.height as f32);
+        let (x, y) = (x - self.offset.0 as f32, y - self.offset.1 as f32);
+        let ndc = (x / w * 2.0 - 1.0, 1.0 - y / h * 2.0);
+        let (fwd, right, up) = self.camera.basis();
+        let tan_half = (self.settings.fov.to_radians() * 0.5).tan();
+        let aspect = w / h;
+        let eye = self.camera.eye();
+        if self.settings.projection == Projection::Orthographic {
+            let half = self.camera.dist * tan_half;
+            return (eye + (right * ndc.0 * aspect + up * ndc.1) * half, fwd);
+        }
+        (eye, (fwd + right * ndc.0 * tan_half * aspect + up * ndc.1 * tan_half).normalize())
+    }
+
+    /// Pixel position of a world point, if it is in front of the camera.
+    pub fn project(&self, p: Vec3) -> Option<(f32, f32)> {
+        let (w, h) = (self.targets.width as f32, self.targets.height as f32);
+        let (fwd, right, up) = self.camera.basis();
+        let tan_half = (self.settings.fov.to_radians() * 0.5).tan();
+        let aspect = w / h;
+        let d = p - self.camera.eye();
+        let z = d.dot(fwd);
+        let (x, y) = if self.settings.projection == Projection::Orthographic {
+            let half = self.camera.dist * tan_half;
+            (d.dot(right) / (half * aspect), d.dot(up) / half)
+        } else {
+            if z <= 1e-3 {
+                return None;
+            }
+            (d.dot(right) / (z * tan_half * aspect), d.dot(up) / (z * tan_half))
+        };
+        Some(((x + 1.0) * 0.5 * w + self.offset.0 as f32, (1.0 - y) * 0.5 * h + self.offset.1 as f32))
+    }
+
+    /// Restart accumulation (after the camera or settings change).
+    pub fn reset(&mut self) {
+        self.frame = 0;
+    }
+
+    /// Re-bake the environment map if any setting it depends on changed.
+    fn update_env(&mut self) {
+        let s = &self.settings;
+        let key = format!(
+            "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            s.env_mode,
+            s.ibl_path,
+            s.ibl_intensity,
+            s.ibl_rotation,
+            s.sky_color,
+            s.sky_intensity,
+            s.rayleigh_density,
+            s.rayleigh_color,
+            s.mie_density,
+            s.mie_color,
+            s.mie_g,
+            s.ozone_density,
+            s.ozone_color,
+            s.sun_color,
+            s.sun_intensity,
+            if s.env_mode == env::EnvMode::Atmosphere { format!("{}/{}", s.sun_pitch, s.sun_yaw) } else { String::new() },
+        );
+        if key == self.env_key {
+            return;
+        }
+        let t = std::time::Instant::now();
+        let map = EnvMap::from_settings(s);
+        self.sun_tint = env::sun_transmittance(s);
+        log::debug!("environment {}x{} baked in {:.1?}", map.width, map.height, t.elapsed());
+        self.env_texels = storage_buffer(&self.device, &self.queue, "env", bytemuck::cast_slice(&map.texels));
+        self.env_cdf = storage_buffer(&self.device, &self.queue, "env_cdf", bytemuck::cast_slice(&map.cdf));
+        self.env_size = (map.width, map.height);
+        self.env_key = key;
+        self.rebuild_targets(self.targets.width, self.targets.height);
+    }
+
+    fn write_params(&self) {
+        let s = &self.settings;
+        let c = &self.camera;
+        let (fwd, right, up) = c.basis();
+        let eye = c.eye();
+        let t = &self.targets;
+        let sun_dir = s.sun_dir();
+        let sun = s.sun_color * s.sun_intensity * 3.0 * self.sun_tint;
+        let fog_range = Vec3::new(self.dims[0] as f32, self.dims[1] as f32, self.dims[2] as f32).length() * 4.0;
+        let bloom_mix = if s.bloom { s.bloom_mix } else { 0.0 };
+        let p = Params {
+            cam_pos: [eye.x, eye.y, eye.z, (s.fov.to_radians() * 0.5).tan()],
+            // Lens radius scales with the focus distance so the blur amount
+            // reads the same at any zoom.
+            cam_fwd: [fwd.x, fwd.y, fwd.z, s.aperture * c.dist * 0.05],
+            cam_right: [right.x, right.y, right.z, c.dist],
+            cam_up: [up.x, up.y, up.z, t.width as f32 / t.height as f32],
+            sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z, s.sun_area.max(1e-4).cos()],
+            sun_col: [sun.x, sun.y, sun.z, s.sun_disk as u32 as f32],
+            fog: [s.fog_color.x, s.fog_color.y, s.fog_color.z, s.fog_density * 0.01],
+            ground_col: [s.ground_color.x, s.ground_color.y, s.ground_color.z, s.ground as u32 as f32],
+            film: [s.exposure, s.gamma, s.aces as u32 as f32, s.vignette],
+            misc: [s.clamp, self.light_power.max(1e-6), s.fog_g, fog_range],
+            bloom: [bloom_mix, s.bloom_scale, s.bloom_aspect, s.bloom_threshold],
+            dims: [self.dims[0], self.dims[1], self.dims[2], s.translucent_shadows as u32],
+            frame: [self.frame, t.width, t.height, s.max_diffuse | (s.max_specular << 8) | (s.max_scatter << 16)],
+            env: [self.env_size.0, self.env_size.1, self.light_count, 0],
+            lens: [s.projection as u32 as f32, s.blades as f32, s.blade_rotation.to_radians(), 0.0],
+            view: [self.offset.0 as f32, self.offset.1 as f32, 0.0, 0.0],
+        };
+        self.queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.targets.width, self.targets.height)
+    }
+
+    /// Submit `samples` path-tracing passes.
+    fn trace(&mut self, samples: u32) {
+        self.update_env();
+        let groups = (self.targets.width.div_ceil(8), self.targets.height.div_ceil(8));
+        for _ in 0..samples {
+            // Each sample needs its own frame index in the uniform buffer, so
+            // submit one pass per sample.
+            self.write_params();
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("pathtrace"), timestamp_writes: None });
+                pass.set_pipeline(&self.pipelines.trace);
+                pass.set_bind_group(0, &self.targets.trace_bg, &[]);
+                pass.dispatch_workgroups(groups.0, groups.1, 1);
+            }
+            self.queue.submit([enc.finish()]);
+            self.frame += 1;
+        }
+    }
+
+    /// Record the bloom passes if bloom is on.
+    fn encode_bloom(&self, enc: &mut wgpu::CommandEncoder) {
+        if !self.settings.bloom || self.settings.bloom_mix <= 0.0 {
+            return;
+        }
+        let t = &self.targets;
+        let groups = (t.width.div_ceil(4).div_ceil(8), t.height.div_ceil(4).div_ceil(8));
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bloom"), timestamp_writes: None });
+        for (pipe, bg) in [
+            (&self.pipelines.bloom_down, &t.bloom_down_bg),
+            (&self.pipelines.bloom_h, &t.bloom_h_bg),
+            (&self.pipelines.bloom_v, &t.bloom_v_bg),
+        ] {
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(groups.0, groups.1, 1);
+        }
+    }
+
+    pub fn set_palette(&mut self, palette: &[[u8; 4]]) {
+        if let Some(m) = self.modeler.as_mut() {
+            m.set_palette(palette);
+        }
+    }
+
+    /// True while the path tracer is shown and still refining.
+    pub fn converging(&self) -> bool {
+        !self.modeling && self.frame < 4096
+    }
+
+    /// Draw the modeler, or accumulate samples and draw the tone-mapped
+    /// path-traced image, into `view` (of size `target`).
+    pub fn render_to_view(&mut self, view: &wgpu::TextureView, target: (u32, u32), samples: u32) {
+        if self.modeling {
+            if let Some(m) = self.modeler.as_mut() {
+                let viewport = (self.offset.0, self.offset.1, self.targets.width, self.targets.height);
+                m.draw(&self.device, &self.queue, view, target, viewport, &self.camera, self.settings.fov, self.settings.projection);
+                return;
+            }
+        }
+        self.trace(samples);
+        self.write_params();
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        self.encode_bloom(&mut enc);
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("display"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let (x, y) = self.offset;
+            pass.set_viewport(x as f32, y as f32, self.targets.width as f32, self.targets.height as f32, 0.0, 1.0);
+            pass.set_pipeline(self.pipelines.display.as_ref().expect("no display pipeline"));
+            pass.set_bind_group(0, self.targets.display_bg.as_ref().unwrap(), &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+    }
+
+    /// Render `samples` samples offscreen and return RGBA8 pixels.
+    pub fn render_image(&mut self, samples: u32) -> Result<Vec<u8>> {
+        self.reset();
+        let t0 = std::time::Instant::now();
+        self.trace(samples);
+        let pixels = self.read_pixels()?;
+        let t = &self.targets;
+        log::info!("{samples} spp at {}x{} in {:.2?}", t.width, t.height, t0.elapsed());
+        Ok(pixels)
+    }
+
+    /// Tone map the current accumulation and read it back as RGBA8.
+    pub fn read_pixels(&self) -> Result<Vec<u8>> {
+        self.write_params();
+        let t = &self.targets;
+        let size = (t.width * t.height * 4) as u64;
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        self.encode_bloom(&mut enc);
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("resolve"), timestamp_writes: None });
+            pass.set_pipeline(&self.pipelines.resolve);
+            pass.set_bind_group(0, &t.resolve_bg, &[]);
+            pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+        }
+        enc.copy_buffer_to_buffer(&t.out, 0, &readback, 0, size);
+        self.queue.submit([enc.finish()]);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map failed"));
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        let pixels = slice.get_mapped_range()?.to_vec();
+        Ok(pixels)
+    }
+}

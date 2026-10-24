@@ -1,0 +1,363 @@
+mod app;
+mod edit;
+mod env;
+mod gpu;
+mod modeler;
+mod scene;
+mod ui;
+mod vox;
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use winit::event_loop::{ControlFlow, EventLoop};
+
+use gpu::Renderer;
+use scene::Scene;
+
+const USAGE: &str = "\
+usage: voxely <model.vox> [options]
+       voxely --new [<w>x<h>x<d>] [options]
+
+  --new [size]         start from an empty canvas (default 40x40x40)
+  --out <file.vox>     where Ctrl+S saves (default export/<name>.vox)
+
+  --render <out.png>   render offscreen and exit
+  --spp <n>            samples per pixel for --render (default 256)
+  --size <w>x<h>       image size for --render (default 960x640)
+  --sky <mode>         uniform | atmo | ibl (default: from the file)
+  --ibl <file.hdr>     environment image (default: first .hdr in ../ibl)
+  --sun <pitch>,<yaw>  sun angles in degrees
+  --fog <density>      fog density (MagicaVoxel units)
+  --bloom              enable bloom
+  --proj <mode>        pers | ortho | stereo | pano | cyl
+  --dof <aperture>     depth of field aperture (0 = off), focus on target
+  --blades <n>         aperture polygon sides
+  --cam <yaw>,<pitch>,<dist>[,<x>,<y>,<z>]
+                       camera orbit in degrees/voxels, optional target
+
+editor controls (MagicaVoxel layout):
+  left click/drag  use brush       right drag  orbit      wheel  zoom
+  middle drag or space + left drag  pan                   F12    reset camera
+  T attach  R erase  G paint       V voxel  F face  B box  L line
+  F5/F6/F7 mirror x/y/z            1 / 2  previous/next color
+  Ctrl+Z undo  Ctrl+Y redo  Ctrl+S save   (Cmd works too on macOS)
+  F1 toggle editing (left drag orbits)    Tab  hide panels
+  arrows sun angle                 6  save a PNG snapshot to export/";
+
+#[derive(Default)]
+struct Args {
+    model: PathBuf,
+    render: Option<PathBuf>,
+    spp: u32,
+    size: (u32, u32),
+    sky: Option<env::EnvMode>,
+    ibl: Option<PathBuf>,
+    sun: Option<(f32, f32)>,
+    fog: Option<f32>,
+    bloom: bool,
+    cam: Option<Vec<f32>>,
+    /// Debug: save the viewer with its UI to this PNG and exit.
+    ui_shot: Option<PathBuf>,
+    /// Show the path tracer instead of the modeler in `--ui-shot`.
+    pathtrace: bool,
+    proj: Option<scene::Projection>,
+    dof: Option<f32>,
+    blades: Option<u32>,
+    new: Option<glam::IVec3>,
+    out: Option<PathBuf>,
+}
+
+fn parse_args() -> Result<Args> {
+    let mut it = std::env::args().skip(1);
+    let mut model = None;
+    let mut args = Args { spp: 256, size: (960, 640), ..Default::default() };
+    while let Some(a) = it.next() {
+        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--render" => args.render = Some(PathBuf::from(val()?)),
+            "--spp" => args.spp = val()?.parse()?,
+            "--size" => {
+                let v = val()?;
+                let (w, h) = v.split_once('x').context("--size needs WxH")?;
+                args.size = (w.parse()?, h.parse()?);
+            }
+            "--sky" => {
+                args.sky = Some(match val()?.as_str() {
+                    "uniform" => env::EnvMode::Uniform,
+                    "atmo" | "atmosphere" => env::EnvMode::Atmosphere,
+                    "ibl" | "image" => env::EnvMode::Image,
+                    other => bail!("unknown sky mode {other}"),
+                })
+            }
+            "--ibl" => args.ibl = Some(PathBuf::from(val()?)),
+            "--sun" => {
+                let v = val()?;
+                let (p, y) = v.split_once(',').context("--sun needs pitch,yaw")?;
+                args.sun = Some((p.parse()?, y.parse()?));
+            }
+            "--fog" => args.fog = Some(val()?.parse()?),
+            "--bloom" => args.bloom = true,
+            "--pathtrace" => args.pathtrace = true,
+            "--ui-shot" => args.ui_shot = Some(PathBuf::from(val()?)),
+            "--proj" => {
+                use scene::Projection::*;
+                args.proj = Some(match val()?.as_str() {
+                    "pers" => Perspective,
+                    "ortho" => Orthographic,
+                    "stereo" | "sg" => Stereographic,
+                    "pano" => Panorama,
+                    "cyl" => Cylindrical,
+                    other => bail!("unknown projection {other}"),
+                })
+            }
+            "--dof" => args.dof = Some(val()?.parse()?),
+            "--blades" => args.blades = Some(val()?.parse()?),
+            "--out" => args.out = Some(PathBuf::from(val()?)),
+            "--new" => args.new = Some(glam::IVec3::splat(40)),
+            "--cam" => {
+                let v: Vec<f32> = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?;
+                if v.len() != 3 && v.len() != 6 {
+                    bail!("--cam needs yaw,pitch,dist[,x,y,z]");
+                }
+                args.cam = Some(v);
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            _ if a.starts_with("--") => bail!("unknown option {a}\n\n{USAGE}"),
+            // A size right after --new.
+            _ if args.new.is_some() && model.is_none() && a.split('x').count() == 3 && a.split('x').all(|v| v.parse::<i32>().is_ok()) => {
+                let v: Vec<i32> = a.split('x').map(|v| v.parse().unwrap()).collect();
+                if v.iter().any(|&n| !(1..=1024).contains(&n)) {
+                    bail!("--new size must be 1..1024 per side");
+                }
+                args.new = Some(glam::IVec3::new(v[0], v[1], v[2]));
+            }
+            _ => model = Some(PathBuf::from(a)),
+        }
+    }
+    args.model = match (model, args.new) {
+        (Some(m), _) => m,
+        (None, Some(_)) => PathBuf::from("untitled.vox"),
+        (None, None) => bail!("{USAGE}"),
+    };
+    Ok(args)
+}
+
+/// MagicaVoxel keeps environment images in an `ibl` folder next to `vox`.
+fn find_ibl(model: &Path) -> Option<PathBuf> {
+    let dir = model.parent()?.parent()?.join("ibl");
+    let mut hdrs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")))
+        .collect();
+    hdrs.sort();
+    hdrs.into_iter().next()
+}
+
+fn load_scene(args: &Args) -> Result<Scene> {
+    let path = args.model.as_path();
+    let t = std::time::Instant::now();
+    let mut scene = match args.new {
+        Some(dims) => Scene::empty(dims),
+        None => Scene::from_vox(&vox::VoxFile::load(path)?)?,
+    };
+    let s = &mut scene.settings;
+    s.ibl_path = args.ibl.clone().or_else(|| find_ibl(path));
+    if let Some(m) = args.sky {
+        s.env_mode = m;
+    }
+    if let Some((p, y)) = args.sun {
+        s.sun_pitch = p;
+        s.sun_yaw = y;
+    }
+    if let Some(f) = args.fog {
+        s.fog_density = f;
+    }
+    s.bloom |= args.bloom;
+    if let Some(p) = args.proj {
+        s.projection = p;
+    }
+    if let Some(a) = args.dof {
+        s.aperture = a;
+    }
+    if let Some(b) = args.blades {
+        s.blades = b;
+    }
+    let d = scene.volume.dims;
+    let filled = scene.volume.cells.iter().filter(|&&c| c != 0).count();
+    log::info!("loaded {} ({}x{}x{}, {filled} voxels) in {:.1?}", path.display(), d.x, d.y, d.z, t.elapsed());
+    Ok(scene)
+}
+
+pub fn save_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut enc = png::Encoder::new(file, w, h);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(rgba)?;
+    Ok(())
+}
+
+fn apply_cam(r: &mut Renderer, args: &Args) {
+    if let Some(c) = &args.cam {
+        r.camera.yaw = c[0].to_radians();
+        r.camera.pitch = c[1].to_radians();
+        r.camera.dist = c[2];
+        if c.len() == 6 {
+            r.camera.target = glam::Vec3::new(c[3], c[4], c[5]);
+        }
+    }
+}
+
+fn render_headless(args: &Args, scene: &Scene) -> Result<()> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let (_adapter, device, queue) = pollster::block_on(gpu::request_device(&instance, None))?;
+    let (w, h) = args.size;
+    let mut r = Renderer::new(device, queue, scene, None, w, h);
+    apply_cam(&mut r, args);
+    let pixels = r.render_image(args.spp)?;
+    let out = args.render.as_ref().unwrap();
+    save_png(out, w, h, &pixels)?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Debug aid: render the scene plus the editor and settings panels
+/// offscreen, as the window would show them, and save a PNG. The brush
+/// preview is shown for the voxel under the image center.
+fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let (_adapter, device, queue) = pollster::block_on(gpu::request_device(&instance, None))?;
+    let (w, h) = args.size;
+    let format = wgpu::TextureFormat::Bgra8Unorm;
+    let mut egui_renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+    let mut r = Renderer::new(device, queue, scene, Some(format), w, h);
+    apply_cam(&mut r, args);
+    r.modeling = !args.pathtrace;
+    let tex = r.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ui_snapshot"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    let ctx = egui::Context::default();
+    let ppp = 2.0;
+    let panel = ui::PanelState { ibl_files: list_ibl(&args.model, scene.settings.ibl_path.as_ref()) };
+    let mut ed = app::EditState { editor: edit::Editor::new(1), hover: None, enabled: r.modeling, save_path: PathBuf::new() };
+    let mut out = None;
+    // A few passes so layout and fonts settle; textures upload every pass.
+    // The 3D view is fitted between the panels, then rendered.
+    for pass in 0..3 {
+        if pass == 2 {
+            r.render_to_view(&view, (w, h), args.spp);
+            let (x, y, vw, vh) = r.viewport();
+            let (ro, rd) = r.camera_ray((x + vw / 2) as f32, (y + vh / 2) as f32);
+            ed.hover = edit::pick(&scene.volume, ro, rd);
+        }
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32 / ppp, h as f32 / ppp))),
+            ..Default::default()
+        };
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        let o = ctx.run_ui(raw, |ui| {
+            let a = app::build_ui(ui, &mut r, scene, &mut ed, &panel, true);
+            if pass < 2 {
+                if let Some(rect) = a.viewport {
+                    app::fit_viewport(&mut r, rect, ppp, (w, h));
+                }
+            }
+        });
+        for (id, deltas) in &o.textures_delta.set {
+            for d in deltas {
+                egui_renderer.update_texture(&r.device, &r.queue, *id, d);
+            }
+        }
+        out = Some(o);
+    }
+    let mut out = out.unwrap();
+    out.textures_delta.set.clear();
+    app::paint_egui(&r.device, &r.queue, &mut egui_renderer, &ctx, &view, [w, h], out);
+
+    let row = (w * 4).next_multiple_of(256);
+    let buf = r.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ui_readback"),
+        size: (row * h) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = r.device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    r.queue.submit([enc.finish()]);
+    let slice = buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |res| res.expect("map failed"));
+    r.device.poll(wgpu::PollType::wait_indefinitely())?;
+    let data = slice.get_mapped_range()?;
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for px in data[(y * row) as usize..(y * row + w * 4) as usize].chunks_exact(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+    }
+    drop(data);
+    save_png(out_path, w, h, &rgba)?;
+    println!("wrote {}", out_path.display());
+    Ok(())
+}
+
+/// Every .hdr next to the model's `ibl` folder, plus the chosen one.
+fn list_ibl(model: &Path, current: Option<&PathBuf>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = model
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|d| std::fs::read_dir(d.join("ibl")).ok())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(c) = current {
+        if !files.contains(c) {
+            files.push(c.clone());
+        }
+    }
+    files.sort();
+    files
+}
+
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("voxely=info,wgpu=warn")).init();
+    let args = parse_args()?;
+    let mut scene = load_scene(&args)?;
+    if args.render.is_some() {
+        return render_headless(&args, &scene);
+    }
+    if let Some(p) = &args.ui_shot {
+        return ui_snapshot(&args, &mut scene, p);
+    }
+    let name = args.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled.vox".into());
+    let save_path = args.out.clone().unwrap_or_else(|| PathBuf::from("export").join(&name));
+    println!("Ctrl+S saves to {}", save_path.display());
+    let panel = ui::PanelState { ibl_files: list_ibl(&args.model, scene.settings.ibl_path.as_ref()) };
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let mut app = app::App::new(scene, format!("voxely — {name}"), panel, save_path);
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
