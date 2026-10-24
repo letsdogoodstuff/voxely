@@ -4,6 +4,7 @@ mod env;
 mod gpu;
 mod modeler;
 mod ops;
+mod palette_ops;
 mod scene;
 mod ui;
 mod vox;
