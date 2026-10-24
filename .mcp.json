@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "voxely": {
+      "command": "./target/release/voxely",
+      "args": ["mcp"]
+    }
+  }
+}

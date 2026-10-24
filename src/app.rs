@@ -140,7 +140,7 @@ fn render_final(r: &Renderer, scene: &Scene, image: ui::ImageSettings) {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let name = format!("export/voxely-render-{secs}.png");
     match out.render_image(image.spp).and_then(|px| crate::save_png(Path::new(&name), image.width, image.height, &px)) {
-        Ok(()) => println!("rendered {name} ({} spp)", image.spp),
+        Ok(()) => eprintln!("rendered {name} ({} spp)", image.spp),
         Err(e) => eprintln!("render failed: {e:#}"),
     }
 }
@@ -167,7 +167,7 @@ pub fn prepare_code_brush(r: &Renderer, scene: &Scene, ed: &mut EditState) {
 }
 
 /// Colors of a palette image: pixel k is color index k + 1.
-fn load_palette(path: &Path) -> Result<Vec<[u8; 4]>> {
+pub(crate) fn load_palette(path: &Path) -> Result<Vec<[u8; 4]>> {
     let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path)?));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
     let mut reader = decoder.read_info()?;
@@ -190,7 +190,7 @@ fn load_palette(path: &Path) -> Result<Vec<[u8; 4]>> {
 }
 
 /// Snap to the nearest isometric view (orthographic, 45 degree turns).
-fn iso_camera(r: &mut Renderer) {
+pub(crate) fn iso_camera(r: &mut Renderer) {
     use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
     let cam = &mut r.camera;
     cam.yaw = ((cam.yaw - FRAC_PI_4) / FRAC_PI_2).round() * FRAC_PI_2 + FRAC_PI_4;
@@ -226,7 +226,7 @@ pub fn sync_volume(r: &mut Renderer, scene: &mut Scene, editor: &mut Editor) {
 pub fn save(scene: &Scene, path: &Path) {
     let result = path.parent().map_or(Ok(()), std::fs::create_dir_all).map_err(anyhow::Error::from).and_then(|_| scene.save(path));
     match result {
-        Ok(()) => println!("saved {}", path.display()),
+        Ok(()) => eprintln!("saved {}", path.display()),
         Err(e) => eprintln!("save failed: {e:#}"),
     }
 }
@@ -236,7 +236,7 @@ pub fn snapshot(r: &Renderer) {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let name = format!("export/voxely-{secs}.png");
     match r.read_pixels().and_then(|px| crate::save_png(Path::new(&name), w, h, &px)) {
-        Ok(()) => println!("saved {name}"),
+        Ok(()) => eprintln!("saved {name}"),
         Err(e) => eprintln!("snapshot failed: {e:#}"),
     }
 }
@@ -254,43 +254,44 @@ fn solid_bounds(scene: &Scene, sel: Option<&[bool]>) -> Option<(Vec3, Vec3)> {
     b.map(|(lo, hi)| (lo.as_vec3(), (hi + IVec3::ONE).as_vec3()))
 }
 
-fn open_project(path: PathBuf, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
-    match crate::open_vox(&path) {
-        Ok(s) => {
-            *scene = s;
-            ed.save_path = default_save_path(Some(&path));
-            ed.projects = list_projects(Some(&path));
-            // Models saved outside MagicaVoxel's folder have no palette or
-            // shader folder beside them; keep the ones we already found.
-            let palettes = list_palettes(Some(&path));
-            if !palettes.is_empty() {
-                ed.palettes = palettes;
-            }
-            let shaders = list_shaders(Some(&path));
-            if !shaders.is_empty() {
-                ed.shaders.files = shaders;
-            }
-            ed.source = Some(path);
-            loaded(r, scene, ed);
-        }
-        Err(e) => eprintln!("open failed: {e:#}"),
+/// Point the project, palette and shader lists at the folders around
+/// `model` (a file in MagicaVoxel's vox folder). Lists that come up empty
+/// keep what was found before.
+pub(crate) fn set_asset_lists(ed: &mut EditState, model: &Path) {
+    ed.projects = list_projects(Some(model));
+    let palettes = list_palettes(Some(model));
+    if !palettes.is_empty() {
+        ed.palettes = palettes;
+    }
+    let shaders = list_shaders(Some(model));
+    if !shaders.is_empty() {
+        ed.shaders.files = shaders;
     }
 }
 
+pub(crate) fn open_project(path: PathBuf, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) -> Result<()> {
+    *scene = crate::open_vox(&path).with_context(|| format!("opening {}", path.display()))?;
+    ed.save_path = default_save_path(Some(&path));
+    set_asset_lists(ed, &path);
+    ed.source = Some(path);
+    loaded(r, scene, ed);
+    Ok(())
+}
+
 /// Show a newly opened or created scene.
-fn loaded(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
+pub(crate) fn loaded(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     ed.editor.reset();
     ed.hover = None;
     r.load_scene(scene);
     ed.editor.sel_dirty = false;
-    println!("Ctrl+S saves to {}", ed.save_path.display());
+    eprintln!("Ctrl+S saves to {}", ed.save_path.display());
 }
 
 fn dialog_dir(ed: &EditState) -> PathBuf {
     ed.source.as_deref().and_then(Path::parent).map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-fn apply_op(op: Op, scene: &Scene, editor: &Editor) -> Option<crate::scene::Volume> {
+pub(crate) fn apply_op(op: Op, scene: &Scene, editor: &Editor) -> Option<crate::scene::Volume> {
     let v = &scene.volume;
     let (sel, c) = (editor.selection(), editor.color);
     Some(match op {
@@ -334,7 +335,7 @@ fn selected_colors(ed: &EditState) -> Vec<u8> {
 }
 
 /// Apply a Scale / Shear / Rotate / Repeat text like "xyz 2".
-fn transform(kind: ui::TransformKind, text: &str, v: &crate::scene::Volume) -> Option<crate::scene::Volume> {
+pub(crate) fn transform(kind: ui::TransformKind, text: &str, v: &crate::scene::Volume) -> Option<crate::scene::Volume> {
     let Some((axes, nums)) = ops::parse_axes_args(text) else {
         eprintln!("expected [axes] [values], e.g. \"xyz 2\", got {text:?}");
         return None;
@@ -367,12 +368,16 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         }
         Command::Open => {
             if let Some(p) = rfd::FileDialog::new().add_filter("MagicaVoxel", &["vox"]).set_directory(dialog_dir(ed)).pick_file() {
-                open_project(p, r, scene, ed);
+                if let Err(e) = open_project(p, r, scene, ed) {
+                    eprintln!("open failed: {e:#}");
+                }
             }
             false
         }
         Command::OpenPath(p) => {
-            open_project(p, r, scene, ed);
+            if let Err(e) = open_project(p, r, scene, ed) {
+                eprintln!("open failed: {e:#}");
+            }
             false
         }
         Command::Save => {
@@ -806,6 +811,58 @@ struct Mouse {
     /// Fractional brush-size change from Ctrl+Alt+drag.
     size_drag: f32,
     pos: Option<(f64, f64)>,
+}
+
+/// Events sent to the window from other threads.
+pub enum UserEvent {
+    /// A tool call from `voxely mcp` and where to send the result.
+    Control { tool: String, args: serde_json::Value, reply: std::sync::mpsc::Sender<serde_json::Value> },
+}
+
+/// Listen on the control socket and forward each request to the window.
+/// Requests are one JSON line `{"tool", "args"}`; replies are one line.
+pub fn serve_control(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    let path = crate::mcp::socket_path();
+    // The newest window takes over the socket.
+    let _ = std::fs::remove_file(&path);
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("control socket {}: {e}", path.display());
+            return;
+        }
+    };
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let proxy = proxy.clone();
+            std::thread::spawn(move || {
+                let Ok(mut writer) = stream.try_clone() else { return };
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let reply = match serde_json::from_str::<serde_json::Value>(&line) {
+                        Ok(req) => {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let tool = req["tool"].as_str().unwrap_or("").to_string();
+                            let args = req.get("args").cloned().unwrap_or(serde_json::json!({}));
+                            if proxy.send_event(UserEvent::Control { tool, args, reply: tx }).is_err() {
+                                break;
+                            }
+                            rx.recv().unwrap_or_else(|_| serde_json::json!({ "content": [{ "type": "text", "text": "the voxely window closed" }], "isError": true }))
+                        }
+                        Err(e) => serde_json::json!({ "content": [{ "type": "text", "text": format!("bad request: {e}") }], "isError": true }),
+                    };
+                    if writeln!(writer, "{reply}").is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
 }
 
 pub struct App {
@@ -1281,7 +1338,21 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
+    fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
+        let UserEvent::Control { tool, args, reply } = event;
+        let result = match self.gfx.as_mut() {
+            Some(g) => {
+                let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true };
+                let result = crate::control::call(&mut ctx, &tool, &args);
+                g.window.request_redraw();
+                result
+            }
+            None => serde_json::json!({ "content": [{ "type": "text", "text": "the voxely window is still starting" }], "isError": true }),
+        };
+        let _ = reply.send(result);
+    }
+
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.gfx.is_none() {
             if let Err(e) = self.init(el) {

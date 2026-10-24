@@ -240,6 +240,8 @@ pub struct Renderer {
     targets: Targets,
     /// Rasterized editing view (window renders only).
     pub modeler: Option<Modeler>,
+    /// Color format the modeler draws in.
+    modeler_format: Option<wgpu::TextureFormat>,
     /// Show the modeler instead of the path tracer (F1).
     pub modeling: bool,
     /// Canvas to re-frame if the view is resized within the next few
@@ -287,7 +289,7 @@ impl Renderer {
         let lights_data: &[GpuLight] = if scene.lights.is_empty() { &[GpuLight { corner_cdf: [0.0; 4], axis_sign_mat: [0; 4] }] } else { &scene.lights };
         let lights = storage_buffer(&device, &queue, "lights", bytemuck::cast_slice(lights_data));
         log::info!("{} emissive faces", scene.lights.len());
-        let modeler = surface_format.map(|f| Modeler::new(&device, f, v, &scene.palette));
+        let modeler = surface_format.map(|f| (Modeler::new(&device, f, v, &scene.palette), f));
 
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
@@ -373,7 +375,8 @@ impl Renderer {
             pipelines,
             targets,
             modeling: modeler.is_some(),
-            modeler,
+            modeler_format: modeler.as_ref().map(|m| m.1),
+            modeler: modeler.map(|m| m.0),
         };
         r.update_env();
         r
@@ -865,6 +868,28 @@ impl Renderer {
         Ok(pixels)
     }
 
+    /// Draw the modeler view at `width` x `height` offscreen with the
+    /// current camera and read it back as RGBA8.
+    pub fn modeler_image(&mut self, width: u32, height: u32) -> Result<Vec<u8>> {
+        let (Some(m), Some(format)) = (self.modeler.as_mut(), self.modeler_format) else {
+            anyhow::bail!("this renderer has no modeler view");
+        };
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("modeler_image"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        m.draw(&self.device, &self.queue, &view, (width, height), (0, 0, width, height), &self.camera, self.settings.fov, self.settings.projection);
+        let bgra = matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
+        read_texture(&self.device, &self.queue, &tex, width, height, bgra)
+    }
+
     /// Tone map the current accumulation and read it back as RGBA8.
     pub fn read_pixels(&self) -> Result<Vec<u8>> {
         self.write_params();
@@ -894,4 +919,33 @@ impl Renderer {
         let pixels = slice.get_mapped_range()?.to_vec();
         Ok(pixels)
     }
+}
+
+/// Read an 8-bit color texture back as RGBA8 (swapping channels for BGRA).
+pub fn read_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32, bgra: bool) -> Result<Vec<u8>> {
+    let row = (w * 4).next_multiple_of(256);
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("texture_readback"),
+        size: (row * h) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    enc.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    queue.submit([enc.finish()]);
+    let slice = buf.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |res| res.expect("map failed"));
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    let data = slice.get_mapped_range()?;
+    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for px in data[(y * row) as usize..(y * row + w * 4) as usize].chunks_exact(4) {
+            rgba.extend_from_slice(&if bgra { [px[2], px[1], px[0], 255] } else { [px[0], px[1], px[2], 255] });
+        }
+    }
+    Ok(rgba)
 }

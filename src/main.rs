@@ -1,7 +1,9 @@
 mod app;
+mod control;
 mod edit;
 mod env;
 mod gpu;
+mod mcp;
 mod modeler;
 mod ops;
 mod palette_ops;
@@ -21,6 +23,9 @@ use scene::Scene;
 const USAGE: &str = "\
 usage: voxely <model.vox> [options]
        voxely --new [<w>x<h>x<d>] [options]
+       voxely mcp [--headless] [--assets <MagicaVoxel folder>]
+                        MCP server on stdio for agents; drives the open
+                        window if there is one, otherwise runs headless
 
   --new [size]         start from a solid block (default 40x40x40)
   --out <file.vox>     where Ctrl+S saves (default export/<name>.vox)
@@ -215,7 +220,7 @@ fn parse_args() -> Result<Args> {
 }
 
 /// MagicaVoxel keeps environment images in an `ibl` folder next to `vox`.
-fn find_ibl(model: &Path) -> Option<PathBuf> {
+pub fn find_ibl(model: &Path) -> Option<PathBuf> {
     let dir = model.parent()?.parent()?.join("ibl");
     let mut hdrs: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
@@ -463,6 +468,10 @@ fn list_ibl(model: &Path, current: Option<&PathBuf>) -> Vec<PathBuf> {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("voxely=info,wgpu=warn")).init();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|a| a == "mcp") {
+        return mcp::run(&argv[1..]);
+    }
     let args = parse_args()?;
     let mut scene = load_scene(&args)?;
     if let Some(p) = &args.xs {
@@ -478,9 +487,13 @@ fn main() -> Result<()> {
     let save_path = args.out.clone().unwrap_or_else(|| app::default_save_path(source.as_deref()));
     println!("Ctrl+S saves to {}", save_path.display());
     let panel = ui::PanelState { ibl_files: list_ibl(&args.model, scene.settings.ibl_path.as_ref()) };
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<app::UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
+    // Agents connect through `voxely mcp`, which talks to this socket.
+    app::serve_control(event_loop.create_proxy());
     let mut app = app::App::new(scene, panel, source, save_path);
-    event_loop.run_app(&mut app)?;
+    let result = event_loop.run_app(&mut app);
+    let _ = std::fs::remove_file(mcp::socket_path());
+    result?;
     Ok(())
 }
