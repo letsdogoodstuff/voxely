@@ -952,7 +952,7 @@ pub fn project_panel(
         match *tab {
             ProjectTab::Project | ProjectTab::Pattern => {
                 if projects.is_empty() {
-                    ui.weak("Open a .vox file to list its folder here");
+                    ui.add(egui::Label::new(egui::RichText::new("Open a .vox file to list its folder here").weak()).wrap());
                 }
                 for p in projects {
                     let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -967,7 +967,7 @@ pub fn project_panel(
             }
             ProjectTab::Shader => {
                 if shaders.files.is_empty() {
-                    ui.weak("No shader folder found next to the model's folder");
+                    ui.add(egui::Label::new(egui::RichText::new("No shader folder found next to the model's folder").weak()).wrap());
                 }
                 let chosen = shaders.current.as_ref().map(|(p, _)| p.clone());
                 for p in &shaders.files {
@@ -978,15 +978,17 @@ pub fn project_panel(
                 }
                 if let Some((_, sh)) = &shaders.current {
                     ui.separator();
+                    // Fit the slider and its value box in the narrow column.
+                    ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(40.0);
                     for (arg, value) in sh.args.iter().zip(shaders.values.iter_mut()) {
                         ui.label(&arg.name);
                         ui.add(Slider::new(value, arg.min..=arg.max).step_by(arg.step.max(0.0) as f64).max_decimals(arg.precision as usize));
                     }
                     command(ui, cmds, "Run", "Execute shader on the model (or the selection)", Command::RunShader);
-                    ui.weak("Or drag a box with the Code brush [C]");
+                    ui.add(egui::Label::new(egui::RichText::new("Or drag a box with the Code brush [C]").weak()).wrap());
                 }
                 if let Some(e) = &shaders.error {
-                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+                    ui.add(egui::Label::new(egui::RichText::new(e).color(egui::Color32::from_rgb(255, 120, 120))).wrap());
                 }
             }
         }

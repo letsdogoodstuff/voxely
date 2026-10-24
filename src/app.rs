@@ -260,8 +260,16 @@ fn open_project(path: PathBuf, r: &mut Renderer, scene: &mut Scene, ed: &mut Edi
             *scene = s;
             ed.save_path = default_save_path(Some(&path));
             ed.projects = list_projects(Some(&path));
-            ed.palettes = list_palettes(Some(&path));
-            ed.shaders.files = list_shaders(Some(&path));
+            // Models saved outside MagicaVoxel's folder have no palette or
+            // shader folder beside them; keep the ones we already found.
+            let palettes = list_palettes(Some(&path));
+            if !palettes.is_empty() {
+                ed.palettes = palettes;
+            }
+            let shaders = list_shaders(Some(&path));
+            if !shaders.is_empty() {
+                ed.shaders.files = shaders;
+            }
             ed.source = Some(path);
             loaded(r, scene, ed);
         }
