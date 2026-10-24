@@ -11,7 +11,7 @@ use glam::{IVec3, Vec3};
 use crate::edit::{Brush, Editor, GeoShape, MarqueeMode, Tool};
 use crate::env::EnvMode;
 use crate::modeler::ModelerOptions;
-use crate::scene::{GpuMaterial, MaterialKind, Projection, RenderSettings, Scene};
+use crate::scene::{BgMode, DenoiseView, GpuMaterial, MaterialKind, Projection, RenderSettings, Scene};
 
 /// Whole-model edits (see `ops`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -282,6 +282,27 @@ pub fn light_panel(ui: &mut Ui, tab: &mut LightTab, s: &mut RenderSettings, stat
             CollapsingHeader::new("Display").default_open(true).show(ui, |ui| {
                 ui.checkbox(&mut s.ground, "Ground");
                 color(ui, "Ground color", &mut s.ground_color);
+                ui.horizontal(|ui| {
+                    ui.label("BG");
+                    ui.selectable_value(&mut s.bg_mode, BgMode::Sky, "Sky");
+                    ui.selectable_value(&mut s.bg_mode, BgMode::Color, "Color");
+                    ui.selectable_value(&mut s.bg_mode, BgMode::Transparent, "Transparent");
+                });
+                if s.bg_mode == BgMode::Color {
+                    color(ui, "Background", &mut s.bg_color);
+                }
+                ui.checkbox(&mut s.show_edges, "Edge");
+                if s.show_edges {
+                    color(ui, "Edge color", &mut s.edge_color);
+                    slider(ui, "Width", &mut s.edge_width, 0.01..=1.0);
+                }
+                ui.checkbox(&mut s.show_grid, "Grid");
+                if s.show_grid {
+                    color(ui, "Grid color", &mut s.grid_color);
+                    ui.add(Slider::new(&mut s.grid_spacing, 1..=1024).logarithmic(true).text("Spacing"));
+                    slider(ui, "Width", &mut s.grid_width, 0.01..=1.0);
+                    ui.checkbox(&mut s.grid_ground_only, "Only on ground");
+                }
             });
         }
     });
@@ -361,6 +382,14 @@ pub fn matter_panel(ui: &mut Ui, s: &mut RenderSettings, e: &Editor, scene: &mut
         if image {
             CollapsingHeader::new("Image").default_open(true).show(ui, |ui| {
                 ui.label(format!("View: {} spp · {}×{}", m.spp, m.size.0, m.size.1));
+                ui.checkbox(&mut s.denoise, "Denoise");
+                if s.denoise {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut s.denoise_view, DenoiseView::Original, "L").on_hover_text("Show original image");
+                        ui.selectable_value(&mut s.denoise_view, DenoiseView::Denoised, "R").on_hover_text("Show denoised image");
+                        ui.selectable_value(&mut s.denoise_view, DenoiseView::Split, "L|R").on_hover_text("Show comparison");
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.label("Size");
                     ui.add(egui::DragValue::new(&mut m.image.width).range(1..=12000)).on_hover_text("Image width [1 - 12000]");
@@ -448,15 +477,15 @@ pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, e: &Editor, cmds: &
         ui.add_space(24.0);
         ui.label(egui::RichText::new(name).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            command(ui, cmds, "Save As", "Ctrl+Shift+S", Command::SaveAs);
-            command(ui, cmds, "Save", "Ctrl+S", Command::Save);
-            command(ui, cmds, "Open", "Ctrl+O", Command::Open);
-            command(ui, cmds, "New", "Ctrl+P", Command::New);
+            command(ui, cmds, "Save As", "Save as [Ctrl+Shift+S]", Command::SaveAs);
+            command(ui, cmds, "Save", "Save [Ctrl+S]", Command::Save);
+            command(ui, cmds, "Open", "Open [Ctrl+O]", Command::Open);
+            command(ui, cmds, "New", "New [Ctrl+P]", Command::New);
             ui.separator();
-            if ui.add_enabled(e.can_redo(), egui::Button::new("Redo")).on_hover_text("Ctrl+Y").clicked() {
+            if ui.add_enabled(e.can_redo(), egui::Button::new("Redo")).on_hover_text("Redo [Ctrl+Y]").clicked() {
                 cmds.push(Command::Redo);
             }
-            if ui.add_enabled(e.can_undo(), egui::Button::new("Undo")).on_hover_text("Ctrl+Z").clicked() {
+            if ui.add_enabled(e.can_undo(), egui::Button::new("Undo")).on_hover_text("Undo [Ctrl+Z]").clicked() {
                 cmds.push(Command::Undo);
             }
         });
@@ -517,6 +546,7 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
         }
         iso = ui.selectable_label(s.iso, "Iso").on_hover_text("Isometric view").clicked();
         command(ui, cmds, "Reset", "Reset camera [F12]", Command::ResetCamera);
+        command(ui, cmds, "Snap", "Snapshot [6]", Command::Snapshot);
         ui.separator();
         ui.weak(s.hint);
     });
@@ -535,7 +565,7 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
                 cmds.push(Command::LoadPalette(p.clone()));
             }
         }
-        ui.menu_button("☰", |ui| {
+        ui.menu_button("...", |ui| {
             if ui.button("Sort").on_hover_text("Sort palette").clicked() {
                 cmds.push(Command::PaletteSort);
                 ui.close();
@@ -558,10 +588,18 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
         });
     });
     let used = if pal.mask_unused { crate::palette_ops::mask_unused(&scene.palette, &scene.volume) } else { Vec::new() };
-    // 8 columns like MagicaVoxel, color index 1..=255.
+    // 8 columns like MagicaVoxel, which lists colors bottom-up: index 1 at
+    // the bottom left, 255 near the top right.
     let swatch = 14.0;
     egui::Grid::new("palette").spacing([1.0, 1.0]).min_col_width(swatch).show(ui, |ui| {
-        for i in 1..=255usize {
+        for k in 0..256usize {
+            let (row, col) = (31 - k / 8, k % 8);
+            let i = row * 8 + col + 1;
+            if i > 255 {
+                ui.allocate_exact_size(egui::vec2(swatch, swatch), egui::Sense::hover());
+                ui.end_row();
+                continue;
+            }
             let p = scene.palette[i];
             let mut fill = egui::Color32::from_rgb(p[0], p[1], p[2]);
             if used.get(i) == Some(&false) {
@@ -585,7 +623,7 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
                 }
             }
             resp.on_hover_text(format!("#{i} · Shift+click to select"));
-            if i % 8 == 0 {
+            if col == 7 {
                 ui.end_row();
             }
         }
@@ -865,7 +903,7 @@ fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
                     ui.label(format!("{} ({}×{}×{})", p.name, d.x, d.y, d.z));
                 }
                 None => {
-                    ui.weak("Pick a model in Project › Pattern");
+                    ui.weak("Pick a model in Project > Pattern");
                 }
             }
             pick2(ui, &mut e.opts.pattern_palette, (true, "Palette", "Use palette color"), (false, "Voxel", "Use the pattern's colors"));
@@ -886,7 +924,7 @@ fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
             });
         }
         Brush::Code => {
-            ui.weak("Drag a box to fill it with the shader chosen in Project › Shader");
+            ui.weak("Drag a box to fill it with the shader chosen in Project > Shader");
         }
         Brush::Box => {}
     }

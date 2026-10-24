@@ -691,7 +691,7 @@ pub fn build_ui(
                 iso_camera(r);
             }
         });
-        egui::Panel::left("palette").exact_size(140.0).resizable(false).show(ui, |ui| {
+        egui::Panel::left("palette").exact_size(160.0).resizable(false).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 edit = ui::palette_panel(ui, &mut ed.editor, scene, &mut ed.palette, &ed.palettes, cmds);
             });
