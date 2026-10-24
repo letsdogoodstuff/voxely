@@ -1,5 +1,6 @@
-// Post-processing: bloom (threshold, quarter-res downsample, separable
-// Gaussian blur) and tone mapping, either to the window (vs/fs) or into a
+// Post-processing: choice of original / denoised image, bloom (threshold,
+// quarter-res downsample, separable Gaussian blur), tone mapping, the
+// background and edge/grid lines, either to the window (vs/fs) or into a
 // packed RGBA8 buffer for headless renders (resolve).
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -7,14 +8,24 @@
 @group(0) @binding(2) var<storage, read_write> out_rgba: array<u32>;
 @group(0) @binding(3) var<storage, read_write> bloom_a: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> bloom_b: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> denoised: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> overlay: array<vec4<f32>>;
 
 fn bloom_size() -> vec2<u32> {
     return (P.frame.yz + 3u) / 4u;
 }
 
+fn split_view() -> bool {
+    return (P.aux.x & FLAG_DENOISE) != 0u && P.aux.y == VIEW_SPLIT;
+}
+
+// Averaged linear radiance (premultiplied by coverage) shown at `px`.
 fn average(px: vec2<u32>) -> vec3<f32> {
-    let a = accum[px.y * P.frame.y + px.x];
-    return a.rgb / max(a.w, 1.0);
+    let i = px.y * P.frame.y + px.x;
+    if (P.aux.x & FLAG_DENOISE) != 0u && !(split_view() && px.x < P.frame.y / 2u) {
+        return denoised[i].rgb;
+    }
+    return accum[i].rgb * inv_samples(P);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -92,13 +103,41 @@ fn bloom_at(uv: vec2<f32>) -> vec3<f32> {
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
-fn final_color(px: vec2<u32>, uv: vec2<f32>) -> vec3<f32> {
-    var c = average(px);
+fn encode(c: vec3<f32>) -> vec3<f32> {
+    return pow(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / P.film.y));
+}
+
+// Display color with straight alpha.
+fn final_color(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
+    let i = px.y * P.frame.y + px.x;
+    let ic = inv_samples(P);
+    var alpha = clamp(accum[i].w * ic, 0.0, 1.0);
+    var c = average(px) / max(alpha, 1e-4);
     if P.bloom.x > 0.0 {
         // Bloom was computed after exposure; undo it so tonemap applies once.
         c += bloom_at(uv) * P.bloom.x / max(P.film.x, 1e-6);
     }
-    return tonemap(P, c, uv);
+    var rgb = tonemap(P, c, uv);
+    if P.aux.z == BG_COLOR {
+        rgb = mix(encode(P.bg_col.rgb), rgb, alpha);
+        alpha = 1.0;
+    }
+    if (P.aux.x & (FLAG_EDGES | FLAG_GRID)) != 0u {
+        let o = overlay[i] * ic;
+        let cov = clamp(o.w, 0.0, 1.0);
+        if cov > 0.0 {
+            let line = encode(o.rgb / o.w);
+            let a = cov + alpha * (1.0 - cov);
+            rgb = (line * cov + rgb * alpha * (1.0 - cov)) / a;
+            alpha = a;
+        }
+    }
+    let mid = P.frame.y / 2u;
+    if split_view() && (px.x == mid || px.x + 1u == mid) {
+        rgb = vec3<f32>(1.0);
+        alpha = 1.0;
+    }
+    return vec4<f32>(rgb, alpha);
 }
 
 struct VsOut {
@@ -118,7 +157,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let pos = in.pos.xy - P.view.xy;
     let px = min(vec2<u32>(max(pos, vec2<f32>(0.0))), P.frame.yz - 1u);
     let uv = pos / vec2<f32>(P.frame.yz);
-    return vec4<f32>(final_color(px, uv), 1.0);
+    let c = final_color(px, uv);
+    // Transparent background over a checkerboard.
+    let check = ((px.x >> 3u) + (px.y >> 3u)) & 1u;
+    let bg = vec3<f32>(select(0.4, 0.6, check == 1u));
+    return vec4<f32>(mix(bg, c.rgb, c.a), 1.0);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -127,5 +170,5 @@ fn resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(P.frame.yz);
-    out_rgba[gid.y * P.frame.y + gid.x] = pack4x8unorm(vec4<f32>(final_color(gid.xy, uv), 1.0));
+    out_rgba[gid.y * P.frame.y + gid.x] = pack4x8unorm(final_color(gid.xy, uv));
 }

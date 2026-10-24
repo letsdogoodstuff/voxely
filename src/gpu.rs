@@ -6,11 +6,20 @@ use glam::Vec3;
 
 use crate::env::{self, EnvMap};
 use crate::modeler::Modeler;
-use crate::scene::{GpuLight, GpuMaterial, Projection, RenderSettings, Scene, Volume};
+use crate::scene::{BgMode, DenoiseView, GpuLight, GpuMaterial, Projection, RenderSettings, Scene, Volume};
 
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 const PATHTRACE_WGSL: &str = include_str!("shaders/pathtrace.wgsl");
 const DISPLAY_WGSL: &str = include_str!("shaders/display.wgsl");
+const DENOISE_WGSL: &str = include_str!("shaders/denoise.wgsl");
+/// À-trous passes (strides 1, 2, 4, ...). Odd, so the result lands in `den_b`.
+const DENOISE_PASSES: u32 = 5;
+/// Bits of `Params::aux[0]`, matching FLAG_* in common.wgsl.
+const FLAG_DENOISE: u32 = 1;
+const FLAG_EDGES: u32 = 2;
+const FLAG_GRID: u32 = 4;
+const FLAG_GRID_GROUND_ONLY: u32 = 8;
+const FLAG_BG_HIDDEN: u32 = 16;
 /// Frames after loading during which a view resize re-frames the camera.
 const REFRAME_FRAMES: u32 = 3;
 
@@ -76,6 +85,10 @@ struct Params {
     env: [u32; 4],
     lens: [f32; 4],
     view: [f32; 4],
+    aux: [u32; 4],
+    bg_col: [f32; 4],
+    edge_col: [f32; 4],
+    grid_col: [f32; 4],
 }
 
 fn storage_buffer(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, data: &[u8]) -> wgpu::Buffer {
@@ -161,7 +174,23 @@ struct Pipelines {
     bloom_h: wgpu::ComputePipeline,
     bloom_v: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
+    denoise_init: wgpu::ComputePipeline,
+    denoise_atrous: wgpu::ComputePipeline,
     display: Option<wgpu::RenderPipeline>,
+}
+
+/// Which optional per-pixel buffers are allocated (full size); the rest
+/// are 16-byte placeholders so disabled features cost no memory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Features {
+    denoise: bool,
+    overlay: bool,
+}
+
+impl Features {
+    fn wanted(s: &RenderSettings) -> Self {
+        Features { denoise: s.denoise && s.denoise_view != DenoiseView::Original, overlay: s.show_edges || s.show_grid }
+    }
 }
 
 /// Resolution-dependent buffers and every bind group (which reference them).
@@ -175,6 +204,9 @@ struct Targets {
     bloom_v_bg: wgpu::BindGroup,
     resolve_bg: wgpu::BindGroup,
     display_bg: Option<wgpu::BindGroup>,
+    features: Features,
+    denoise_init_bg: wgpu::BindGroup,
+    denoise_bgs: Vec<wgpu::BindGroup>,
 }
 
 pub struct Renderer {
@@ -272,12 +304,18 @@ impl Renderer {
             label: Some("display"),
             source: wgpu::ShaderSource::Wgsl(format!("{COMMON_WGSL}\n{DISPLAY_WGSL}").into()),
         });
+        let denoise_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("denoise"),
+            source: wgpu::ShaderSource::Wgsl(format!("{COMMON_WGSL}\n{DENOISE_WGSL}").into()),
+        });
         let pipelines = Pipelines {
             trace: compute_pipeline(&device, &trace_module, "main"),
             bloom_down: compute_pipeline(&device, &post_module, "bloom_down"),
             bloom_h: compute_pipeline(&device, &post_module, "bloom_h"),
             bloom_v: compute_pipeline(&device, &post_module, "bloom_v"),
             resolve: compute_pipeline(&device, &post_module, "resolve"),
+            denoise_init: compute_pipeline(&device, &denoise_module, "denoise_init"),
+            denoise_atrous: compute_pipeline(&device, &denoise_module, "denoise_atrous"),
             display: surface_format.map(|format| {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("display"),
@@ -306,7 +344,8 @@ impl Renderer {
         // Placeholders until the first environment bake.
         let env_texels = storage_buffer(&device, &queue, "env", &[0; 16]);
         let env_cdf = storage_buffer(&device, &queue, "env_cdf", &[0; 16]);
-        let targets = Self::placeholder_targets(&device, &pipelines, &params, &vox_view, &brick_view, &materials, &lights, &env_texels, &env_cdf, width, height);
+        let features = Features::wanted(&scene.settings);
+        let targets = Self::placeholder_targets(&device, &pipelines, &params, &vox_view, &brick_view, &materials, &lights, &env_texels, &env_cdf, width, height, features);
         let mut r = Renderer {
             device,
             queue,
@@ -353,13 +392,21 @@ impl Renderer {
         env_cdf: &wgpu::Buffer,
         width: u32,
         height: u32,
+        features: Features,
     ) -> Targets {
         let pixels = (width * height) as u64;
         let bloom_pixels = (width.div_ceil(4) * height.div_ceil(4)) as u64;
-        let accum = scratch_buffer(device, "accum", pixels * 16, wgpu::BufferUsages::empty());
+        let none = wgpu::BufferUsages::empty();
+        let accum = scratch_buffer(device, "accum", pixels * 16, none);
         let out = scratch_buffer(device, "out_rgba", pixels * 4, wgpu::BufferUsages::COPY_SRC);
-        let bloom_a = scratch_buffer(device, "bloom_a", bloom_pixels * 16, wgpu::BufferUsages::empty());
-        let bloom_b = scratch_buffer(device, "bloom_b", bloom_pixels * 16, wgpu::BufferUsages::empty());
+        let bloom_a = scratch_buffer(device, "bloom_a", bloom_pixels * 16, none);
+        let bloom_b = scratch_buffer(device, "bloom_b", bloom_pixels * 16, none);
+        let den_pixels = if features.denoise { pixels } else { 0 };
+        let aov_albedo = scratch_buffer(device, "aov_albedo", den_pixels * 16, none);
+        let aov_normal = scratch_buffer(device, "aov_normal", den_pixels * 16, none);
+        let den_a = scratch_buffer(device, "denoise_a", den_pixels * 16, none);
+        let den_b = scratch_buffer(device, "denoise_b", den_pixels * 16, none);
+        let overlay = scratch_buffer(device, "overlay", if features.overlay { pixels * 16 } else { 0 }, none);
 
         let trace_bg = bind_group(
             device,
@@ -374,8 +421,44 @@ impl Renderer {
                 (5, env_texels.as_entire_binding()),
                 (6, env_cdf.as_entire_binding()),
                 (7, lights.as_entire_binding()),
+                (8, aov_albedo.as_entire_binding()),
+                (9, aov_normal.as_entire_binding()),
+                (10, overlay.as_entire_binding()),
             ],
         );
+        let denoise_init_bg = bind_group(
+            device,
+            "denoise_init",
+            &p.denoise_init.get_bind_group_layout(0),
+            &[(0, params.as_entire_binding()), (1, accum.as_entire_binding()), (2, aov_albedo.as_entire_binding()), (5, den_a.as_entire_binding())],
+        );
+        let denoise_bgs = (0..DENOISE_PASSES)
+            .map(|i| {
+                let info = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("denoise_pass"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM,
+                    mapped_at_creation: true,
+                });
+                let data = [1u32 << i, (i + 1 == DENOISE_PASSES) as u32, 0, 0];
+                info.slice(..).get_mapped_range_mut().expect("mapped at creation").copy_from_slice(bytemuck::bytes_of(&data));
+                info.unmap();
+                let (src, dst) = if i % 2 == 0 { (&den_a, &den_b) } else { (&den_b, &den_a) };
+                bind_group(
+                    device,
+                    "denoise_atrous",
+                    &p.denoise_atrous.get_bind_group_layout(0),
+                    &[
+                        (0, params.as_entire_binding()),
+                        (2, aov_albedo.as_entire_binding()),
+                        (3, aov_normal.as_entire_binding()),
+                        (4, src.as_entire_binding()),
+                        (5, dst.as_entire_binding()),
+                        (6, info.as_entire_binding()),
+                    ],
+                )
+            })
+            .collect();
         let post = |pipe_layout: wgpu::BindGroupLayout, label: &str, bindings: &[u32]| {
             let all = [
                 (0, params.as_entire_binding()),
@@ -383,6 +466,8 @@ impl Renderer {
                 (2, out.as_entire_binding()),
                 (3, bloom_a.as_entire_binding()),
                 (4, bloom_b.as_entire_binding()),
+                (5, den_b.as_entire_binding()),
+                (6, overlay.as_entire_binding()),
             ];
             let picked: Vec<_> = all.into_iter().filter(|(b, _)| bindings.contains(b)).collect();
             bind_group(device, label, &pipe_layout, &picked)
@@ -390,13 +475,16 @@ impl Renderer {
         Targets {
             width,
             height,
-            bloom_down_bg: post(p.bloom_down.get_bind_group_layout(0), "bloom_down", &[0, 1, 3]),
+            bloom_down_bg: post(p.bloom_down.get_bind_group_layout(0), "bloom_down", &[0, 1, 3, 5]),
             bloom_h_bg: post(p.bloom_h.get_bind_group_layout(0), "bloom_h", &[0, 3, 4]),
             bloom_v_bg: post(p.bloom_v.get_bind_group_layout(0), "bloom_v", &[0, 3, 4]),
-            resolve_bg: post(p.resolve.get_bind_group_layout(0), "resolve", &[0, 1, 2, 3]),
-            display_bg: p.display.as_ref().map(|d| post(d.get_bind_group_layout(0), "display", &[0, 1, 3])),
+            resolve_bg: post(p.resolve.get_bind_group_layout(0), "resolve", &[0, 1, 2, 3, 5, 6]),
+            display_bg: p.display.as_ref().map(|d| post(d.get_bind_group_layout(0), "display", &[0, 1, 3, 5, 6])),
             out,
             trace_bg,
+            features,
+            denoise_init_bg,
+            denoise_bgs,
         }
     }
 
@@ -413,6 +501,7 @@ impl Renderer {
             &self.env_cdf,
             width,
             height,
+            Features::wanted(&self.settings),
         );
         self.reset();
     }
@@ -597,8 +686,40 @@ impl Renderer {
             env: [self.env_size.0, self.env_size.1, self.light_count, 0],
             lens: [s.projection as u32 as f32, s.blades as f32, s.blade_rotation.to_radians(), 0.0],
             view: [self.offset.0 as f32, self.offset.1 as f32, 0.0, 0.0],
+            aux: [self.flags(), s.denoise_view as u32, s.bg_mode as u32, s.grid_spacing.clamp(1, 1024)],
+            bg_col: [s.bg_color.x, s.bg_color.y, s.bg_color.z, 0.0],
+            edge_col: [s.edge_color.x, s.edge_color.y, s.edge_color.z, s.edge_width.clamp(0.01, 1.0)],
+            grid_col: [s.grid_color.x, s.grid_color.y, s.grid_color.z, s.grid_width.clamp(0.001, 1.0)],
         };
         self.queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&p));
+    }
+
+    /// True when the denoiser runs on the displayed image.
+    pub fn denoising(&self) -> bool {
+        let s = &self.settings;
+        self.targets.features.denoise && s.denoise && s.denoise_view != DenoiseView::Original
+    }
+
+    fn flags(&self) -> u32 {
+        let s = &self.settings;
+        let overlay = self.targets.features.overlay;
+        let mut f = 0;
+        if self.denoising() {
+            f |= FLAG_DENOISE;
+        }
+        if overlay && s.show_edges {
+            f |= FLAG_EDGES;
+        }
+        if overlay && s.show_grid {
+            f |= FLAG_GRID;
+        }
+        if s.grid_ground_only {
+            f |= FLAG_GRID_GROUND_ONLY;
+        }
+        if s.bg_mode != BgMode::Sky {
+            f |= FLAG_BG_HIDDEN;
+        }
+        f
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -608,6 +729,9 @@ impl Renderer {
     /// Submit `samples` path-tracing passes.
     fn trace(&mut self, samples: u32) {
         self.update_env();
+        if Features::wanted(&self.settings) != self.targets.features {
+            self.rebuild_targets(self.targets.width, self.targets.height);
+        }
         let groups = (self.targets.width.div_ceil(8), self.targets.height.div_ceil(8));
         for _ in 0..samples {
             // Each sample needs its own frame index in the uniform buffer, so
@@ -622,6 +746,24 @@ impl Renderer {
             }
             self.queue.submit([enc.finish()]);
             self.frame += 1;
+        }
+    }
+
+    /// Record the denoiser passes if it is on.
+    fn encode_denoise(&self, enc: &mut wgpu::CommandEncoder) {
+        if !self.denoising() {
+            return;
+        }
+        let t = &self.targets;
+        let groups = (t.width.div_ceil(8), t.height.div_ceil(8));
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("denoise"), timestamp_writes: None });
+        pass.set_pipeline(&self.pipelines.denoise_init);
+        pass.set_bind_group(0, &t.denoise_init_bg, &[]);
+        pass.dispatch_workgroups(groups.0, groups.1, 1);
+        pass.set_pipeline(&self.pipelines.denoise_atrous);
+        for bg in &t.denoise_bgs {
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(groups.0, groups.1, 1);
         }
     }
 
@@ -687,6 +829,7 @@ impl Renderer {
         self.trace(samples);
         self.write_params();
         let mut enc = self.device.create_command_encoder(&Default::default());
+        self.encode_denoise(&mut enc);
         self.encode_bloom(&mut enc);
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -734,6 +877,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let mut enc = self.device.create_command_encoder(&Default::default());
+        self.encode_denoise(&mut enc);
         self.encode_bloom(&mut enc);
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("resolve"), timestamp_writes: None });

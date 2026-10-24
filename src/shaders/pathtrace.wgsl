@@ -42,6 +42,12 @@ const BIG: f32 = 1e30;
 @group(0) @binding(5) var<storage, read> env: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read> env_cdf: array<f32>;
 @group(0) @binding(7) var<storage, read> lights: array<Light>;
+// Denoiser AOVs (summed like `accum`): first non-glass hit albedo and the
+// squared luminance of the demodulated sample; normal and path depth.
+@group(0) @binding(8) var<storage, read_write> aov_albedo: array<vec4<f32>>;
+@group(0) @binding(9) var<storage, read_write> aov_normal: array<vec4<f32>>;
+// Edge / grid lines: rgb * coverage, coverage.
+@group(0) @binding(10) var<storage, read_write> overlay: array<vec4<f32>>;
 
 // ---------------------------------------------------------------- random
 
@@ -145,10 +151,6 @@ fn hg_sample(wo: vec3<f32>, g: f32) -> vec3<f32> {
 fn power_heuristic(a: f32, b: f32) -> f32 {
     let a2 = a * a;
     return a2 / max(a2 + b * b, 1e-20);
-}
-
-fn luminance(c: vec3<f32>) -> f32 {
-    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
 // ---------------------------------------------------------------- environment
@@ -505,6 +507,27 @@ fn direct(p: vec3<f32>, n: vec3<f32>, wo: vec3<f32>, g: f32) -> vec3<f32> {
 
 // ---------------------------------------------------------------- integrator
 
+// Per-sample outputs besides radiance, set by `radiance`.
+var<private> aov_done: bool;
+var<private> aov_a: vec3<f32>;
+var<private> aov_n: vec3<f32>;
+var<private> aov_t: f32;
+// Primary hit: 0 nothing, 1 voxel, 2 ground; distance and face normal.
+var<private> prim_hit: u32;
+var<private> prim_t: f32;
+var<private> prim_n: vec3<f32>;
+// 0 where a camera ray sees the (hidden) background.
+var<private> alpha: f32;
+
+fn record_aov(a: vec3<f32>, n: vec3<f32>, t: f32) {
+    if !aov_done {
+        aov_done = true;
+        aov_a = a;
+        aov_n = n;
+        aov_t = t;
+    }
+}
+
 fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
     var ro = ro_in;
     var rd = rd_in;
@@ -516,6 +539,8 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
     var n_scatter = 0u;
     // Pdf of the BSDF sample that produced `rd`; 0 after delta-like events.
     var last_pdf = 0.0;
+    // Distance travelled so far, for the depth AOV.
+    var path_t = 0.0;
     let max_diffuse = P.frame.w & 0xffu;
     let max_specular = (P.frame.w >> 8u) & 0xffu;
     let max_scatter = (P.frame.w >> 16u) & 0xffu;
@@ -524,6 +549,11 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
         let h = trace(ro, rd, inside, BIG);
         let tg = select(BIG, ground_t(ro, rd), inside == 0u);
         let t_surf = min(select(BIG, h.t, h.hit), tg);
+        if bounce == 0u {
+            prim_t = t_surf;
+            prim_hit = select(select(1u, 2u, tg < h.t), 0u, t_surf >= BIG);
+            prim_n = select(h.n, vec3<f32>(0.0, 0.0, 1.0), tg < h.t);
+        }
 
         // Inside a cloud voxel: free-flight sample against the exit distance.
         if inside != 0u && mats[inside].kind == KIND_MEDIA {
@@ -535,6 +565,8 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
                     break;
                 }
                 let p = ro + rd * tf;
+                record_aov(thr * cm.color.rgb, vec3<f32>(0.0), path_t + tf);
+                path_t += tf;
                 thr *= cm.color.rgb;
                 L += thr * direct(p, vec3<f32>(0.0), rd, cm.g);
                 let nd = hg_sample(rd, cm.g);
@@ -546,6 +578,7 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
             if h.v == 0u {
                 // Leave the cloud without refraction.
                 ro += rd * h.t - h.n * EPS;
+                path_t += h.t;
                 inside = 0u;
                 continue;
             }
@@ -561,6 +594,8 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
                     break;
                 }
                 let p = ro + rd * tf;
+                record_aov(thr * P.fog.rgb, vec3<f32>(0.0), path_t + tf);
+                path_t += tf;
                 thr *= P.fog.rgb;
                 let none = vec3<f32>(0.0);
                 L += thr * direct(p, none, rd, P.misc.z);
@@ -573,6 +608,14 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
         }
 
         if t_surf >= BIG {
+            if bounce == 0u && (P.aux.x & FLAG_BG_HIDDEN) != 0u {
+                // The background is composited later; light still comes
+                // from the sky for every other ray.
+                alpha = 0.0;
+                record_aov(vec3<f32>(1.0), vec3<f32>(0.0), 0.0);
+                break;
+            }
+            record_aov(thr, vec3<f32>(0.0), 0.0);
             let tex = env_texel(rd);
             var w = 1.0;
             if last_pdf > 0.0 {
@@ -607,6 +650,7 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
             }
         }
         let albedo = m.color.rgb;
+        path_t += t_surf;
 
         if m.kind == KIND_EMIT && inside == 0u {
             var w = 1.0;
@@ -627,6 +671,10 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
         }
         if kind == KIND_EMIT {
             kind = KIND_DIFFUSE;
+        }
+        if kind != KIND_GLASS && kind != KIND_MEDIA {
+            // Glass is looked through: the AOVs come from what lies behind.
+            record_aov(thr * albedo, n, path_t);
         }
         if kind == KIND_MEDIA {
             // Enter the cloud; scattering happens on the next iteration.
@@ -733,6 +781,7 @@ fn radiance(ro_in: vec3<f32>, rd_in: vec3<f32>) -> vec3<f32> {
             thr /= q;
         }
     }
+    record_aov(vec3<f32>(1.0), vec3<f32>(0.0), 0.0);
     let lum = max(L.x, max(L.y, L.z));
     if lum > P.misc.x {
         L *= P.misc.x / lum;
@@ -802,6 +851,110 @@ fn aperture_sample() -> vec2<f32> {
     return vec2<f32>(cos(a0), sin(a0)) * u.x + vec2<f32>(cos(a1), sin(a1)) * u.y;
 }
 
+// ---------------------------------------------------------------- overlays
+
+fn vox_at(c: vec3<i32>) -> u32 {
+    if any(c < vec3<i32>(0)) || any(c >= vec3<i32>(P.dims.xyz)) {
+        return 0u;
+    }
+    return textureLoad(vox, c, 0).r;
+}
+
+// World-space size of a pixel at distance `t`.
+fn footprint(t: f32) -> f32 {
+    let h = f32(P.frame.z);
+    if P.lens.x == PROJ_ORTHO {
+        return 2.0 * P.cam_right.w * P.cam_pos.w / h;
+    }
+    return t * 2.0 * P.cam_pos.w / h;
+}
+
+// Coverage of a line `half_width` either side of distance 0, widened to
+// at least a pixel (`fp`) and dimmed to match so it neither vanishes nor
+// aliases when small.
+fn line_cov(d: f32, half_width: f32, fp: f32) -> f32 {
+    let hw = max(half_width, fp * 0.5);
+    return select(0.0, min(1.0, half_width / hw), d < hw);
+}
+
+fn normal_axis(n: vec3<f32>) -> i32 {
+    return select(select(2, 1, abs(n.y) > 0.5), 0, abs(n.x) > 0.5);
+}
+
+// Lines on the edges of the face at `p` (normal `n`) where the surface
+// changes: an empty or differently colored in-plane neighbor, or a solid
+// cell beyond it (a concave crease).
+fn edge_cov(p: vec3<f32>, n: vec3<f32>, fp: f32) -> f32 {
+    let a = normal_axis(n);
+    let s = vec3<i32>(round(n));
+    let base = floor(p - n * 0.5);
+    let cell = vec3<i32>(base);
+    let v = vox_at(cell);
+    if v == 0u {
+        return 0.0;
+    }
+    let f = p - base;
+    let w = P.edge_col.w;
+    var cov = 0.0;
+    for (var k = 1; k <= 2; k++) {
+        let u = (a + k) % 3;
+        for (var side = 0; side < 2; side++) {
+            let c = line_cov(select(f[u], 1.0 - f[u], side == 1), w, fp);
+            if c <= cov {
+                continue;
+            }
+            var o = vec3<i32>(0);
+            o[u] = select(-1, 1, side == 1);
+            if vox_at(cell + o + s) != 0u || vox_at(cell + o) != v {
+                cov = c;
+            }
+        }
+    }
+    return cov;
+}
+
+fn grid_line(x: f32, sp: f32, fp: f32) -> f32 {
+    return line_cov(abs(x - round(x / sp) * sp), P.grid_col.w * 0.5, fp);
+}
+
+fn grid_cov(p: vec3<f32>, n: vec3<f32>, fp: f32) -> f32 {
+    let sp = f32(max(P.aux.w, 1u));
+    // Fade out where lines would be closer than a couple of pixels.
+    let fade = 1.0 - smoothstep(0.25, 0.5, fp / sp);
+    if fade <= 0.0 {
+        return 0.0;
+    }
+    let a = normal_axis(n);
+    return max(grid_line(p[(a + 1) % 3], sp, fp), grid_line(p[(a + 2) % 3], sp, fp)) * fade;
+}
+
+// Edge and grid lines for the primary ray: rgb * coverage, coverage.
+fn overlay_sample(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
+    let flags = P.aux.x;
+    var e = 0.0;
+    var g = 0.0;
+    if prim_hit == 1u {
+        let p = ro + rd * prim_t;
+        let fp = footprint(prim_t) / max(abs(dot(rd, prim_n)), 0.1);
+        if (flags & FLAG_EDGES) != 0u {
+            e = edge_cov(p, prim_n, fp);
+        }
+        if (flags & FLAG_GRID) != 0u && (flags & FLAG_GRID_GROUND_ONLY) == 0u {
+            g = grid_cov(p, prim_n, fp);
+        }
+    }
+    if (flags & FLAG_GRID) != 0u && abs(rd.z) > 1e-6 {
+        // The ground plane, drawn even when the ground itself is off.
+        let tp = -ro.z / rd.z;
+        if tp > 0.0 && (prim_hit != 1u || tp < prim_t) {
+            let fp = footprint(tp) / max(abs(rd.z), 0.1);
+            g = max(g, grid_cov(ro + rd * tp, vec3<f32>(0.0, 0.0, 1.0), fp));
+        }
+    }
+    let cov = e + (1.0 - e) * g;
+    return vec4<f32>(P.edge_col.rgb * e + P.grid_col.rgb * g * (1.0 - e), cov);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w = P.frame.y;
@@ -830,10 +983,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         rd = normalize(focus - ro);
     }
 
-    let c = vec4<f32>(radiance(ro, rd), 1.0);
-    if P.frame.x == 0u {
+    aov_done = false;
+    prim_hit = 0u;
+    prim_t = BIG;
+    alpha = 1.0;
+    let L = radiance(ro, rd);
+    // w accumulates coverage; the sample count is `P.frame.x`.
+    let c = vec4<f32>(L, alpha);
+    let first = P.frame.x == 0u;
+    if first {
         accum[idx] = c;
     } else {
         accum[idx] += c;
+    }
+    let flags = P.aux.x;
+    if (flags & FLAG_DENOISE) != 0u {
+        let l = luminance(L / max(aov_a, vec3<f32>(DEMOD_EPS)));
+        let a = vec4<f32>(aov_a, l * l);
+        let n = vec4<f32>(aov_n, aov_t);
+        if first {
+            aov_albedo[idx] = a;
+            aov_normal[idx] = n;
+        } else {
+            aov_albedo[idx] += a;
+            aov_normal[idx] += n;
+        }
+    }
+    if (flags & (FLAG_EDGES | FLAG_GRID)) != 0u {
+        let o = overlay_sample(ro, rd);
+        if first {
+            overlay[idx] = o;
+        } else {
+            overlay[idx] += o;
+        }
     }
 }

@@ -170,6 +170,47 @@ pub struct RenderSettings {
     pub max_specular: u32,
     pub max_scatter: u32,
     pub clamp: f32,
+    /// Edge-aware denoising of the accumulated image (display only).
+    pub denoise: bool,
+    pub denoise_view: DenoiseView,
+    /// Lines along silhouette, crease and color-change voxel edges.
+    pub show_edges: bool,
+    pub edge_color: Vec3,
+    /// Fraction of a voxel, 0.01..1.
+    pub edge_width: f32,
+    /// Grid lines on the ground plane (and voxel faces unless ground only).
+    pub show_grid: bool,
+    pub grid_color: Vec3,
+    /// Voxels between lines, 1..1024.
+    pub grid_spacing: u32,
+    /// Line width as a fraction of a voxel.
+    pub grid_width: f32,
+    pub grid_ground_only: bool,
+    /// What camera rays that miss everything show (lighting is unaffected).
+    pub bg_mode: BgMode,
+    pub bg_color: Vec3,
+}
+
+/// Which image to show while denoising: the filtered one, the raw
+/// accumulation, or original on the left and denoised on the right.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DenoiseView {
+    #[default]
+    Denoised = 0,
+    Original = 1,
+    Split = 2,
+}
+
+/// The directly visible background.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BgMode {
+    /// The sky / environment map.
+    #[default]
+    Sky = 0,
+    /// A solid `bg_color`.
+    Color = 1,
+    /// Alpha 0 in saved images; a checkerboard in the window.
+    Transparent = 2,
 }
 
 impl Default for RenderSettings {
@@ -219,6 +260,18 @@ impl Default for RenderSettings {
             max_specular: 8,
             max_scatter: 8,
             clamp: 50.0,
+            denoise: false,
+            denoise_view: DenoiseView::Denoised,
+            show_edges: false,
+            edge_color: Vec3::ZERO,
+            edge_width: 0.1,
+            show_grid: false,
+            grid_color: srgb_to_linear(Vec3::splat(40.0 / 255.0)),
+            grid_spacing: 1,
+            grid_width: 0.05,
+            grid_ground_only: false,
+            bg_mode: BgMode::Sky,
+            bg_color: srgb_to_linear(Vec3::splat(40.0 / 255.0)),
         }
     }
 }
