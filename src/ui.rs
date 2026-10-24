@@ -936,6 +936,7 @@ pub fn project_panel(
     ui: &mut Ui,
     tab: &mut ProjectTab,
     projects: &[PathBuf],
+    samples: &[PathBuf],
     current: &Path,
     pattern: Option<&str>,
     shaders: &mut ShaderState,
@@ -951,18 +952,26 @@ pub fn project_panel(
     egui::ScrollArea::vertical().show(ui, |ui| {
         match *tab {
             ProjectTab::Project | ProjectTab::Pattern => {
-                if projects.is_empty() {
-                    ui.add(egui::Label::new(egui::RichText::new("Open a .vox file to list its folder here").weak()).wrap());
-                }
-                for p in projects {
-                    let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    if *tab == ProjectTab::Project {
-                        if ui.selectable_label(p == current, name).clicked() {
+                let pattern_tab = *tab == ProjectTab::Pattern;
+                for (title, list) in [("My projects", projects), ("Samples", samples)] {
+                    if list.is_empty() && title == "Samples" {
+                        continue;
+                    }
+                    ui.label(egui::RichText::new(title).small().strong());
+                    if list.is_empty() {
+                        ui.add(egui::Label::new(egui::RichText::new("Saved projects appear here").weak()).wrap());
+                    }
+                    for p in list {
+                        let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        if pattern_tab {
+                            if ui.selectable_label(pattern == Some(name.as_str()), name).clicked() {
+                                cmds.push(Command::LoadPattern(p.clone()));
+                            }
+                        } else if ui.selectable_label(p == current, name).on_hover_text(p.display().to_string()).clicked() {
                             cmds.push(Command::OpenPath(p.clone()));
                         }
-                    } else if ui.selectable_label(pattern == Some(name.as_str()), name).clicked() {
-                        cmds.push(Command::LoadPattern(p.clone()));
                     }
+                    ui.add_space(6.0);
                 }
             }
             ProjectTab::Shader => {

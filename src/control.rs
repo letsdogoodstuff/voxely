@@ -30,7 +30,9 @@ pub const INSTRUCTIONS: &str = "\
 voxely is a MagicaVoxel-style voxel editor and path tracer. Coordinates are integer voxel cells \
 [x, y, z] with z up, from 0 to size-1 on each axis. Colors are palette indices 1-255 (0 = empty) or \
 \"#rrggbb\" strings, which pick the nearest palette color (use set_palette_colors to define exact colors). \
-Typical flow: new_scene -> draw with fill_box / draw_shape / draw_line / set_voxels -> look with \
+Projects live in a workspace folder and show in the window's Project list; use new_project to start \
+a named one, list_projects / open_project to flip between them, and save_file to save. \
+Typical flow: new_project -> draw with fill_box / draw_shape / draw_line / set_voxels -> look with \
 screenshot (fast) -> set_material and set_render_settings -> render (path traced) -> save_file. \
 Every edit is undoable. If the voxely window is open, edits appear in it live.";
 
@@ -58,12 +60,20 @@ pub fn tools() -> Value {
     let axis = json!({ "type": "string", "enum": ["x", "y", "z"] });
     json!([
         tool("get_scene_info", "Canvas size, voxel count and bounds, colors in use, file, selection, camera and mode.", json!({}), &[]),
-        tool("new_scene", "Start a new project. Empty unless `fill` is given.", json!({
+        tool("new_project", "Create a named project in the workspace (it appears in the window's Project list) and make it current. Empty unless `fill` is given.", json!({
+            "name": { "type": "string", "description": "Letters, digits, spaces, - and _" },
+            "size": xyz("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
+            "fill": color_schema(),
+            "overwrite": { "type": "boolean", "description": "Replace an existing project with this name" },
+        }), &["name"]),
+        tool("list_projects", "The workspace's projects (newest first) and MagicaVoxel's sample models.", json!({}), &[]),
+        tool("open_project", "Open a project or sample by name.", json!({ "name": { "type": "string" } }), &["name"]),
+        tool("new_scene", "Start a new unnamed project (saved as project, project-2, ... in the workspace). Empty unless `fill` is given.", json!({
             "size": xyz("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
             "fill": color_schema(),
         }), &[]),
         tool("open_file", "Open a MagicaVoxel .vox file (all models are merged into one canvas).", json!({ "path": { "type": "string" } }), &["path"]),
-        tool("save_file", "Save the project as .vox. Without `path`, saves to the current save path.", json!({ "path": { "type": "string" } }), &[]),
+        tool("save_file", "Save the project as .vox. Without `path`, saves the current project in the workspace.", json!({ "path": { "type": "string" } }), &[]),
         tool("set_voxels", "Set individual voxels. Color 0 erases.", json!({
             "voxels": { "type": "array", "description": "[[x, y, z, color], ...]; color is an index or \"#rrggbb\"", "items": { "type": "array", "items": { "type": ["integer", "string"] } } },
         }), &["voxels"]),
@@ -433,16 +443,54 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             Ok(edited(ctx, true, &format!("Opened {}", path.display())))
         }
         "save_file" => {
-            if let Some(p) = string(a, "path") {
-                ctx.ed.save_path = PathBuf::from(p).with_extension("vox");
-            }
-            let path = ctx.ed.save_path.clone();
-            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::create_dir_all(dir)?;
-            }
-            ctx.scene.save(&path)?;
+            let path = string(a, "path").map_or_else(|| ctx.ed.save_path.clone(), |p| PathBuf::from(p).with_extension("vox"));
+            let path = app::save_project(ctx.scene, ctx.ed, path)?;
             let full = std::fs::canonicalize(&path).unwrap_or(path);
             Ok(vec![text(format!("Saved {}", full.display()))])
+        }
+        "new_project" => {
+            let name = string(a, "name").context("missing `name`")?.trim();
+            if name.is_empty() || name.len() > 80 || !name.chars().all(|c| c.is_alphanumeric() || " -_".contains(c)) {
+                bail!("project names use letters, digits, spaces, - and _");
+            }
+            let path = app::project_path(name);
+            if path.exists() && !boolean(a, "overwrite").unwrap_or(false) {
+                bail!("a project named {name:?} exists; open_project it, or pass overwrite: true");
+            }
+            let size = opt_ivec3(a, "size")?.unwrap_or(IVec3::splat(40));
+            if size.cmplt(IVec3::ONE).any() || size.cmpgt(IVec3::splat(ops::MAX_DIM)).any() {
+                bail!("size must be 1..={} per axis", ops::MAX_DIM);
+            }
+            let ibl = ctx.r.settings.ibl_path.clone();
+            *ctx.scene = Scene::empty(size);
+            ctx.scene.settings.ibl_path = ibl;
+            if let Some(c) = get(a, "fill") {
+                let c = color(ctx.scene, c)?;
+                ctx.scene.volume = ops::full(&ctx.scene.volume, c);
+            }
+            app::loaded(ctx.r, ctx.scene, ctx.ed);
+            let path = app::save_project(ctx.scene, ctx.ed, path)?;
+            Ok(edited(ctx, true, &format!("Created project {name:?} at {}", path.display())))
+        }
+        "list_projects" => {
+            ctx.ed.rescan();
+            let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let mut projects: Vec<&PathBuf> = ctx.ed.projects.iter().collect();
+            projects.sort_by_key(|p| std::cmp::Reverse(modified(p)));
+            let stem = |p: &PathBuf| p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let current = ctx.ed.source.as_ref();
+            let list: Vec<Value> = projects.iter().map(|p| json!({ "name": stem(p), "current": Some(*p) == current })).collect();
+            let samples: Vec<String> = ctx.ed.samples.iter().map(stem).collect();
+            let out = json!({ "workspace": app::workspace_dir().display().to_string(), "projects": list, "samples": samples });
+            Ok(vec![text(serde_json::to_string_pretty(&out)?)])
+        }
+        "open_project" => {
+            let name = string(a, "name").context("missing `name`")?;
+            ctx.ed.rescan();
+            let matches = |p: &&PathBuf| p.file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(name));
+            let path = ctx.ed.projects.iter().find(matches).or_else(|| ctx.ed.samples.iter().find(matches)).cloned().ok_or_else(|| anyhow!("no project or sample named {name:?}; see list_projects"))?;
+            app::open_project(path.clone(), ctx.r, ctx.scene, ctx.ed)?;
+            Ok(edited(ctx, true, &format!("Opened {}", path.display())))
         }
         "set_voxels" => {
             let list = get(a, "voxels").and_then(Value::as_array).context("`voxels` must be [[x, y, z, color], ...]")?;

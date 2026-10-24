@@ -47,11 +47,19 @@ Options:
 - `--assets <dir>`: MagicaVoxel's install folder, for its shaders, palettes and models.
   You can also set `VOXELY_ASSETS`.
 
+### Projects
+
+Projects live in a workspace folder, `~/Documents/voxely` (set `VOXELY_WORKSPACE` to change it).
+The window's Project column lists them under **My projects**, above MagicaVoxel's **Samples**, and
+re-reads the folder every second, so projects an agent creates show up while you watch. Ctrl+S saves
+the current project there; opening a sample and saving makes a copy, leaving the original alone.
+
 ### Tools
 
 | Area | Tools |
 |---|---|
-| Scene | `get_scene_info`, `new_scene`, `open_file`, `save_file`, `resize_canvas` |
+| Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
+| Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
 | Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid), `draw_line` |
 | Reading | `get_voxels`, `get_slice` (a text map of one layer) |
 | Model tools | `edit_model` (MagicaVoxel's Edit panel: fill, hull, mirror, rotate, …), `transform_model` (scale/shear/rotate/repeat) |

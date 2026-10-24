@@ -34,8 +34,12 @@ pub struct EditState {
     /// The file the project was opened from, if any.
     pub source: Option<PathBuf>,
     pub save_path: PathBuf,
-    /// `.vox` files next to the source, for the Project list.
+    /// The user's projects: `.vox` files in the workspace folder.
     pub projects: Vec<PathBuf>,
+    /// MagicaVoxel's sample models (its `vox` folder), when known.
+    pub samples: Vec<PathBuf>,
+    /// When `projects` was last read from disk.
+    scanned: std::time::Instant,
     /// Palette images in MagicaVoxel's `palette` folder.
     pub palettes: Vec<PathBuf>,
     pub project_tab: ui::ProjectTab,
@@ -58,9 +62,11 @@ pub struct EditState {
 
 impl EditState {
     pub fn new(color: u8, source: Option<PathBuf>, save_path: PathBuf) -> Self {
-        let projects = list_projects(source.as_deref());
+        let samples = list_samples(source.as_deref());
         let palettes = list_palettes(source.as_deref());
         EditState {
+            samples,
+            scanned: std::time::Instant::now(),
             palettes,
             project_tab: ui::ProjectTab::default(),
             free_look: false,
@@ -76,7 +82,7 @@ impl EditState {
             enabled: true,
             source,
             save_path,
-            projects,
+            projects: list_vox(&workspace_dir()),
             canvas: IVec3::ZERO,
             canvas_for: IVec3::ZERO,
             marquee: None,
@@ -84,14 +90,58 @@ impl EditState {
         }
     }
 
-    fn name(&self) -> String {
+    pub(crate) fn name(&self) -> String {
         self.save_path.file_stem().map_or("project".into(), |n| n.to_string_lossy().into_owned())
+    }
+
+    /// Re-read the workspace's project list.
+    pub fn rescan(&mut self) {
+        self.projects = list_vox(&workspace_dir());
+        self.scanned = std::time::Instant::now();
+    }
+
+    /// Re-read the project list if it's more than a second old, so
+    /// projects saved elsewhere (e.g. by an agent) show up.
+    fn rescan_if_stale(&mut self) {
+        if self.scanned.elapsed() > std::time::Duration::from_secs(1) {
+            self.rescan();
+        }
     }
 }
 
-/// Sorted `.vox` files in the directory of `source`.
-fn list_projects(source: Option<&Path>) -> Vec<PathBuf> {
-    let Some(dir) = source.and_then(Path::parent) else { return Vec::new() };
+/// Where projects are saved and listed: `$VOXELY_WORKSPACE`, or
+/// `~/Documents/voxely`.
+pub fn workspace_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("VOXELY_WORKSPACE") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join("Documents").join("voxely")
+}
+
+/// The workspace file for a project name.
+pub fn project_path(name: &str) -> PathBuf {
+    workspace_dir().join(format!("{name}.vox"))
+}
+
+/// Sample models: the `.vox` files next to `source`, unless that is the
+/// workspace itself.
+fn list_samples(source: Option<&Path>) -> Vec<PathBuf> {
+    match source.and_then(Path::parent) {
+        Some(dir) if !same_dir(dir, &workspace_dir()) => list_vox(dir),
+        _ => Vec::new(),
+    }
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Sorted `.vox` files in `dir`.
+pub fn list_vox(dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -205,11 +255,34 @@ fn is_iso(r: &Renderer) -> bool {
     r.settings.projection == Projection::Orthographic && (k - k.round()).abs() < 1e-3 && (r.camera.pitch - (1.0 / 2f32.sqrt()).atan()).abs() < 1e-3
 }
 
-/// Where Ctrl+S writes a project by default: `export/<name>.vox`, so the
-/// original (which saving flattens) is not overwritten.
+/// Where Ctrl+S writes a project by default. Projects already in the
+/// workspace save in place; anything else (a sample, a file elsewhere, a
+/// new project) gets a copy in the workspace, so originals are never
+/// overwritten by saving's flattening.
 pub fn default_save_path(source: Option<&Path>) -> PathBuf {
-    let name = source.and_then(Path::file_name).map_or("project.vox".into(), |n| n.to_string_lossy().into_owned());
-    PathBuf::from("export").join(name)
+    if let Some(src) = source {
+        if src.parent().is_some_and(|d| same_dir(d, &workspace_dir())) {
+            return src.to_path_buf();
+        }
+    }
+    let stem = source.and_then(Path::file_stem).map_or("project".into(), |n| n.to_string_lossy().into_owned());
+    if source.is_some() {
+        return project_path(&stem);
+    }
+    // A new project: the first free "project", "project-2", ...
+    (1..).map(|k| if k == 1 { project_path(&stem) } else { project_path(&format!("{stem}-{k}")) }).find(|p| !p.exists()).unwrap()
+}
+
+/// Save to `path` and make it the current project.
+pub fn save_project(scene: &Scene, ed: &mut EditState, path: PathBuf) -> Result<PathBuf> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    scene.save(&path)?;
+    ed.save_path = path.clone();
+    ed.source = Some(path.clone());
+    ed.rescan();
+    Ok(path)
 }
 
 /// Push voxel edits to the GPU, refreshing emissive faces if any exist.
@@ -220,14 +293,6 @@ pub fn sync_volume(r: &mut Renderer, scene: &mut Scene, editor: &mut Editor) {
     if any_emit || !scene.lights.is_empty() {
         scene.rebuild_lights();
         r.set_lights(&scene.lights, scene.light_power);
-    }
-}
-
-pub fn save(scene: &Scene, path: &Path) {
-    let result = path.parent().map_or(Ok(()), std::fs::create_dir_all).map_err(anyhow::Error::from).and_then(|_| scene.save(path));
-    match result {
-        Ok(()) => eprintln!("saved {}", path.display()),
-        Err(e) => eprintln!("save failed: {e:#}"),
     }
 }
 
@@ -258,7 +323,10 @@ fn solid_bounds(scene: &Scene, sel: Option<&[bool]>) -> Option<(Vec3, Vec3)> {
 /// `model` (a file in MagicaVoxel's vox folder). Lists that come up empty
 /// keep what was found before.
 pub(crate) fn set_asset_lists(ed: &mut EditState, model: &Path) {
-    ed.projects = list_projects(Some(model));
+    let samples = list_samples(Some(model));
+    if !samples.is_empty() {
+        ed.samples = samples;
+    }
     let palettes = list_palettes(Some(model));
     if !palettes.is_empty() {
         ed.palettes = palettes;
@@ -381,15 +449,21 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::Save => {
-            save(scene, &ed.save_path);
+            let path = ed.save_path.clone();
+            match save_project(scene, ed, path) {
+                Ok(p) => eprintln!("saved {}", p.display()),
+                Err(e) => eprintln!("save failed: {e:#}"),
+            }
             false
         }
         Command::SaveAs => {
-            let dir = ed.save_path.parent().filter(|d| d.is_dir()).map_or_else(|| dialog_dir(ed), Path::to_path_buf);
+            let dir = ed.save_path.parent().filter(|d| d.is_dir()).map_or_else(workspace_dir, Path::to_path_buf);
             let dialog = rfd::FileDialog::new().add_filter("MagicaVoxel", &["vox"]).set_directory(dir).set_file_name(format!("{}.vox", ed.name()));
             if let Some(p) = dialog.save_file() {
-                ed.save_path = p.with_extension("vox");
-                save(scene, &ed.save_path);
+                match save_project(scene, ed, p.with_extension("vox")) {
+                    Ok(p) => eprintln!("saved {}", p.display()),
+                    Err(e) => eprintln!("save failed: {e:#}"),
+                }
             }
             false
         }
@@ -713,7 +787,8 @@ pub fn build_ui(
         egui::Panel::right("project").exact_size(150.0).resizable(false).show(ui, |ui| {
             let current = ed.source.clone().unwrap_or_default();
             let pattern = ed.editor.pattern.as_ref().map(|p| p.name.clone());
-            ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &current, pattern.as_deref(), &mut ed.shaders, cmds);
+            ed.rescan_if_stale();
+            ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &ed.samples, &current, pattern.as_deref(), &mut ed.shaders, cmds);
         });
         if r.modeling {
             egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
