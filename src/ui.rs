@@ -64,6 +64,24 @@ pub enum Command {
     LoadPattern(PathBuf),
     /// Make the selection the pattern.
     PatternFromSelection,
+    /// Choose the voxel shader for the Code brush and Run.
+    SelectShader(PathBuf),
+    /// Run the chosen voxel shader over the model (or the selection).
+    RunShader,
+    /// Paste the copied material onto the selected color.
+    PasteMaterial,
+    ResetMaterial,
+    /// Render the final image at the Image size and save it.
+    RenderImage,
+}
+
+/// The chosen voxel shader and its argument values.
+pub struct ShaderState {
+    pub files: Vec<PathBuf>,
+    pub current: Option<(PathBuf, crate::xs::XsShader)>,
+    pub values: Vec<f32>,
+    /// Last compile or run error.
+    pub error: Option<String>,
 }
 
 /// Which list the Project column shows, like MagicaVoxel's tabs.
@@ -105,108 +123,210 @@ fn color(ui: &mut Ui, label: &str, c: &mut Vec3) {
     });
 }
 
-pub fn settings_panel(ui: &mut Ui, s: &mut RenderSettings, state: &PanelState, spp: u32, size: (u32, u32), cmds: &mut Vec<Command>) {
+/// Which settings the left render column shows, like MagicaVoxel's
+/// Light / Sample / Display tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum LightTab {
+    #[default]
+    All,
+    Light,
+    Sample,
+    Display,
+}
+
+/// Which settings the right render column shows: Matter / Camera / Image.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum MatterTab {
+    #[default]
+    All,
+    Matter,
+    Camera,
+    Image,
+}
+
+/// Final-render image settings.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageSettings {
+    pub width: u32,
+    pub height: u32,
+    pub spp: u32,
+}
+
+impl Default for ImageSettings {
+    fn default() -> Self {
+        ImageSettings { width: 1280, height: 720, spp: 256 }
+    }
+}
+
+/// Left render column: lighting, sampling and display settings.
+pub fn light_panel(ui: &mut Ui, tab: &mut LightTab, s: &mut RenderSettings, state: &PanelState) {
     ui.horizontal(|ui| {
-        ui.label(format!("{spp} spp · {}×{}", size.0, size.1));
-        command(ui, cmds, "Snapshot", "6", Command::Snapshot);
+        ui.selectable_value(tab, LightTab::All, "All");
+        ui.selectable_value(tab, LightTab::Light, "Light");
+        ui.selectable_value(tab, LightTab::Sample, "Sample");
+        ui.selectable_value(tab, LightTab::Display, "Display");
     });
     ui.separator();
-
+    let show = |t: LightTab| *tab == LightTab::All || *tab == t;
+    let (light, sample, display) = (show(LightTab::Light), show(LightTab::Sample), show(LightTab::Display));
     egui::ScrollArea::vertical().show(ui, |ui| {
-        CollapsingHeader::new("Sun").default_open(true).show(ui, |ui| {
-            slider(ui, "Pitch", &mut s.sun_pitch, -90.0..=90.0);
-            slider(ui, "Yaw", &mut s.sun_yaw, 0.0..=360.0);
-            slider(ui, "Area", &mut s.sun_area, 0.0..=1.0);
-            slider(ui, "Intensity", &mut s.sun_intensity, 0.0..=5.0);
-            color(ui, "Color", &mut s.sun_color);
-            ui.checkbox(&mut s.sun_disk, "Show sun disk");
-        });
-
-        CollapsingHeader::new("Sky").default_open(true).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut s.env_mode, EnvMode::Uniform, "Uniform");
-                ui.selectable_value(&mut s.env_mode, EnvMode::Atmosphere, "Atmosphere");
-                ui.selectable_value(&mut s.env_mode, EnvMode::Image, "Image");
+        if light {
+            CollapsingHeader::new("Sun").default_open(true).show(ui, |ui| {
+                slider(ui, "Pitch", &mut s.sun_pitch, -90.0..=90.0);
+                slider(ui, "Yaw", &mut s.sun_yaw, 0.0..=360.0);
+                slider(ui, "Area", &mut s.sun_area, 0.0..=1.0);
+                slider(ui, "Intensity", &mut s.sun_intensity, 0.0..=5.0);
+                color(ui, "Color", &mut s.sun_color);
+                ui.checkbox(&mut s.sun_disk, "Show sun disk");
             });
-            match s.env_mode {
-                EnvMode::Uniform => {
-                    slider(ui, "Intensity", &mut s.sky_intensity, 0.0..=5.0);
-                    color(ui, "Color", &mut s.sky_color);
-                }
-                EnvMode::Atmosphere => {
-                    slider(ui, "Rayleigh", &mut s.rayleigh_density, 0.0..=2.0);
-                    color(ui, "Rayleigh color", &mut s.rayleigh_color);
-                    slider(ui, "Mie", &mut s.mie_density, 0.0..=2.0);
-                    slider(ui, "Mie phase", &mut s.mie_g, 0.5..=0.99);
-                    color(ui, "Mie color", &mut s.mie_color);
-                    slider(ui, "Ozone", &mut s.ozone_density, 0.0..=2.0);
-                    color(ui, "Ozone color", &mut s.ozone_color);
-                }
-                EnvMode::Image => {
-                    let name = |p: &PathBuf| p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let current = s.ibl_path.as_ref().map(name).unwrap_or_else(|| "none".into());
-                    ComboBox::from_label("Image").selected_text(current).show_ui(ui, |ui| {
-                        for f in &state.ibl_files {
-                            ui.selectable_value(&mut s.ibl_path, Some(f.clone()), name(f));
-                        }
-                    });
-                    slider(ui, "Intensity", &mut s.ibl_intensity, 0.0..=5.0);
-                    slider(ui, "Rotation", &mut s.ibl_rotation, 0.0..=1.0);
-                }
-            }
-        });
-
-        CollapsingHeader::new("Fog").show(ui, |ui| {
-            slider(ui, "Density", &mut s.fog_density, 0.0..=5.0);
-            slider(ui, "Phase", &mut s.fog_g, -0.9..=0.9);
-            color(ui, "Color", &mut s.fog_color);
-        });
-
-        CollapsingHeader::new("Lens").default_open(true).show(ui, |ui| {
-            ComboBox::from_label("Projection").selected_text(format!("{:?}", s.projection)).show_ui(ui, |ui| {
-                for p in [
-                    Projection::Perspective,
-                    Projection::Orthographic,
-                    Projection::Stereographic,
-                    Projection::Panorama,
-                    Projection::Cylindrical,
-                ] {
-                    ui.selectable_value(&mut s.projection, p, format!("{p:?}"));
+            CollapsingHeader::new("Sky").default_open(true).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut s.env_mode, EnvMode::Uniform, "Uniform");
+                    ui.selectable_value(&mut s.env_mode, EnvMode::Atmosphere, "Atmo");
+                    ui.selectable_value(&mut s.env_mode, EnvMode::Image, "IBL");
+                });
+                match s.env_mode {
+                    EnvMode::Uniform => {
+                        slider(ui, "Intensity", &mut s.sky_intensity, 0.0..=5.0);
+                        color(ui, "Color", &mut s.sky_color);
+                    }
+                    EnvMode::Atmosphere => {
+                        slider(ui, "Rayleigh", &mut s.rayleigh_density, 0.0..=2.0);
+                        color(ui, "Rayleigh color", &mut s.rayleigh_color);
+                        slider(ui, "Mie", &mut s.mie_density, 0.0..=2.0);
+                        slider(ui, "Mie phase", &mut s.mie_g, 0.5..=0.99);
+                        color(ui, "Mie color", &mut s.mie_color);
+                        slider(ui, "Ozone", &mut s.ozone_density, 0.0..=2.0);
+                        color(ui, "Ozone color", &mut s.ozone_color);
+                    }
+                    EnvMode::Image => {
+                        let name = |p: &PathBuf| p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let current = s.ibl_path.as_ref().map(name).unwrap_or_else(|| "none".into());
+                        ComboBox::from_label("Image").selected_text(current).show_ui(ui, |ui| {
+                            for f in &state.ibl_files {
+                                ui.selectable_value(&mut s.ibl_path, Some(f.clone()), name(f));
+                            }
+                        });
+                        slider(ui, "Intensity", &mut s.ibl_intensity, 0.0..=5.0);
+                        slider(ui, "Rotation", &mut s.ibl_rotation, 0.0..=1.0);
+                    }
                 }
             });
-            slider(ui, "Field of view", &mut s.fov, 1.0..=170.0);
-            slider(ui, "Aperture", &mut s.aperture, 0.0..=2.0);
-            slider_u(ui, "Blades", &mut s.blades, 0..=8);
-            slider(ui, "Blade rotation", &mut s.blade_rotation, -180.0..=180.0);
-        });
-
-        CollapsingHeader::new("Film").default_open(true).show(ui, |ui| {
-            slider(ui, "Exposure", &mut s.exposure, 0.0..=8.0);
-            slider(ui, "Vignette", &mut s.vignette, 0.0..=1.0);
-            slider(ui, "Gamma", &mut s.gamma, 1.0..=5.0);
-            ui.checkbox(&mut s.aces, "ACES tone mapping");
-            ui.checkbox(&mut s.bloom, "Bloom");
-            if s.bloom {
-                slider(ui, "Mix", &mut s.bloom_mix, 0.0..=1.0);
-                slider(ui, "Size", &mut s.bloom_scale, 0.0..=1.0);
-                slider(ui, "Aspect", &mut s.bloom_aspect, 0.0..=1.0);
-                slider(ui, "Threshold", &mut s.bloom_threshold, 0.0..=5.0);
-            }
-        });
-
-        CollapsingHeader::new("Sample").show(ui, |ui| {
-            slider_u(ui, "Diffuse depth", &mut s.max_diffuse, 0..=15);
-            slider_u(ui, "Specular depth", &mut s.max_specular, 5..=15);
-            slider_u(ui, "Scatter depth", &mut s.max_scatter, 5..=15);
-            slider(ui, "Clamp energy", &mut s.clamp, 1.0..=5000.0);
-            ui.checkbox(&mut s.translucent_shadows, "Translucent shadows");
-        });
-
-        CollapsingHeader::new("Display").show(ui, |ui| {
-            ui.checkbox(&mut s.ground, "Ground");
-            color(ui, "Ground color", &mut s.ground_color);
-        });
+            CollapsingHeader::new("Fog").show(ui, |ui| {
+                slider(ui, "Density", &mut s.fog_density, 0.0..=5.0);
+                slider(ui, "Phase", &mut s.fog_g, -0.9..=0.9);
+                color(ui, "Color", &mut s.fog_color);
+            });
+        }
+        if sample {
+            CollapsingHeader::new("Sample").default_open(true).show(ui, |ui| {
+                slider_u(ui, "Diffuse", &mut s.max_diffuse, 0..=15);
+                slider_u(ui, "Specular", &mut s.max_specular, 5..=15);
+                slider_u(ui, "Scatter", &mut s.max_scatter, 5..=15);
+                slider(ui, "Energy", &mut s.clamp, 1.0..=5000.0);
+                ui.checkbox(&mut s.translucent_shadows, "TR-Shadow").on_hover_text("Translucent shadow");
+            });
+        }
+        if display {
+            CollapsingHeader::new("Display").default_open(true).show(ui, |ui| {
+                ui.checkbox(&mut s.ground, "Ground");
+                color(ui, "Ground color", &mut s.ground_color);
+            });
+        }
     });
+}
+
+/// What the right render column asks for.
+pub struct MatterState<'a> {
+    pub tab: &'a mut MatterTab,
+    pub clipboard: &'a mut Option<GpuMaterial>,
+    pub image: &'a mut ImageSettings,
+    pub spp: u32,
+    pub size: (u32, u32),
+}
+
+/// Right render column: material of the selected color, camera and image.
+pub fn matter_panel(ui: &mut Ui, s: &mut RenderSettings, e: &Editor, scene: &mut Scene, m: MatterState, cmds: &mut Vec<Command>) -> EditActions {
+    let mut a = EditActions::default();
+    let tab = m.tab;
+    ui.horizontal(|ui| {
+        ui.selectable_value(tab, MatterTab::All, "All");
+        ui.selectable_value(tab, MatterTab::Matter, "Matter");
+        ui.selectable_value(tab, MatterTab::Camera, "Camera");
+        ui.selectable_value(tab, MatterTab::Image, "Image");
+    });
+    ui.separator();
+    let show = |t: MatterTab| *tab == MatterTab::All || *tab == t;
+    let (matter, camera, image) = (show(MatterTab::Matter), show(MatterTab::Camera), show(MatterTab::Image));
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        if matter {
+            CollapsingHeader::new("Material").default_open(true).show(ui, |ui| {
+                let i = e.color as usize;
+                ui.label(format!("Color #{i}"));
+                let before = scene.materials[i];
+                material_editor(ui, &mut scene.materials[i]);
+                ui.horizontal(|ui| {
+                    if ui.button("Copy").on_hover_text("Copy material [Ctrl+C]").clicked() {
+                        *m.clipboard = Some(scene.materials[i]);
+                    }
+                    if ui.add_enabled(m.clipboard.is_some(), egui::Button::new("Paste")).on_hover_text("Paste material [Ctrl+V]").clicked() {
+                        cmds.push(Command::PasteMaterial);
+                    }
+                    if ui.button("Reset").on_hover_text("Reset to diffuse [Ctrl+R]").clicked() {
+                        cmds.push(Command::ResetMaterial);
+                    }
+                });
+                if bytemuck::bytes_of(&before) != bytemuck::bytes_of(&scene.materials[i]) {
+                    a.materials_changed = true;
+                }
+            });
+        }
+        if camera {
+            CollapsingHeader::new("Lens").default_open(true).show(ui, |ui| {
+                ComboBox::from_label("Projection").selected_text(format!("{:?}", s.projection)).show_ui(ui, |ui| {
+                    for p in [Projection::Perspective, Projection::Orthographic, Projection::Stereographic, Projection::Panorama, Projection::Cylindrical] {
+                        ui.selectable_value(&mut s.projection, p, format!("{p:?}"));
+                    }
+                });
+                slider(ui, "Field of view", &mut s.fov, 1.0..=170.0);
+                slider(ui, "Aperture", &mut s.aperture, 0.0..=2.0);
+                slider_u(ui, "Blades", &mut s.blades, 0..=8);
+                slider(ui, "Blade rotation", &mut s.blade_rotation, -180.0..=180.0);
+            });
+            CollapsingHeader::new("Film").default_open(true).show(ui, |ui| {
+                slider(ui, "Exposure", &mut s.exposure, 0.0..=8.0);
+                slider(ui, "Vignette", &mut s.vignette, 0.0..=1.0);
+                slider(ui, "Gamma", &mut s.gamma, 1.0..=5.0);
+                ui.checkbox(&mut s.aces, "ACES tone mapping");
+                ui.checkbox(&mut s.bloom, "Bloom");
+                if s.bloom {
+                    slider(ui, "Mix", &mut s.bloom_mix, 0.0..=1.0);
+                    slider(ui, "Size", &mut s.bloom_scale, 0.0..=1.0);
+                    slider(ui, "Aspect", &mut s.bloom_aspect, 0.0..=1.0);
+                    slider(ui, "Threshold", &mut s.bloom_threshold, 0.0..=5.0);
+                }
+            });
+        }
+        if image {
+            CollapsingHeader::new("Image").default_open(true).show(ui, |ui| {
+                ui.label(format!("View: {} spp · {}×{}", m.spp, m.size.0, m.size.1));
+                ui.horizontal(|ui| {
+                    ui.label("Size");
+                    ui.add(egui::DragValue::new(&mut m.image.width).range(1..=12000)).on_hover_text("Image width [1 - 12000]");
+                    ui.add(egui::DragValue::new(&mut m.image.height).range(1..=12000)).on_hover_text("Image height [1 - 12000]");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Samples");
+                    ui.add(egui::DragValue::new(&mut m.image.spp).range(1..=65536));
+                });
+                ui.horizontal(|ui| {
+                    command(ui, cmds, "Render", "Final render to export/", Command::RenderImage);
+                    command(ui, cmds, "Snapshot", "Save the view as it is [6]", Command::Snapshot);
+                });
+            });
+        }
+    });
+    a
 }
 
 // ------------------------------------------------------------ editor panel
@@ -398,13 +518,7 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: b
         }
         ui.label(format!("#{i}"));
     });
-    if !modeling {
-        let before = scene.materials[i];
-        material_editor(ui, &mut scene.materials[i]);
-        if bytemuck::bytes_of(&before) != bytemuck::bytes_of(&scene.materials[i]) {
-            a.materials_changed = true;
-        }
-    }
+    let _ = modeling;
     a
 }
 
@@ -654,7 +768,16 @@ fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
 }
 
 /// Far-right column in the modeler: project, pattern and shader lists.
-pub fn project_panel(ui: &mut Ui, tab: &mut ProjectTab, projects: &[PathBuf], current: &Path, pattern: Option<&str>, cmds: &mut Vec<Command>) {
+#[allow(clippy::too_many_arguments)]
+pub fn project_panel(
+    ui: &mut Ui,
+    tab: &mut ProjectTab,
+    projects: &[PathBuf],
+    current: &Path,
+    pattern: Option<&str>,
+    shaders: &mut ShaderState,
+    cmds: &mut Vec<Command>,
+) {
     heading(ui, "Project");
     ui.horizontal(|ui| {
         ui.selectable_value(tab, ProjectTab::Project, "Proj").on_hover_text("Project list");
@@ -679,7 +802,28 @@ pub fn project_panel(ui: &mut Ui, tab: &mut ProjectTab, projects: &[PathBuf], cu
                 }
             }
             ProjectTab::Shader => {
-                ui.weak("Shaders coming soon");
+                if shaders.files.is_empty() {
+                    ui.weak("No shader folder found next to the model's folder");
+                }
+                let chosen = shaders.current.as_ref().map(|(p, _)| p.clone());
+                for p in &shaders.files {
+                    let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if ui.selectable_label(chosen.as_ref() == Some(p), name).clicked() {
+                        cmds.push(Command::SelectShader(p.clone()));
+                    }
+                }
+                if let Some((_, sh)) = &shaders.current {
+                    ui.separator();
+                    for (arg, value) in sh.args.iter().zip(shaders.values.iter_mut()) {
+                        ui.label(&arg.name);
+                        ui.add(Slider::new(value, arg.min..=arg.max).step_by(arg.step.max(0.0) as f64).max_decimals(arg.precision as usize));
+                    }
+                    command(ui, cmds, "Run", "Execute shader on the model (or the selection)", Command::RunShader);
+                    ui.weak("Or drag a box with the Code brush [C]");
+                }
+                if let Some(e) = &shaders.error {
+                    ui.colored_label(egui::Color32::from_rgb(255, 120, 120), e);
+                }
             }
         }
     });

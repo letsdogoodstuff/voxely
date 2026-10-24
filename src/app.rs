@@ -41,6 +41,11 @@ pub struct EditState {
     pub project_tab: ui::ProjectTab,
     /// Free camera: rotate around the eye instead of the target.
     pub free_look: bool,
+    pub shaders: ui::ShaderState,
+    pub light_tab: ui::LightTab,
+    pub matter_tab: ui::MatterTab,
+    pub material_clipboard: Option<crate::scene::GpuMaterial>,
+    pub image: ui::ImageSettings,
     /// Canvas size being typed into the Canvas panel.
     pub canvas: IVec3,
     canvas_for: IVec3,
@@ -57,6 +62,11 @@ impl EditState {
             palettes,
             project_tab: ui::ProjectTab::default(),
             free_look: false,
+            light_tab: ui::LightTab::default(),
+            matter_tab: ui::MatterTab::default(),
+            material_clipboard: None,
+            image: ui::ImageSettings::default(),
+            shaders: ui::ShaderState { files: list_shaders(source.as_deref()), current: None, values: Vec::new(), error: None },
             editor: Editor::new(color),
             hover: None,
             enabled: true,
@@ -101,6 +111,54 @@ fn list_palettes(source: Option<&Path>) -> Vec<PathBuf> {
         .collect();
     out.sort();
     out
+}
+
+/// MagicaVoxel keeps voxel shaders in a `shader` folder next to `vox`.
+fn list_shaders(source: Option<&Path>) -> Vec<PathBuf> {
+    source.and_then(Path::parent).and_then(Path::parent).map_or_else(Vec::new, |d| crate::xs::list_shaders(&d.join("shader")))
+}
+
+/// Give color `i` material `m`, keeping its color.
+fn set_material(r: &mut Renderer, scene: &mut Scene, i: u8, mut m: crate::scene::GpuMaterial) {
+    let i = i as usize;
+    m.color = scene.materials[i].color;
+    scene.materials[i] = m;
+    r.upload_materials(&scene.materials);
+    scene.rebuild_lights();
+    r.set_lights(&scene.lights, scene.light_power);
+}
+
+/// Render the final image offscreen at the Image size and save it.
+fn render_final(r: &Renderer, scene: &Scene, image: ui::ImageSettings) {
+    let mut out = Renderer::new(r.device.clone(), r.queue.clone(), scene, None, image.width, image.height);
+    out.settings = r.settings.clone();
+    out.set_camera(r.camera);
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let name = format!("export/voxely-render-{secs}.png");
+    match out.render_image(image.spp).and_then(|px| crate::save_png(Path::new(&name), image.width, image.height, &px)) {
+        Ok(()) => println!("rendered {name} ({} spp)", image.spp),
+        Err(e) => eprintln!("render failed: {e:#}"),
+    }
+}
+
+/// Run the chosen shader over the volume.
+fn shader_output(r: &Renderer, scene: &Scene, ed: &mut EditState) -> Option<crate::scene::Volume> {
+    let (_, shader) = ed.shaders.current.as_ref()?;
+    match crate::xs::run(&r.device, &r.queue, shader, &ed.shaders.values, &scene.volume, &scene.palette, ed.editor.color, &[]) {
+        Ok(v) => {
+            ed.shaders.error = None;
+            Some(v)
+        }
+        Err(e) => {
+            ed.shaders.error = Some(format!("{e:#}"));
+            None
+        }
+    }
+}
+
+/// Before a Code brush stroke, compute what the shader would make.
+pub fn prepare_code_brush(r: &Renderer, scene: &Scene, ed: &mut EditState) {
+    ed.editor.code = if ed.editor.brush == edit::Brush::Code { shader_output(r, scene, ed) } else { None };
 }
 
 /// Colors of a palette image: pixel k is color index k + 1.
@@ -198,6 +256,7 @@ fn open_project(path: PathBuf, r: &mut Renderer, scene: &mut Scene, ed: &mut Edi
             ed.save_path = default_save_path(Some(&path));
             ed.projects = list_projects(Some(&path));
             ed.palettes = list_palettes(Some(&path));
+            ed.shaders.files = list_shaders(Some(&path));
             ed.source = Some(path);
             loaded(r, scene, ed);
         }
@@ -340,6 +399,47 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
                 },
                 Err(e) => eprintln!("pattern {}: {e:#}", p.display()),
             }
+            false
+        }
+        Command::SelectShader(p) => {
+            match crate::xs::XsShader::load(&p) {
+                Ok(sh) => {
+                    ed.shaders.values = sh.args.iter().map(|a| a.value).collect();
+                    ed.shaders.current = Some((p, sh));
+                    ed.shaders.error = None;
+                    ed.editor.brush = edit::Brush::Code;
+                }
+                Err(e) => ed.shaders.error = Some(format!("{e:#}")),
+            }
+            false
+        }
+        Command::RunShader => match shader_output(r, scene, ed) {
+            Some(out) => {
+                // With a selection, only selected voxels change.
+                let new = match ed.editor.selection() {
+                    Some(sel) => crate::scene::Volume::from_cells(
+                        scene.volume.dims,
+                        scene.volume.cells.iter().zip(&out.cells).enumerate().map(|(i, (&a, &b))| if sel[i] { b } else { a }).collect(),
+                    ),
+                    None => out,
+                };
+                ed.editor.commit(&mut scene.volume, new)
+            }
+            None => false,
+        },
+        Command::PasteMaterial => {
+            if let Some(m) = ed.material_clipboard {
+                set_material(r, scene, ed.editor.color, m);
+            }
+            false
+        }
+        Command::ResetMaterial => {
+            let i = ed.editor.color;
+            set_material(r, scene, i, crate::scene::material(i as u32, scene.palette[i as usize], None));
+            false
+        }
+        Command::RenderImage => {
+            render_final(r, scene, ed.image);
             false
         }
         Command::PatternFromSelection => {
@@ -530,19 +630,27 @@ pub fn build_ui(
                 edit = ui::palette_panel(ui, &mut ed.editor, scene, r.modeling, &ed.palettes, cmds);
             });
         });
+        // The Project column shows in both modes, like MagicaVoxel.
+        egui::Panel::right("project").exact_size(130.0).resizable(false).show(ui, |ui| {
+            let current = ed.source.clone().unwrap_or_default();
+            let pattern = ed.editor.pattern.as_ref().map(|p| p.name.clone());
+            ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &current, pattern.as_deref(), &mut ed.shaders, cmds);
+        });
         if r.modeling {
             egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
-            egui::Panel::right("project").exact_size(130.0).resizable(false).show(ui, |ui| {
-                let current = ed.source.clone().unwrap_or_default();
-                let pattern = ed.editor.pattern.as_ref().map(|p| p.name.clone());
-                ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &current, pattern.as_deref(), cmds);
-            });
             if let Some(m) = r.modeler.as_mut() {
                 egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut m.options, cmds));
             }
             egui::Panel::top("viewbar").show(ui, |ui| ui::view_bar(ui, dims, &mut ed.canvas, cmds));
         } else {
-            egui::Panel::right("settings").default_size(280.0).show(ui, |ui| ui::settings_panel(ui, &mut r.settings, panel, spp, size, cmds));
+            // MagicaVoxel's render layout: Light / Sample / Display on the
+            // left, Matter / Camera / Image on the right.
+            egui::Panel::left("light").default_size(250.0).show(ui, |ui| ui::light_panel(ui, &mut ed.light_tab, &mut r.settings, panel));
+            egui::Panel::right("matter").default_size(250.0).show(ui, |ui| {
+                let state = ui::MatterState { tab: &mut ed.matter_tab, clipboard: &mut ed.material_clipboard, image: &mut ed.image, spp, size };
+                let a = ui::matter_panel(ui, &mut r.settings, &ed.editor, scene, state, cmds);
+                edit.materials_changed |= a.materials_changed;
+            });
         }
     }
     actions.viewport = Some(ui.available_rect_before_wrap());
@@ -743,6 +851,20 @@ impl App {
             Key::Character(c) => c.to_ascii_lowercase(),
             _ => String::new(),
         };
+        let modeling = self.gfx.as_ref().is_some_and(|g| g.renderer.modeling);
+        if cmd && !modeling && matches!(c.as_str(), "c" | "v" | "r") {
+            // The renderer's material clipboard.
+            match c.as_str() {
+                "c" => {
+                    let i = self.edit.editor.color as usize;
+                    self.edit.material_clipboard = Some(self.scene.materials[i]);
+                }
+                "v" => self.command(Command::PasteMaterial),
+                _ => self.command(Command::ResetMaterial),
+            }
+            self.redraw_soon();
+            return;
+        }
         if cmd {
             let command = match c.as_str() {
                 "z" if shift => Some(Command::Redo),
@@ -1000,6 +1122,9 @@ impl App {
                     } else if tool == Tool::Marquee && self.edit.editor.opts.marquee == edit::MarqueeMode::Rect {
                         self.edit.marquee = pos.map(|p| (p, p));
                     } else if let Some(hit) = hover {
+                        if let Some(g) = self.gfx.as_ref() {
+                            prepare_code_brush(&g.renderer, &self.scene, &mut self.edit);
+                        }
                         let (ro, rd) = self.ray().unwrap_or((Vec3::ZERO, Vec3::NEG_Z));
                         if self.edit.editor.begin(&mut self.scene.volume, hit, ro, rd) {
                             self.sync();

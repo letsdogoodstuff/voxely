@@ -134,7 +134,6 @@ fn parse_arg(s: &str) -> Result<XsArg> {
 }
 
 /// Sorted `*.txt` files in `dir` (empty if it can't be read).
-#[allow(dead_code)] // used by the UI
 pub fn list_shaders(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|rd| {
