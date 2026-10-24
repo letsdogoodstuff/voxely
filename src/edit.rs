@@ -1,6 +1,6 @@
 //! Voxel editing, modelled on MagicaVoxel's brushes: Attach / Erase /
-//! Paint tools combined with Voxel / Face / Box / Line brushes, axis
-//! mirroring, selection (region and marquee), moving and copy/paste of
+//! Paint tools combined with Voxel / Face / Box / Geometry / Pattern / Code
+//! brushes, axis mode and mirroring, selection (region and marquee), moving and copy/paste of
 //! selected voxels, and undo/redo per stroke or whole-model edit.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -40,14 +40,94 @@ pub enum SelMode {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Brush {
-    /// One voxel per click; drag to draw.
+    /// The voxel brush (sized, cube or sphere); drag to draw [V].
     Voxel,
-    /// The connected same-color face region under the cursor.
+    /// The connected face region under the cursor [F].
     Face,
-    /// Box between press and release.
+    /// Box between press and release [B].
     Box,
-    /// Straight line between press and release.
+    /// Line, square or circle between press and release [L].
+    Geo,
+    /// Stamp a pattern model [P].
+    Pattern,
+    /// Box region filled with a voxel shader's output [C].
+    Code,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GeoShape {
     Line,
+    Square,
+    Circle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MarqueeMode {
+    /// Screen rectangle.
+    Rect,
+    /// Paint the selection with the voxel brush.
+    Brush,
+    /// 3D box dragged on a plane.
+    Box,
+}
+
+/// Brush settings from MagicaVoxel's brush option panels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BrushOptions {
+    /// Voxel brush size [1 - 64].
+    pub size: i32,
+    /// Sphere (or circle, in 2D) rather than cube.
+    pub sphere: bool,
+    /// 2D: the footprint lies in the plane of the face under the cursor.
+    pub flat: bool,
+    /// Face brush: new voxels take the color of the face they grow from.
+    pub face_voxel_color: bool,
+    /// Face brush: connect through the same color, or any voxel ("Geo").
+    pub face_by_color: bool,
+    /// Face brush: also connect diagonally (8 rather than 4 neighbors).
+    pub face_diagonal: bool,
+    pub geo: GeoShape,
+    /// Geometry line follows the surface under it.
+    pub project: bool,
+    /// Square and circle are filled rather than outlines.
+    pub fill: bool,
+    /// Square and circle have an even width (centered between cells).
+    pub even: bool,
+    /// Axis mode: extend brushes through the whole canvas along these axes.
+    pub axis: [bool; 3],
+    pub marquee: MarqueeMode,
+    /// Rect select only picks voxels visible from the camera.
+    pub visible_only: bool,
+    /// Pattern brush paints with the palette color, not its own colors.
+    pub pattern_palette: bool,
+}
+
+impl Default for BrushOptions {
+    fn default() -> Self {
+        BrushOptions {
+            size: 1,
+            sphere: false,
+            flat: false,
+            face_voxel_color: false,
+            face_by_color: true,
+            face_diagonal: false,
+            geo: GeoShape::Line,
+            project: true,
+            fill: true,
+            even: false,
+            axis: [false; 3],
+            marquee: MarqueeMode::Rect,
+            visible_only: false,
+            pattern_palette: false,
+        }
+    }
+}
+
+/// A model stamped by the Pattern brush.
+#[derive(Clone)]
+pub struct Pattern {
+    pub name: String,
+    pub volume: Volume,
 }
 
 /// A ray hit: the voxel that was hit (z = -1 for the ground plane) and the
@@ -134,7 +214,7 @@ fn target(tool: Tool, p: Pick) -> Option<IVec3> {
 
 /// Connected region of same-colored cells on the picked face plane that
 /// are exposed in the normal direction.
-fn face_region(v: &Volume, p: Pick) -> Vec<IVec3> {
+fn face_region(v: &Volume, p: Pick, by_color: bool, diagonal: bool) -> Vec<IVec3> {
     const LIMIT: usize = 1 << 20;
     let axis = axis_of(p.normal);
     let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
@@ -144,9 +224,14 @@ fn face_region(v: &Volume, p: Pick) -> Vec<IVec3> {
             // Ground: the empty floor cells of the bottom layer.
             q.x >= 0 && q.y >= 0 && q.x < v.dims.x && q.y < v.dims.y && v.get(q + p.normal) == 0
         } else {
-            v.get(q) == color && v.get(q + p.normal) == 0
+            let c = v.get(q);
+            (if by_color { c == color } else { c != 0 }) && v.get(q + p.normal) == 0
         }
     };
+    let mut steps = vec![(1, 0), (-1, 0), (0, 1), (0, -1)];
+    if diagonal {
+        steps.extend([(1, 1), (1, -1), (-1, 1), (-1, -1)]);
+    }
     let mut seen = HashSet::from([p.cell]);
     let mut queue = VecDeque::from([p.cell]);
     let mut out = Vec::new();
@@ -155,9 +240,10 @@ fn face_region(v: &Volume, p: Pick) -> Vec<IVec3> {
         if out.len() >= LIMIT {
             break;
         }
-        for (ax, d) in [(a, 1), (a, -1), (b, 1), (b, -1)] {
+        for &(da, db) in &steps {
             let mut n = q;
-            n[ax] += d;
+            n[a] += da;
+            n[b] += db;
             if !seen.contains(&n) && inside(n) {
                 seen.insert(n);
                 queue.push_back(n);
@@ -193,6 +279,11 @@ struct Stroke {
     anchor: IVec3,
     axis: usize,
     current: IVec3,
+    /// Normal of the face the stroke started on.
+    normal: IVec3,
+    /// Camera rays at press and now (for lines projected on the surface).
+    ray0: (Vec3, Vec3),
+    ray1: (Vec3, Vec3),
 }
 
 /// One undoable edit.
@@ -209,6 +300,8 @@ struct Move {
     cells: Vec<(IVec3, u8)>,
     anchor: IVec3,
     axis: usize,
+    /// Shift: move along the face normal instead of across the face.
+    along_normal: bool,
     delta: IVec3,
     /// Moving everything (nothing was selected), so don't select it.
     whole: bool,
@@ -221,6 +314,10 @@ pub struct Editor {
     pub mirror: [bool; 3],
     pub sel_mode: SelMode,
     pub region: ops::RegionOptions,
+    pub opts: BrushOptions,
+    pub pattern: Option<Pattern>,
+    /// The Code brush's shader output for the current volume.
+    pub code: Option<Volume>,
     /// Set when the selection changes, so the view can refresh.
     pub sel_dirty: bool,
     undo: Vec<Entry>,
@@ -243,6 +340,9 @@ impl Editor {
             mirror: [false; 3],
             sel_mode: SelMode::Replace,
             region: ops::RegionOptions::default(),
+            opts: BrushOptions::default(),
+            pattern: None,
+            code: None,
             sel_dirty: false,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -260,9 +360,9 @@ impl Editor {
 
     /// Forget history and selection (after opening another model).
     pub fn reset(&mut self) {
-        let (tool, brush, color, mirror, region, clipboard) =
-            (self.tool, self.brush, self.color, self.mirror, self.region, std::mem::take(&mut self.clipboard));
-        *self = Editor { tool, brush, mirror, region, clipboard, ..Editor::new(color) };
+        let (tool, brush, color, mirror, region, opts) = (self.tool, self.brush, self.color, self.mirror, self.region, self.opts);
+        let (clipboard, pattern) = (std::mem::take(&mut self.clipboard), self.pattern.take());
+        *self = Editor { tool, brush, mirror, region, opts, clipboard, pattern, ..Editor::new(color) };
         self.sel_dirty = true;
     }
 
@@ -405,12 +505,36 @@ impl Editor {
         changed
     }
 
+    /// Make the selection (or the whole model) the Pattern brush's pattern.
+    pub fn pattern_from_selection(&mut self, v: &Volume) -> bool {
+        let sel = self.selection();
+        let cells: Vec<(IVec3, u8)> =
+            v.cells.iter().enumerate().filter(|&(i, &c)| c != 0 && sel.is_none_or(|s| s[i])).map(|(i, &c)| (v.position(i), c)).collect();
+        let Some(lo) = cells.iter().map(|c| c.0).reduce(IVec3::min) else { return false };
+        let hi = cells.iter().map(|c| c.0).fold(lo, IVec3::max);
+        let mut volume = Volume::new(hi - lo + IVec3::ONE);
+        for (p, c) in cells {
+            volume.set(p - lo, c);
+        }
+        self.pattern = Some(Pattern { name: "selection".into(), volume });
+        true
+    }
+
+    /// Turn the pattern 90 degrees about `axis` [-/+ and 9/0].
+    pub fn rotate_pattern(&mut self, axis: usize, times: i32) {
+        if let Some(p) = self.pattern.as_mut() {
+            for _ in 0..times.rem_euclid(4) {
+                p.volume = ops::rotate(&p.volume, axis);
+            }
+        }
+    }
+
     // ---- moving the selection ----
 
     /// Ctrl+press (or the Move tool): start dragging the selected voxels,
     /// or all of them when nothing is selected, along the plane of the face
     /// under the cursor.
-    pub fn begin_move(&mut self, v: &Volume, hit: Pick) -> bool {
+    pub fn begin_move(&mut self, v: &Volume, hit: Pick, along_normal: bool) -> bool {
         let sel = self.selection();
         let cells: Vec<(IVec3, u8)> =
             v.cells.iter().enumerate().filter(|&(i, &c)| c != 0 && sel.is_none_or(|s| s[i])).map(|(i, &c)| (v.position(i), c)).collect();
@@ -418,14 +542,30 @@ impl Editor {
             return false;
         }
         let whole = sel.is_none();
-        self.moving = Some(Move { before: v.clone(), cells, anchor: hit.cell, axis: axis_of(hit.normal), delta: IVec3::ZERO, whole });
+        self.moving = Some(Move { before: v.clone(), cells, anchor: hit.cell, axis: axis_of(hit.normal), along_normal, delta: IVec3::ZERO, whole });
         true
     }
 
     fn drag_move(&mut self, v: &mut Volume, ro: Vec3, rd: Vec3) -> bool {
         let Some(m) = self.moving.as_mut() else { return false };
-        let Some(cell) = plane_cell(ro, rd, m.axis, m.anchor[m.axis]) else { return false };
-        let delta = cell - m.anchor;
+        let delta = if m.along_normal {
+            // Closest point on the normal line through the grabbed voxel.
+            let mut dir = Vec3::ZERO;
+            dir[m.axis] = 1.0;
+            let p0 = m.anchor.as_vec3() + 0.5;
+            let w = p0 - ro;
+            let (b, d, e) = (dir.dot(rd), dir.dot(w), rd.dot(w));
+            let denom = 1.0 - b * b;
+            if denom < 1e-6 {
+                return false;
+            }
+            let mut delta = IVec3::ZERO;
+            delta[m.axis] = ((b * e - d) / denom).round() as i32;
+            delta
+        } else {
+            let Some(cell) = plane_cell(ro, rd, m.axis, m.anchor[m.axis]) else { return false };
+            cell - m.anchor
+        };
         if delta == m.delta {
             return false;
         }
@@ -487,15 +627,109 @@ impl Editor {
         out
     }
 
-    /// Apply the tool to cells; returns whether anything changed.
+    /// The voxel brush's footprint at `c` (size, cube or sphere, 2D or 3D).
+    /// When attaching in 3D the footprint rests on the surface instead of
+    /// sinking into it.
+    fn stamp(&self, c: IVec3, normal: IVec3) -> Vec<IVec3> {
+        let o = &self.opts;
+        let n = o.size.max(1);
+        if n == 1 {
+            return vec![c];
+        }
+        let axis = axis_of(normal);
+        let (lo, hi) = (-(n - 1) / 2, n / 2);
+        let center = (lo + hi) as f32 * 0.5;
+        let mut out = Vec::new();
+        for z in lo..=hi {
+            for y in lo..=hi {
+                for x in lo..=hi {
+                    let mut d = IVec3::new(x, y, z);
+                    if o.flat && d[axis] != 0 {
+                        continue;
+                    }
+                    if o.sphere {
+                        let mut q = d.as_vec3() - center;
+                        if o.flat {
+                            q[axis] = 0.0;
+                        }
+                        if q.length() > n as f32 * 0.5 {
+                            continue;
+                        }
+                    }
+                    if self.tool == Tool::Attach && !o.flat && normal != IVec3::ZERO {
+                        d[axis] += normal[axis] * -lo;
+                    }
+                    out.push(c + d);
+                }
+            }
+        }
+        out
+    }
+
+    /// Extend cells through the whole canvas along the Axis-mode axes.
+    fn lofted(&self, v: &Volume, cells: Vec<IVec3>) -> Vec<IVec3> {
+        let mut out = cells;
+        for axis in 0..3 {
+            if self.opts.axis[axis] {
+                let mut seen = HashSet::new();
+                out = out
+                    .iter()
+                    .flat_map(|&c| {
+                        (0..v.dims[axis]).map(move |k| {
+                            let mut q = c;
+                            q[axis] = k;
+                            q
+                        })
+                    })
+                    .filter(|q| seen.insert(*q))
+                    .collect();
+            }
+        }
+        out
+    }
+
+    /// Cells after the voxel stamp, Axis mode and mirroring, with colors.
+    fn expand(&self, v: &Volume, cells: &[(IVec3, u8)], normal: IVec3) -> Vec<(IVec3, u8)> {
+        let mut out = Vec::new();
+        for &(c, color) in cells {
+            let stamped = if self.brush == Brush::Voxel || (self.tool == Tool::Marquee && self.opts.marquee == MarqueeMode::Brush) {
+                self.stamp(c, normal)
+            } else {
+                vec![c]
+            };
+            for q in self.lofted(v, stamped) {
+                out.extend(self.mirrored(v, q).into_iter().map(|m| (m, color)));
+            }
+        }
+        out
+    }
+
+    /// Apply the tool to cells in the current color; returns whether
+    /// anything changed.
     fn apply(&mut self, v: &mut Volume, cells: &[IVec3]) -> bool {
-        let all: Vec<IVec3> = cells.iter().flat_map(|&c| self.mirrored(v, c)).collect();
-        let (tool, color) = (self.tool, self.color);
+        let color = self.color;
+        let colored: Vec<(IVec3, u8)> = cells.iter().map(|&c| (c, color)).collect();
+        self.apply_colored(v, &colored)
+    }
+
+    /// Apply the tool to cells, attaching or painting each with its own
+    /// color. Marquee strokes select instead.
+    fn apply_colored(&mut self, v: &mut Volume, cells: &[(IVec3, u8)]) -> bool {
+        let normal = self.stroke.as_ref().map_or(IVec3::Z, |s| s.normal);
+        let all = self.expand(v, cells, normal);
+        if self.tool == Tool::Marquee {
+            let idx: Vec<usize> = all.iter().filter(|(c, _)| v.contains(*c)).map(|(c, _)| v.index(*c)).collect();
+            let mode = if self.sel_mode == SelMode::Remove { SelMode::Remove } else { SelMode::Add };
+            self.select(v, idx, mode);
+            return false;
+        }
+        let tool = self.tool;
         // A selection masks erasing and painting.
         let sel = if self.sel_count > 0 && tool != Tool::Attach { Some(&self.sel) } else { None };
+        let code = if self.brush == Brush::Code { self.code.as_ref().filter(|c| c.dims == v.dims) } else { None };
         let Some(stroke) = self.stroke.as_mut() else { return false };
         let mut changed = false;
-        for c in all {
+        for (c, color) in all {
             if !v.contains(c) {
                 continue;
             }
@@ -504,10 +738,15 @@ impl Editor {
                 continue;
             }
             let old = v.cells[i];
-            let new = match tool {
-                Tool::Attach if old == 0 => color,
-                Tool::Erase => 0,
-                Tool::Paint if old != 0 => color,
+            let new = match (code, tool) {
+                // The shader's output replaces the brushed cells.
+                (Some(code), Tool::Attach) if old == 0 => code.cells[i],
+                (Some(code), Tool::Paint) if old != 0 && code.cells[i] != 0 => code.cells[i],
+                (Some(code), Tool::Erase) if code.cells[i] != 0 => 0,
+                (Some(_), _) => old,
+                (None, Tool::Attach) if old == 0 => color,
+                (None, Tool::Erase) => 0,
+                (None, Tool::Paint) if old != 0 => color,
                 _ => old,
             };
             if new != old {
@@ -519,8 +758,101 @@ impl Editor {
         changed
     }
 
-    /// Mouse press. Returns whether the volume changed.
-    pub fn begin(&mut self, v: &mut Volume, hit: Pick) -> bool {
+    /// Cells of the Face brush region, with the color each new voxel takes.
+    fn face_cells(&self, v: &Volume, hit: Pick) -> Vec<(IVec3, u8)> {
+        let region = face_region(v, hit, self.opts.face_by_color, self.opts.face_diagonal);
+        match self.tool {
+            Tool::Attach => region
+                .iter()
+                .map(|&c| (c + hit.normal, if self.opts.face_voxel_color && !hit.on_ground() { v.get(c) } else { self.color }))
+                .collect(),
+            _ if hit.on_ground() => Vec::new(),
+            _ => region.into_iter().map(|c| (c, self.color)).collect(),
+        }
+    }
+
+    /// The Pattern brush's voxels placed at target `t`, extending away from
+    /// the surface along `normal` and centered in the other two axes.
+    fn pattern_cells(&self, t: IVec3, normal: IVec3) -> Vec<(IVec3, u8)> {
+        let Some(p) = self.pattern.as_ref() else { return Vec::new() };
+        let axis = axis_of(normal);
+        let mut origin = t - p.volume.dims / 2;
+        let outward = if self.tool == Tool::Attach { normal[axis] } else { -normal[axis] };
+        origin[axis] = if outward >= 0 { t[axis] } else { t[axis] - p.volume.dims[axis] + 1 };
+        p.volume
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c != 0)
+            .map(|(i, &c)| (origin + p.volume.position(i), if self.opts.pattern_palette { self.color } else { c }))
+            .collect()
+    }
+
+    /// Geometry-mode shape between the anchor and current cell on the
+    /// stroke plane.
+    fn geo_cells(&self, v: &Volume, s: &Stroke) -> Vec<IVec3> {
+        let o = &self.opts;
+        let (a, b, axis) = (s.anchor, s.current, s.axis);
+        let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+        let at = |du: i32, dw: i32| {
+            let mut q = a;
+            q[u] += du;
+            q[w] += dw;
+            q
+        };
+        match o.geo {
+            GeoShape::Line if o.project => {
+                // Follow the surface: cast rays between the press and
+                // release rays.
+                let ((ro0, rd0), (ro1, rd1)) = (s.ray0, s.ray1);
+                let steps = ((b - a).abs().max_element() * 3).clamp(2, 4096);
+                let mut out = Vec::new();
+                for k in 0..=steps {
+                    let f = k as f32 / steps as f32;
+                    let (ro, rd) = (ro0.lerp(ro1, f), rd0.lerp(rd1, f).normalize());
+                    if let Some(t) = pick(v, ro, rd).and_then(|h| target(self.tool, h)) {
+                        if out.last() != Some(&t) {
+                            out.push(t);
+                        }
+                    }
+                }
+                out
+            }
+            GeoShape::Line => line(a, b),
+            GeoShape::Square => {
+                let h = (b[u] - a[u]).abs().max((b[w] - a[w]).abs());
+                let (lo, hi) = (-h, h - o.even as i32);
+                let mut out = Vec::new();
+                for dw in lo..=hi {
+                    for du in lo..=hi {
+                        if o.fill || du == lo || du == hi || dw == lo || dw == hi {
+                            out.push(at(du, dw));
+                        }
+                    }
+                }
+                out
+            }
+            GeoShape::Circle => {
+                let d = Vec3::new((b[u] - a[u]) as f32, (b[w] - a[w]) as f32, 0.0);
+                let r = d.length() + 0.5;
+                let c = if o.even { 0.5 } else { 0.0 };
+                let k = r.ceil() as i32 + 1;
+                let mut out = Vec::new();
+                for dw in -k..=k {
+                    for du in -k..=k {
+                        let dist = Vec3::new(du as f32 - c, dw as f32 - c, 0.0).length();
+                        if dist <= r && (o.fill || dist > r - 1.0) {
+                            out.push(at(du, dw));
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Mouse press with the camera ray. Returns whether the volume changed.
+    pub fn begin(&mut self, v: &mut Volume, hit: Pick, ro: Vec3, rd: Vec3) -> bool {
         match self.tool {
             Tool::Region => {
                 if !hit.on_ground() {
@@ -548,25 +880,33 @@ impl Editor {
                 }
                 return false;
             }
-            Tool::Marquee | Tool::Move => return false,
+            Tool::Marquee if self.opts.marquee == MarqueeMode::Rect => return false,
+            Tool::Move => return false,
             _ => {}
         }
-        let Some(t) = target(self.tool, hit) else { return false };
+        // Marquee brush/box select acts on voxels like erase/paint would.
+        let as_tool = if self.tool == Tool::Marquee { Tool::Paint } else { self.tool };
+        let Some(t) = target(as_tool, hit) else { return false };
+        if self.tool == Tool::Marquee && self.sel_mode == SelMode::Replace {
+            self.select_none();
+        }
         let axis = axis_of(hit.normal);
-        self.stroke = Some(Stroke { changes: HashMap::new(), anchor: t, axis, current: t });
+        self.stroke = Some(Stroke { changes: HashMap::new(), anchor: t, axis, current: t, normal: hit.normal, ray0: (ro, rd), ray1: (ro, rd) });
+        if self.tool == Tool::Marquee {
+            return if self.opts.marquee == MarqueeMode::Brush { self.apply(v, &[t]) } else { false };
+        }
         match self.brush {
             Brush::Voxel => self.apply(v, &[t]),
             Brush::Face => {
-                let region = face_region(v, hit);
-                let cells: Vec<IVec3> = match self.tool {
-                    Tool::Attach => region.iter().map(|&c| c + hit.normal).collect(),
-                    _ if hit.on_ground() => Vec::new(),
-                    _ => region,
-                };
-                self.apply(v, &cells)
+                let cells = self.face_cells(v, hit);
+                self.apply_colored(v, &cells)
+            }
+            Brush::Pattern => {
+                let cells = self.pattern_cells(t, hit.normal);
+                self.apply_colored(v, &cells)
             }
             // Applied on release; the overlay shows the preview meanwhile.
-            Brush::Box | Brush::Line => false,
+            Brush::Box | Brush::Geo | Brush::Code => false,
         }
     }
 
@@ -575,13 +915,18 @@ impl Editor {
         if self.moving.is_some() {
             return self.drag_move(v, ro, rd);
         }
-        let Some(s) = self.stroke.as_ref() else { return false };
+        let Some(s) = self.stroke.as_mut() else { return false };
+        s.ray1 = (ro, rd);
         let (anchor, axis) = (s.anchor, s.axis);
-        // Attach draws on the plane of the first voxel; erase and paint
-        // follow whatever surface is under the cursor.
-        let cell = match (self.brush, self.tool) {
-            (Brush::Voxel, Tool::Attach) | (Brush::Box | Brush::Line, _) => plane_cell(ro, rd, axis, anchor[axis]),
-            _ => hit.and_then(|h| target(self.tool, h)),
+        let marquee = (self.tool == Tool::Marquee).then_some(self.opts.marquee);
+        // Attach draws on the plane of the first voxel; erase, paint and
+        // brush select follow whatever surface is under the cursor.
+        let planar = matches!(self.brush, Brush::Box | Brush::Geo | Brush::Code) || (self.brush == Brush::Voxel && self.tool == Tool::Attach);
+        let cell = match marquee {
+            Some(MarqueeMode::Box) => plane_cell(ro, rd, axis, anchor[axis]),
+            Some(_) => hit.and_then(|h| target(Tool::Paint, h)),
+            None if planar => plane_cell(ro, rd, axis, anchor[axis]),
+            None => hit.and_then(|h| target(self.tool, h)),
         };
         let Some(cell) = cell else { return false };
         let cell = cell.clamp(IVec3::ZERO, v.dims - IVec3::ONE);
@@ -591,9 +936,12 @@ impl Editor {
         }
         let prev = s.current;
         s.current = cell;
+        if marquee == Some(MarqueeMode::Brush) {
+            return self.apply(v, &line(prev, cell));
+        }
         match self.brush {
             // Fill the gap from the previous cell so fast drags stay connected.
-            Brush::Voxel => self.apply(v, &line(prev, cell)),
+            Brush::Voxel if marquee.is_none() => self.apply(v, &line(prev, cell)),
             _ => false,
         }
     }
@@ -603,14 +951,16 @@ impl Editor {
         if self.moving.is_some() {
             return self.end_move(v);
         }
-        let changed = match (self.brush, self.stroke.as_ref()) {
-            (Brush::Box, Some(s)) => {
-                let cells = cuboid(s.anchor, s.current);
-                self.apply(v, &cells)
-            }
-            (Brush::Line, Some(s)) => {
-                let cells = line(s.anchor, s.current);
-                self.apply(v, &cells)
+        let pending = self.stroke.as_ref().map(|s| self.pending_cells(v, s));
+        let changed = match pending {
+            Some(cells) if !cells.is_empty() => {
+                if self.tool == Tool::Marquee {
+                    // Box select: only voxels inside the box.
+                    let solid: Vec<IVec3> = cells.into_iter().filter(|&c| v.get(c) != 0).collect();
+                    self.apply(v, &solid)
+                } else {
+                    self.apply(v, &cells)
+                }
             }
             _ => false,
         };
@@ -623,6 +973,18 @@ impl Editor {
             }
         }
         changed
+    }
+
+    /// Cells a drag-and-release brush will fill when released.
+    fn pending_cells(&self, v: &Volume, s: &Stroke) -> Vec<IVec3> {
+        if self.tool == Tool::Marquee {
+            return if self.opts.marquee == MarqueeMode::Box { cuboid(s.anchor, s.current) } else { Vec::new() };
+        }
+        match self.brush {
+            Brush::Box | Brush::Code => cuboid(s.anchor, s.current),
+            Brush::Geo => self.geo_cells(v, s),
+            _ => Vec::new(),
+        }
     }
 
     pub fn undo(&mut self, v: &mut Volume) -> bool {
@@ -641,29 +1003,42 @@ impl Editor {
         true
     }
 
-    /// Cells to outline: the pending box/line, or what a click would touch.
+    /// Cells to outline: the pending shape, or what a click would touch.
     pub fn preview(&self, v: &Volume, hover: Option<Pick>) -> Vec<IVec3> {
-        let cells = match (&self.stroke, self.brush) {
-            (Some(s), Brush::Box) => cuboid(s.anchor, s.current),
-            (Some(s), Brush::Line) => line(s.anchor, s.current),
-            (Some(_), _) => Vec::new(),
-            (None, _) if matches!(self.tool, Tool::Marquee | Tool::Move) => Vec::new(),
-            (None, _) if self.tool == Tool::Pick => hover.filter(|h| !h.on_ground()).map(|h| h.cell).into_iter().collect(),
+        let normal = hover.map_or(IVec3::Z, |h| h.normal);
+        let cells: Vec<IVec3> = match (&self.stroke, self.tool) {
+            (Some(s), _) => {
+                let pending = self.pending_cells(v, s);
+                if pending.is_empty() {
+                    return Vec::new();
+                }
+                pending
+            }
+            (None, Tool::Move) => return Vec::new(),
+            (None, Tool::Marquee) if self.opts.marquee == MarqueeMode::Rect => return Vec::new(),
+            (None, Tool::Marquee) => hover.and_then(|h| target(Tool::Paint, h)).into_iter().collect(),
+            (None, Tool::Pick) => hover.filter(|h| !h.on_ground()).map(|h| h.cell).into_iter().collect(),
             // Regions can be scattered all over the model, so like
             // MagicaVoxel only the voxel under the cursor is outlined.
-            (None, _) if matches!(self.tool, Tool::Region | Tool::RegionRemove | Tool::RegionReplace) => {
-                hover.filter(|h| !h.on_ground()).map(|h| h.cell).into_iter().collect()
-            }
-            (None, Brush::Face) => match hover {
-                Some(h) => {
-                    let r = face_region(v, h);
-                    if self.tool == Tool::Attach { r.iter().map(|&c| c + h.normal).collect() } else if h.on_ground() { Vec::new() } else { r }
+            (None, Tool::Region | Tool::RegionRemove | Tool::RegionReplace) => hover.filter(|h| !h.on_ground()).map(|h| h.cell).into_iter().collect(),
+            (None, _) => match (self.brush, hover) {
+                (Brush::Face, Some(h)) => self.face_cells(v, h).into_iter().map(|(c, _)| c).collect(),
+                (Brush::Pattern, Some(h)) => {
+                    target(self.tool, h).map(|t| self.pattern_cells(t, h.normal).into_iter().map(|(c, _)| c).collect()).unwrap_or_default()
                 }
-                None => Vec::new(),
+                (_, Some(h)) => target(self.tool, h).into_iter().collect(),
+                (_, None) => Vec::new(),
             },
-            (None, _) => hover.and_then(|h| target(self.tool, h)).into_iter().collect(),
         };
-        cells.into_iter().flat_map(|c| self.mirrored(v, c)).filter(|&c| v.contains(c)).collect()
+        let colored: Vec<(IVec3, u8)> = cells.into_iter().map(|c| (c, 0)).collect();
+        // Pending shapes were already placed; only the hover cursor gets the
+        // voxel stamp.
+        let all = if self.stroke.is_some() {
+            colored.iter().flat_map(|&(c, _)| self.lofted(v, vec![c])).flat_map(|c| self.mirrored(v, c)).collect()
+        } else {
+            self.expand(v, &colored, normal).into_iter().map(|(c, _)| c).collect::<Vec<_>>()
+        };
+        all.into_iter().filter(|&c| v.contains(c)).collect()
     }
 }
 
@@ -681,7 +1056,7 @@ mod tests {
         let mut e = Editor::new(5);
         let hit = pick(&v, Vec3::new(2.5, 3.5, 20.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
         assert_eq!(hit, Pick { cell: IVec3::new(2, 3, -1), normal: IVec3::Z });
-        assert!(e.begin(&mut v, hit));
+        assert!(e.begin(&mut v, hit, Vec3::ZERO, Vec3::NEG_Z));
         e.end(&mut v);
         assert_eq!(v.get(IVec3::new(2, 3, 0)), 5);
 
@@ -703,7 +1078,7 @@ mod tests {
         let ro = Vec3::new(1.5, 1.5, 20.0);
         let down = Vec3::new(0.0, 0.0, -1.0);
         let hit = pick(&v, ro, down).unwrap();
-        assert!(!e.begin(&mut v, hit));
+        assert!(!e.begin(&mut v, hit, Vec3::ZERO, Vec3::NEG_Z));
         let ro2 = Vec3::new(3.5, 2.5, 20.0);
         let hit2 = pick(&v, ro2, down);
         e.drag(&mut v, ro2, down, hit2);
@@ -717,7 +1092,7 @@ mod tests {
         let mut e = Editor::new(3);
         e.mirror[0] = true;
         let hit = pick(&v, Vec3::new(1.5, 1.5, 20.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
-        e.begin(&mut v, hit);
+        e.begin(&mut v, hit, Vec3::ZERO, Vec3::NEG_Z);
         e.end(&mut v);
         assert_eq!(v.get(IVec3::new(1, 1, 0)), 3);
         assert_eq!(v.get(IVec3::new(6, 1, 0)), 3);
@@ -745,7 +1120,7 @@ mod tests {
         let mut e = Editor::new(1);
         e.select_all(&v);
         let hit = pick(&v, Vec3::new(1.5, 1.5, 20.0), Vec3::NEG_Z).unwrap();
-        assert!(e.begin_move(&v, hit));
+        assert!(e.begin_move(&v, hit, false));
         e.drag(&mut v, Vec3::new(3.5, 1.5, 20.0), Vec3::NEG_Z, None);
         assert!(e.end(&mut v));
         assert_eq!((v.get(IVec3::new(1, 1, 0)), v.get(IVec3::new(3, 1, 0))), (0, 4));
@@ -769,9 +1144,94 @@ mod tests {
         e.tool = Tool::Paint;
         e.brush = Brush::Face;
         let hit = pick(&v, Vec3::new(2.5, 1.5, 20.0), Vec3::NEG_Z).unwrap();
-        e.begin(&mut v, hit);
+        e.begin(&mut v, hit, Vec3::ZERO, Vec3::NEG_Z);
         e.end(&mut v);
         assert_eq!((v.get(IVec3::new(1, 1, 0)), v.get(IVec3::new(2, 1, 0))), (9, 4));
+    }
+
+    fn count(v: &Volume, c: u8) -> usize {
+        v.cells.iter().filter(|&&x| x == c).count()
+    }
+
+    fn click(e: &mut Editor, v: &mut Volume, x: f32, y: f32) {
+        let (ro, rd) = (Vec3::new(x, y, 20.0), Vec3::NEG_Z);
+        let hit = pick(v, ro, rd).unwrap();
+        e.begin(v, hit, ro, rd);
+        e.end(v);
+    }
+
+    #[test]
+    fn brush_size_shape_and_axis() {
+        let mut v = Volume::new(IVec3::splat(16));
+        let mut e = Editor::new(2);
+        e.opts.size = 3;
+        click(&mut e, &mut v, 8.5, 8.5);
+        // A 3x3x3 cube resting on the ground.
+        assert_eq!(count(&v, 2), 27);
+        assert_eq!(v.get(IVec3::new(8, 8, 2)), 2);
+
+        let mut v = Volume::new(IVec3::splat(16));
+        e.opts.flat = true;
+        click(&mut e, &mut v, 8.5, 8.5);
+        assert_eq!(count(&v, 2), 9);
+
+        let mut v = Volume::new(IVec3::splat(16));
+        e.opts = BrushOptions { size: 5, sphere: true, flat: true, ..Default::default() };
+        click(&mut e, &mut v, 8.5, 8.5);
+        assert_eq!(count(&v, 2), 21);
+
+        let mut v = Volume::new(IVec3::splat(16));
+        e.opts = BrushOptions { axis: [false, false, true], ..Default::default() };
+        click(&mut e, &mut v, 3.5, 3.5);
+        assert_eq!(count(&v, 2), 16);
+    }
+
+    #[test]
+    fn geo_square_and_circle() {
+        let mut e = Editor::new(4);
+        e.brush = Brush::Geo;
+        let down = Vec3::NEG_Z;
+        for (shape, fill, expect) in [(GeoShape::Square, true, 25), (GeoShape::Square, false, 16), (GeoShape::Circle, true, 21)] {
+            let mut v = Volume::new(IVec3::splat(16));
+            e.opts.geo = shape;
+            e.opts.fill = fill;
+            let ro = Vec3::new(8.5, 8.5, 20.0);
+            let hit = pick(&v, ro, down).unwrap();
+            e.begin(&mut v, hit, ro, down);
+            let ro2 = Vec3::new(10.5, 8.5, 20.0);
+            let hit2 = pick(&v, ro2, down);
+            e.drag(&mut v, ro2, down, hit2);
+            e.end(&mut v);
+            assert_eq!(count(&v, 4), expect, "{shape:?} fill {fill}");
+        }
+    }
+
+    #[test]
+    fn pattern_stamps_on_surface() {
+        let mut v = Volume::new(IVec3::splat(16));
+        let mut e = Editor::new(1);
+        let mut p = Volume::new(IVec3::new(2, 2, 3));
+        p.set(IVec3::ZERO, 7);
+        p.set(IVec3::new(1, 1, 2), 8);
+        e.pattern = Some(Pattern { name: "p".into(), volume: p });
+        e.brush = Brush::Pattern;
+        click(&mut e, &mut v, 8.5, 8.5);
+        assert_eq!(v.get(IVec3::new(7, 7, 0)), 7);
+        assert_eq!(v.get(IVec3::new(8, 8, 2)), 8);
+    }
+
+    #[test]
+    fn move_along_normal() {
+        let mut v = vol();
+        v.set(IVec3::new(2, 2, 0), 4);
+        let mut e = Editor::new(1);
+        let hit = Pick { cell: IVec3::new(2, 2, 0), normal: IVec3::Z };
+        assert!(e.begin_move(&v, hit, true));
+        // A horizontal ray passing 3 voxels above the voxel.
+        e.drag(&mut v, Vec3::new(-10.0, 2.5, 3.5), Vec3::X, None);
+        e.end(&mut v);
+        assert_eq!(v.get(IVec3::new(2, 2, 3)), 4);
+        assert_eq!(v.get(IVec3::new(2, 2, 0)), 0);
     }
 
     #[test]
@@ -789,7 +1249,7 @@ mod tests {
         e.tool = Tool::Erase;
         e.brush = Brush::Face;
         let hit = pick(&v, Vec3::new(1.5, 1.5, 20.0), Vec3::new(0.0, 0.0, -1.0)).unwrap();
-        e.begin(&mut v, hit);
+        e.begin(&mut v, hit, Vec3::ZERO, Vec3::NEG_Z);
         e.end(&mut v);
         assert_eq!(v.cells.iter().filter(|&&c| c == 9).count(), 16);
     }

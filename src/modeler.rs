@@ -9,6 +9,10 @@ use crate::scene::{Projection, Volume};
 
 const MODELER_WGSL: &str = include_str!("shaders/modeler.wgsl");
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const SHADOW_SIZE: u32 = 2048;
+/// Direction the modeler's light comes from. Tilted off every axis so no
+/// face is lit by the ambient term alone.
+const LIGHT: Vec3 = Vec3::new(0.42, 0.55, 0.72);
 /// `kind` of the ground quad's vertices; voxel faces use 0..6.
 const FLOOR: u32 = 6;
 
@@ -99,6 +103,10 @@ pub struct ModelerOptions {
     pub frame: bool,
     /// Outline of the volume bounds (MagicaVoxel's `rm_show bo`).
     pub bounds: bool,
+    /// Cast shadows from the modeler light [SW].
+    pub shadow: bool,
+    /// Draw voxels as wireframe outlines [WR].
+    pub wire: bool,
     pub background: Vec3,
     pub ambient: Vec3,
 }
@@ -112,6 +120,8 @@ impl Default for ModelerOptions {
             constant: false,
             frame: false,
             bounds: true,
+            shadow: false,
+            wire: false,
             background: Vec3::new(0.17, 0.17, 0.17),
             // `ambient_color` from MagicaVoxel's config.txt.
             ambient: Vec3::new(0.19, 0.18, 0.26),
@@ -133,18 +143,30 @@ struct Uniforms {
     edge: [f32; 4],
     /// Bounding box line color (with alpha).
     line: [f32; 4],
+    /// Light-space transform for the shadow map.
+    shadow_vp: [[f32; 4]; 4],
+    /// x shadows on, y wireframe on.
+    view: [f32; 4],
     palette: [[f32; 4]; 256],
 }
 
 pub struct Modeler {
     pub options: ModelerOptions,
     pipeline: wgpu::RenderPipeline,
+    /// Same as `pipeline` without back-face culling, for wireframe.
+    wire_pipeline: wgpu::RenderPipeline,
+    /// Depth-only pass from the light into `shadow_view`.
+    shadow_pipeline: wgpu::RenderPipeline,
+    shadow_view: wgpu::TextureView,
     uniforms: wgpu::Buffer,
+    /// Uniforms plus the shadow map, for the voxel passes.
     bind_group: wgpu::BindGroup,
+    /// Uniforms only, for passes that render into the shadow map or draw
+    /// lines.
+    plain_bind_group: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     /// Bounding box edges, depth-tested so voxels hide the back edges.
     line_pipeline: wgpu::RenderPipeline,
-    line_bind_group: wgpu::BindGroup,
     bounds: wgpu::Buffer,
     vertex_count: u32,
     palette: [[f32; 4]; 256],
@@ -158,68 +180,102 @@ impl Modeler {
             label: Some("modeler"),
             source: wgpu::ShaderSource::Wgsl(MODELER_WGSL.into()),
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("modeler"),
-            layout: None,
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Uint16x4, 1 => Uint32],
-                })],
-            },
-            primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+        let uniform_entry = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let plain_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("modeler_plain"), entries: &[uniform_entry] });
+        let shaded_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("modeler_shaded"),
+            entries: &[
+                uniform_entry,
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+        let layout = |bgl: &wgpu::BindGroupLayout| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(bgl)], immediate_size: 0 })
+        };
+        let (plain_pl, shaded_pl) = (layout(&plain_layout), layout(&shaded_layout));
+        let vertex_layout = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Uint16x4, 1 => Uint32],
+        })];
+        let depth = |write: bool, compare: wgpu::CompareFunction| {
+            Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(write),
+                depth_compare: Some(compare),
+                stencil: Default::default(),
+                bias: Default::default(),
+            })
+        };
+        let voxels = |label: &str, cull: Option<wgpu::Face>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&shaded_pl),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &vertex_layout },
+                primitive: wgpu::PrimitiveState { cull_mode: cull, ..Default::default() },
+                depth_stencil: depth(true, wgpu::CompareFunction::Less),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(format.into())],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = voxels("modeler", Some(wgpu::Face::Back));
+        let wire_pipeline = voxels("modeler_wire", None);
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("modeler_shadow"),
+            layout: Some(&plain_pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_shadow"), compilation_options: Default::default(), buffers: &vertex_layout },
+            primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: Default::default(),
-                bias: Default::default(),
+                bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 },
             }),
             multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(format.into())],
-            }),
+            fragment: None,
             multiview_mask: None,
             cache: None,
         });
         let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("modeler_lines"),
-            layout: None,
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_line"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Uint16x4, 1 => Uint32],
-                })],
-            },
+            layout: Some(&plain_pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_line"), compilation_options: Default::default(), buffers: &vertex_layout },
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
+            depth_stencil: depth(false, wgpu::CompareFunction::LessEqual),
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &module,
                 entry_point: Some("fs_line"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
             }),
             multiview_mask: None,
             cache: None,
@@ -230,25 +286,51 @@ impl Modeler {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let shadow_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("modeler_shadow"),
+                size: wgpu::Extent3d { width: SHADOW_SIZE, height: SHADOW_SIZE, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("modeler_shadow"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("modeler"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
+            layout: &shaded_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&shadow_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
         });
-        let line_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("modeler_lines"),
-            layout: &line_pipeline.get_bind_group_layout(0),
+        let plain_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("modeler_plain"),
+            layout: &plain_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() }],
         });
         let (vertices, vertex_count) = vertex_buffer(device, volume, None);
         let mut m = Modeler {
             options: ModelerOptions::default(),
             pipeline,
+            wire_pipeline,
+            shadow_pipeline,
+            shadow_view,
             uniforms,
             bind_group,
+            plain_bind_group,
             vertices,
             line_pipeline,
-            line_bind_group,
             bounds: bounds_buffer(device, volume.dims),
             vertex_count,
             palette: [[0.0; 4]; 256],
@@ -302,8 +384,7 @@ impl Modeler {
         }
         let (x, y, w, h) = viewport;
         let o = &self.options;
-        // Tilted off every axis so no face is lit by the ambient term alone.
-        let light = Vec3::new(0.42, 0.55, 0.72).normalize();
+        let light = LIGHT.normalize();
         let u = Uniforms {
             view_proj: view_proj(camera, fov, projection, w as f32 / h as f32, self.dims).to_cols_array_2d(),
             light: light.extend(0.0).to_array(),
@@ -313,11 +394,32 @@ impl Modeler {
             opts: [o.grid as u32 as f32, o.ao as u32 as f32, o.constant as u32 as f32, o.frame as u32 as f32],
             edge: [0.0, 0.0, 0.0, o.edge as u32 as f32],
             line: [1.0, 1.0, 1.0, 0.45],
+            shadow_vp: shadow_view_proj(self.dims).to_cols_array_2d(),
+            view: [o.shadow as u32 as f32, o.wire as u32 as f32, 0.0, 0.0],
             palette: self.palette,
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
         let bg = o.background;
         let mut enc = device.create_command_encoder(&Default::default());
+        if o.shadow {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("modeler_shadow"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.shadow_pipeline);
+            pass.set_bind_group(0, &self.plain_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertices.slice(..));
+            // Voxels only: the ground quad (last 6 vertices) receives shadows.
+            pass.draw(0..self.vertex_count - 6, 0..1);
+        }
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("modeler"),
@@ -340,7 +442,7 @@ impl Modeler {
                 multiview_mask: None,
             });
             pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(if o.wire { &self.wire_pipeline } else { &self.pipeline });
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             // The ground quad (the last 6 vertices) shows with grid lines.
@@ -348,7 +450,7 @@ impl Modeler {
             pass.draw(0..n, 0..1);
             if o.bounds {
                 pass.set_pipeline(&self.line_pipeline);
-                pass.set_bind_group(0, &self.line_bind_group, &[]);
+                pass.set_bind_group(0, &self.plain_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.bounds.slice(..));
                 pass.draw(0..24, 0..1);
             }
@@ -390,6 +492,35 @@ fn vertex_buffer(device: &wgpu::Device, volume: &Volume, sel: Option<&[bool]>) -
     buf.slice(..).get_mapped_range_mut().expect("mapped at creation").copy_from_slice(bytemuck::cast_slice(&mesh));
     buf.unmap();
     (buf, mesh.len() as u32)
+}
+
+/// Right-handed view matrix looking from `eye` along `fwd`.
+fn look(eye: Vec3, fwd: Vec3) -> Mat4 {
+    let f = fwd.normalize();
+    let s = f.cross(Vec3::Z).normalize();
+    let u = s.cross(f);
+    Mat4::from_cols(
+        Vec3::new(s.x, u.x, -f.x).extend(0.0),
+        Vec3::new(s.y, u.y, -f.y).extend(0.0),
+        Vec3::new(s.z, u.z, -f.z).extend(0.0),
+        Vec3::new(-s.dot(eye), -u.dot(eye), f.dot(eye)).extend(1.0),
+    )
+}
+
+/// Orthographic projection from the light covering the whole canvas.
+fn shadow_view_proj(dims: Vec3) -> Mat4 {
+    let radius = dims.length() * 0.5 + 1.0;
+    let center = dims * 0.5;
+    let dir = LIGHT.normalize();
+    let view = look(center + dir * radius * 2.0, -dir);
+    let (near, far) = (radius, radius * 3.0);
+    let proj = Mat4::from_cols(
+        glam::Vec4::new(1.0 / radius, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, 1.0 / radius, 0.0, 0.0),
+        glam::Vec4::new(0.0, 0.0, -1.0 / (far - near), 0.0),
+        glam::Vec4::new(0.0, 0.0, -near / (far - near), 1.0),
+    );
+    proj * view
 }
 
 /// Same camera model as the path tracer's perspective and ortho rays,

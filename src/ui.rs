@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use egui::{CollapsingHeader, ComboBox, Slider, Ui};
 use glam::{IVec3, Vec3};
 
-use crate::edit::{Brush, Editor, Tool};
+use crate::edit::{Brush, Editor, GeoShape, MarqueeMode, Tool};
 use crate::env::EnvMode;
 use crate::modeler::ModelerOptions;
 use crate::scene::{GpuMaterial, MaterialKind, Projection, RenderSettings, Scene};
@@ -60,6 +60,19 @@ pub enum Command {
     Snapshot,
     /// Replace the palette with a 256x1 palette image.
     LoadPalette(PathBuf),
+    /// Use a model file as the Pattern brush's pattern.
+    LoadPattern(PathBuf),
+    /// Make the selection the pattern.
+    PatternFromSelection,
+}
+
+/// Which list the Project column shows, like MagicaVoxel's tabs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ProjectTab {
+    #[default]
+    Project,
+    Pattern,
+    Shader,
 }
 
 /// Things the panels ask the app to do this frame.
@@ -286,6 +299,8 @@ pub struct Status<'a> {
     pub hover: Option<(IVec3, u8)>,
     pub projection: &'a mut Projection,
     pub iso: bool,
+    /// Free camera: rotating turns the view around the eye.
+    pub free: &'a mut bool,
     pub hint: &'a str,
 }
 
@@ -300,6 +315,8 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
             ui.toggle_value(&mut o.grid, "Grid").on_hover_text("Grid lines [Ctrl+G]");
             ui.toggle_value(&mut o.frame, "Frame").on_hover_text("Ground frame lines [Ctrl+F]");
             ui.toggle_value(&mut o.ao, "AO").on_hover_text("Ambient occlusion");
+            ui.toggle_value(&mut o.shadow, "SW").on_hover_text("Shadow");
+            ui.toggle_value(&mut o.wire, "WR").on_hover_text("Wireframe");
             ui.separator();
         }
         let field = |v: Option<i32>| v.map_or("-".to_string(), |v| v.to_string());
@@ -316,8 +333,13 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
         ));
         ui.separator();
         let pers = *s.projection == Projection::Perspective;
-        if ui.selectable_label(pers, "Pers").clicked() {
+        if ui.selectable_label(pers && !*s.free, "Pers").on_hover_text("Perspective, orbiting the target").clicked() {
             *s.projection = Projection::Perspective;
+            *s.free = false;
+        }
+        if ui.selectable_label(pers && *s.free, "Free").on_hover_text("Perspective, looking around from the eye [WASD/QE to move]").clicked() {
+            *s.projection = Projection::Perspective;
+            *s.free = true;
         }
         if ui.selectable_label(!pers && !s.iso && *s.projection == Projection::Orthographic, "Orth").clicked() {
             *s.projection = Projection::Orthographic;
@@ -388,14 +410,16 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: b
 
 /// Second left column in the modeler: brush, tool, selection tools and
 /// mirroring.
-pub fn brush_panel(ui: &mut Ui, e: &mut Editor) {
+pub fn brush_panel(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
     heading(ui, "Brush");
-    egui::Grid::new("brushes").num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
-        ui.selectable_value(&mut e.brush, Brush::Voxel, "Voxel").on_hover_text("V");
-        ui.selectable_value(&mut e.brush, Brush::Face, "Face").on_hover_text("F · drag to extrude");
+    egui::Grid::new("brushes").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
+        ui.selectable_value(&mut e.brush, Brush::Geo, "Geo").on_hover_text("Geometry mode [L]: line, square, circle");
+        ui.selectable_value(&mut e.brush, Brush::Code, "Code").on_hover_text("Voxel shader mode [C]");
+        ui.selectable_value(&mut e.brush, Brush::Pattern, "Pattern").on_hover_text("Pattern mode [P] : Rot [-/+/0/9]");
         ui.end_row();
-        ui.selectable_value(&mut e.brush, Brush::Box, "Box").on_hover_text("B");
-        ui.selectable_value(&mut e.brush, Brush::Line, "Line").on_hover_text("L");
+        ui.selectable_value(&mut e.brush, Brush::Voxel, "Voxel").on_hover_text("Voxel mode [V] : Resize [-/+/Ctrl+Alt+Drag]");
+        ui.selectable_value(&mut e.brush, Brush::Face, "Face").on_hover_text("Face mode [F] : Extrude [Drag]");
+        ui.selectable_value(&mut e.brush, Brush::Box, "Box").on_hover_text("Box mode [B]");
         ui.end_row();
     });
     ui.separator();
@@ -406,8 +430,8 @@ pub fn brush_panel(ui: &mut Ui, e: &mut Editor) {
     });
     ui.separator();
     egui::Grid::new("select_tools").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
-        ui.selectable_value(&mut e.tool, Tool::Move, "Move").on_hover_text("Drag the selection, or the model");
-        ui.selectable_value(&mut e.tool, Tool::Marquee, "Rect").on_hover_text("Marquee select [M] : Add [Shift] : Remove [Shift+Alt]");
+        ui.selectable_value(&mut e.tool, Tool::Move, "Move").on_hover_text("Drag the selection, or the model : Normal axis [Shift]");
+        ui.selectable_value(&mut e.tool, Tool::Marquee, "Select").on_hover_text("Marquee select [M] : Add [Shift] : Remove [Shift+Alt]");
         ui.selectable_value(&mut e.tool, Tool::Region, "Region").on_hover_text("Region select [N] : Add [Shift] : Remove [Shift+Alt]");
         ui.end_row();
         ui.selectable_value(&mut e.tool, Tool::Pick, "Pick").on_hover_text("Pick voxel color [Alt+LButton]");
@@ -415,6 +439,21 @@ pub fn brush_panel(ui: &mut Ui, e: &mut Editor) {
         ui.selectable_value(&mut e.tool, Tool::RegionReplace, "Replace").on_hover_text("Region replace with the current color");
         ui.end_row();
     });
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Mirror").on_hover_text("Mirror mode");
+        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+            ui.toggle_value(&mut e.mirror[i], *n).on_hover_text(format!("F{}", 5 + i));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Axis").on_hover_text("Axis mode: extend the brush through the canvas");
+        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+            ui.toggle_value(&mut e.opts.axis[i], *n);
+        }
+    });
+    ui.separator();
+    brush_options(ui, e, cmds);
     if matches!(e.tool, Tool::Region | Tool::RegionRemove | Tool::RegionReplace) {
         ui.separator();
         ui.label("Region");
@@ -529,17 +568,118 @@ pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, cmds: &mut Ve
     });
 }
 
-/// Far-right column in the modeler: the project list.
-pub fn project_panel(ui: &mut Ui, projects: &[PathBuf], current: &Path, cmds: &mut Vec<Command>) {
-    heading(ui, "Project");
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        if projects.is_empty() {
-            ui.weak("Open a .vox file to list its folder here");
+fn pick2<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, a: (T, &str, &str), b: (T, &str, &str)) {
+    ui.horizontal(|ui| {
+        ui.selectable_value(v, a.0, a.1).on_hover_text(a.2);
+        ui.selectable_value(v, b.0, b.1).on_hover_text(b.2);
+    });
+}
+
+/// Options for the current brush or selection tool.
+fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
+    if e.tool == Tool::Marquee {
+        ui.label("Marquee");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut e.opts.marquee, MarqueeMode::Rect, "Rect").on_hover_text("Rect select");
+            ui.selectable_value(&mut e.opts.marquee, MarqueeMode::Brush, "Brush").on_hover_text("Brush select (voxel brush size)");
+            ui.selectable_value(&mut e.opts.marquee, MarqueeMode::Box, "Box").on_hover_text("Box select");
+        });
+        if e.opts.marquee == MarqueeMode::Rect {
+            ui.checkbox(&mut e.opts.visible_only, "Visible only").on_hover_text("Skip voxels hidden behind others");
         }
-        for p in projects {
-            let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            if ui.selectable_label(p == current, name).clicked() {
-                cmds.push(Command::OpenPath(p.clone()));
+        if e.opts.marquee != MarqueeMode::Brush {
+            return;
+        }
+    }
+    let o = &mut e.opts;
+    match e.brush {
+        Brush::Voxel => {
+            ui.horizontal(|ui| {
+                ui.label("Size");
+                ui.add(egui::DragValue::new(&mut o.size).range(1..=64)).on_hover_text("Voxel size [1 - 64] : Change size [-/+/Ctrl+Alt+Drag]");
+            });
+            pick2(ui, &mut o.sphere, (false, "Cube", "Cube shape"), (true, "Sphere", "Sphere shape"));
+            pick2(ui, &mut o.flat, (true, "2D", "Flat on the face under the cursor"), (false, "3D", "Solid"));
+        }
+        Brush::Face => {
+            pick2(ui, &mut o.face_voxel_color, (false, "Palette", "Use palette color"), (true, "Voxel", "Use voxel color"));
+            pick2(ui, &mut o.face_by_color, (true, "Color", "Color connectivity"), (false, "Geo", "Geometry connectivity"));
+            pick2(ui, &mut o.face_diagonal, (false, "4", "4 neighbor searching"), (true, "8", "8 neighbor searching"));
+        }
+        Brush::Geo => {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut o.geo, GeoShape::Line, "Line");
+                ui.selectable_value(&mut o.geo, GeoShape::Square, "Square");
+                ui.selectable_value(&mut o.geo, GeoShape::Circle, "Circle");
+            });
+            if o.geo == GeoShape::Line {
+                ui.checkbox(&mut o.project, "Project").on_hover_text("Project the line on the surface");
+            } else {
+                ui.checkbox(&mut o.fill, "Fill").on_hover_text("Fill center");
+                ui.checkbox(&mut o.even, "Even").on_hover_text("Even size");
+            }
+        }
+        Brush::Pattern => {
+            match &e.pattern {
+                Some(p) => {
+                    let d = p.volume.dims;
+                    ui.label(format!("{} ({}×{}×{})", p.name, d.x, d.y, d.z));
+                }
+                None => {
+                    ui.weak("Pick a model in Project › Pattern");
+                }
+            }
+            pick2(ui, &mut e.opts.pattern_palette, (true, "Palette", "Use palette color"), (false, "Voxel", "Use the pattern's colors"));
+            ui.horizontal(|ui| {
+                command(ui, cmds, "From selection", "Create pattern from selection", Command::PatternFromSelection);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Rot");
+                if ui.small_button("Z").on_hover_text("[-/+]").clicked() {
+                    e.rotate_pattern(2, 1);
+                }
+                if ui.small_button("X").on_hover_text("[9/0]").clicked() {
+                    e.rotate_pattern(0, 1);
+                }
+                if ui.small_button("Y").clicked() {
+                    e.rotate_pattern(1, 1);
+                }
+            });
+        }
+        Brush::Code => {
+            ui.weak("Drag a box to fill it with the shader chosen in Project › Shader");
+        }
+        Brush::Box => {}
+    }
+}
+
+/// Far-right column in the modeler: project, pattern and shader lists.
+pub fn project_panel(ui: &mut Ui, tab: &mut ProjectTab, projects: &[PathBuf], current: &Path, pattern: Option<&str>, cmds: &mut Vec<Command>) {
+    heading(ui, "Project");
+    ui.horizontal(|ui| {
+        ui.selectable_value(tab, ProjectTab::Project, "Proj").on_hover_text("Project list");
+        ui.selectable_value(tab, ProjectTab::Pattern, "Patt").on_hover_text("Pattern list");
+        ui.selectable_value(tab, ProjectTab::Shader, "Shdr").on_hover_text("Shader list");
+    });
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        match *tab {
+            ProjectTab::Project | ProjectTab::Pattern => {
+                if projects.is_empty() {
+                    ui.weak("Open a .vox file to list its folder here");
+                }
+                for p in projects {
+                    let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if *tab == ProjectTab::Project {
+                        if ui.selectable_label(p == current, name).clicked() {
+                            cmds.push(Command::OpenPath(p.clone()));
+                        }
+                    } else if ui.selectable_label(pattern == Some(name.as_str()), name).clicked() {
+                        cmds.push(Command::LoadPattern(p.clone()));
+                    }
+                }
+            }
+            ProjectTab::Shader => {
+                ui.weak("Shaders coming soon");
             }
         }
     });

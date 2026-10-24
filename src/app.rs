@@ -38,6 +38,9 @@ pub struct EditState {
     pub projects: Vec<PathBuf>,
     /// Palette images in MagicaVoxel's `palette` folder.
     pub palettes: Vec<PathBuf>,
+    pub project_tab: ui::ProjectTab,
+    /// Free camera: rotate around the eye instead of the target.
+    pub free_look: bool,
     /// Canvas size being typed into the Canvas panel.
     pub canvas: IVec3,
     canvas_for: IVec3,
@@ -52,6 +55,8 @@ impl EditState {
         let palettes = list_palettes(source.as_deref());
         EditState {
             palettes,
+            project_tab: ui::ProjectTab::default(),
+            free_look: false,
             editor: Editor::new(color),
             hover: None,
             enabled: true,
@@ -323,6 +328,26 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             snapshot(r);
             false
         }
+        Command::LoadPattern(p) => {
+            match crate::open_vox(&p) {
+                Ok(s) => match ops::fit(&s.volume) {
+                    Some(volume) => {
+                        let name = p.file_stem().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+                        ed.editor.pattern = Some(edit::Pattern { name, volume });
+                        ed.editor.brush = edit::Brush::Pattern;
+                    }
+                    None => eprintln!("pattern {}: empty model", p.display()),
+                },
+                Err(e) => eprintln!("pattern {}: {e:#}", p.display()),
+            }
+            false
+        }
+        Command::PatternFromSelection => {
+            if ed.editor.pattern_from_selection(&scene.volume) {
+                ed.editor.brush = edit::Brush::Pattern;
+            }
+            false
+        }
         Command::LoadPalette(p) => {
             match load_palette(&p) {
                 Ok(colors) => {
@@ -495,7 +520,7 @@ pub fn build_ui(
             };
             let iso = is_iso(r);
             let options = r.modeler.as_mut().filter(|_| r.modeling).map(|m| &mut m.options);
-            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, hint };
+            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, hint };
             if ui::status_bar(ui, status, cmds) {
                 iso_camera(r);
             }
@@ -506,10 +531,11 @@ pub fn build_ui(
             });
         });
         if r.modeling {
-            egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| ui::brush_panel(ui, &mut ed.editor));
+            egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
             egui::Panel::right("project").exact_size(130.0).resizable(false).show(ui, |ui| {
                 let current = ed.source.clone().unwrap_or_default();
-                ui::project_panel(ui, &ed.projects, &current, cmds);
+                let pattern = ed.editor.pattern.as_ref().map(|p| p.name.clone());
+                ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &current, pattern.as_deref(), cmds);
             });
             if let Some(m) = r.modeler.as_mut() {
                 egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut m.options, cmds));
@@ -595,6 +621,8 @@ struct Mouse {
     space: bool,
     zoom: bool,
     focus: bool,
+    /// Fractional brush-size change from Ctrl+Alt+drag.
+    size_drag: f32,
     pos: Option<(f64, f64)>,
 }
 
@@ -783,7 +811,14 @@ impl App {
                 "v" => ed.brush = edit::Brush::Voxel,
                 "f" => ed.brush = edit::Brush::Face,
                 "b" => ed.brush = edit::Brush::Box,
-                "l" => ed.brush = edit::Brush::Line,
+                "l" => ed.brush = edit::Brush::Geo,
+                "c" => ed.brush = edit::Brush::Code,
+                "p" => ed.brush = edit::Brush::Pattern,
+                // Pattern rotation, or voxel brush size.
+                "-" | "=" | "+" if ed.brush == edit::Brush::Pattern => ed.rotate_pattern(2, if c == "-" { 3 } else { 1 }),
+                "9" | "0" if ed.brush == edit::Brush::Pattern => ed.rotate_pattern(0, if c == "9" { 3 } else { 1 }),
+                "-" => ed.opts.size = (ed.opts.size - 1).max(1),
+                "=" | "+" => ed.opts.size = (ed.opts.size + 1).min(64),
                 "t" => ed.tool = Tool::Attach,
                 "r" => ed.tool = Tool::Erase,
                 "g" => ed.tool = Tool::Paint,
@@ -864,14 +899,30 @@ impl App {
         let (dx, dy) = last.map(|(lx, ly)| ((x - lx) as f32, (y - ly) as f32)).unwrap_or((0.0, 0.0));
         let cam = &mut g.renderer.camera;
         let editing = self.edit.enabled && !self.mouse.space && !self.mouse.zoom;
+        let ctrl_alt = (self.modifiers.control_key() || self.modifiers.super_key()) && self.modifiers.alt_key();
         if let Some((_, b)) = self.edit.marquee.as_mut() {
             *b = Vec2::new(x as f32, y as f32);
+        } else if self.mouse.left && ctrl_alt && !self.edit.editor.active() {
+            // Ctrl+Alt+drag resizes the voxel brush.
+            let o = &mut self.edit.editor.opts;
+            self.mouse.size_drag += dx * 0.1;
+            let step = self.mouse.size_drag.trunc();
+            self.mouse.size_drag -= step;
+            o.size = (o.size + step as i32).clamp(1, 64);
         } else if self.mouse.left && self.mouse.zoom {
             cam.dist = (cam.dist * (dy * 0.01).exp()).max(1.0);
             g.renderer.reset();
         } else if self.mouse.right || (self.mouse.left && !editing && !self.edit.editor.active()) && !self.mouse.space {
-            cam.yaw -= dx * 0.005;
-            cam.pitch = (cam.pitch + dy * 0.005).clamp(-1.55, 1.55);
+            let eye = cam.eye();
+            if self.edit.free_look {
+                // Look around from where the camera is.
+                cam.yaw -= dx * 0.003;
+                cam.pitch = (cam.pitch + dy * 0.003).clamp(-1.55, 1.55);
+                cam.target = eye - (cam.eye() - cam.target);
+            } else {
+                cam.yaw -= dx * 0.005;
+                cam.pitch = (cam.pitch + dy * 0.005).clamp(-1.55, 1.55);
+            }
             g.renderer.reset();
         } else if self.mouse.middle || (self.mouse.left && self.mouse.space) {
             let (_, right, up) = cam.basis();
@@ -894,10 +945,20 @@ impl App {
         let Some(g) = self.gfx.as_ref() else { return };
         let (lo, hi) = (a.min(b), a.max(b));
         let v = &self.scene.volume;
+        let visible_only = self.edit.editor.opts.visible_only;
         let cells: Vec<usize> = (0..v.cells.len())
             .filter(|&i| v.cells[i] != 0)
             .filter(|&i| {
-                g.renderer.project(v.position(i).as_vec3() + 0.5).is_some_and(|(x, y)| x >= lo.x && x <= hi.x && y >= lo.y && y <= hi.y)
+                let p = v.position(i);
+                let Some((x, y)) = g.renderer.project(p.as_vec3() + 0.5) else { return false };
+                if x < lo.x || x > hi.x || y < lo.y || y > hi.y {
+                    return false;
+                }
+                // Visible: the camera ray through the voxel hits it first.
+                !visible_only || {
+                    let (ro, rd) = g.renderer.camera_ray(x, y);
+                    edit::pick(v, ro, rd).is_some_and(|h| h.cell == p)
+                }
             })
             .collect();
         let mode = self.sel_mode();
@@ -922,20 +983,25 @@ impl App {
                     let hover = self.edit.hover;
                     self.edit.editor.sel_mode = self.sel_mode();
                     let tool = self.edit.editor.tool;
-                    let alt_only = self.modifiers.alt_key() && !self.modifiers.shift_key();
-                    if alt_only {
+                    let alt = self.modifiers.alt_key();
+                    let alt_only = alt && !self.modifiers.shift_key() && !cmd;
+                    if cmd && alt {
+                        // Ctrl+Alt+drag resizes the brush (see mouse_moved).
+                    } else if alt_only {
                         // Alt+click picks a voxel's color with any tool.
                         if let Some(h) = hover.filter(|h| !h.on_ground()) {
                             self.edit.editor.color = self.scene.volume.get(h.cell);
                         }
                     } else if (cmd && self.edit.editor.selected_count() > 0) || tool == Tool::Move {
                         if let Some(hit) = hover {
-                            self.edit.editor.begin_move(&self.scene.volume, hit);
+                            let shift = self.modifiers.shift_key();
+                            self.edit.editor.begin_move(&self.scene.volume, hit, shift);
                         }
-                    } else if self.edit.editor.tool == Tool::Marquee {
+                    } else if tool == Tool::Marquee && self.edit.editor.opts.marquee == edit::MarqueeMode::Rect {
                         self.edit.marquee = pos.map(|p| (p, p));
                     } else if let Some(hit) = hover {
-                        if self.edit.editor.begin(&mut self.scene.volume, hit) {
+                        let (ro, rd) = self.ray().unwrap_or((Vec3::ZERO, Vec3::NEG_Z));
+                        if self.edit.editor.begin(&mut self.scene.volume, hit, ro, rd) {
                             self.sync();
                         }
                     } else if self.edit.editor.tool == Tool::Region && self.edit.editor.sel_mode == SelMode::Replace {

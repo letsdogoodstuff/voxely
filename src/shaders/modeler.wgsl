@@ -16,10 +16,16 @@ struct U {
     edge: vec4<f32>,
     // Bounding box line color.
     line: vec4<f32>,
+    // Light-space transform for the shadow map.
+    shadow_vp: mat4x4<f32>,
+    // x shadows on, y wireframe on.
+    view: vec4<f32>,
     palette: array<vec4<f32>, 256>,
 }
 
 @group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var shadow_map: texture_depth_2d;
+@group(0) @binding(2) var shadow_sampler: sampler_comparison;
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -48,6 +54,25 @@ fn vs_main(@location(0) pos: vec4<u32>, @location(1) data: u32) -> VsOut {
     return o;
 }
 
+// Depth-only pass from the light.
+@vertex
+fn vs_shadow(@location(0) pos: vec4<u32>, @location(1) data: u32) -> @builtin(position) vec4<f32> {
+    return u.shadow_vp * vec4<f32>(vec3<f32>(pos.xyz), 1.0);
+}
+
+// Fraction of light reaching `p` (4-tap PCF).
+fn lit(p: vec3<f32>) -> f32 {
+    let l = u.shadow_vp * vec4<f32>(p, 1.0);
+    let uv = l.xy * vec2<f32>(0.5, -0.5) + 0.5;
+    let texel = 1.0 / vec2<f32>(textureDimensions(shadow_map));
+    var sum = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let o = (vec2<f32>(f32(i & 1), f32(i >> 1u)) - 0.5) * texel;
+        sum += textureSampleCompareLevel(shadow_map, shadow_sampler, uv + o, l.z - 0.0015);
+    }
+    return sum * 0.25;
+}
+
 fn screen_grad(v: vec2<f32>) -> vec2<f32> {
     return max(abs(dpdx(v)), abs(dpdy(v)));
 }
@@ -67,8 +92,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let grad = screen_grad(uv);
     let lgrad = max(fwidth(in.local), vec2<f32>(1e-6));
 
+    var shade = 1.0;
+    if u.view.x > 0.0 && dot(u.light.xyz, n) > 0.0 {
+        shade = mix(0.55, 1.0, lit(in.pos + n * 0.02));
+    }
+
     if kind == 6u {
-        var c = u.floor.rgb;
+        var c = u.floor.rgb * shade;
         c = mix(c * 0.85, c, lines(uv, grad, 1.0));
         if u.opts.w > 0.0 {
             c = mix(c * 0.6, c, lines(uv, grad, u.floor.w));
@@ -83,10 +113,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if u.opts.z <= 0.0 {
         let d = dot(u.light.xyz, n);
-        c *= u.ambient.rgb + (max(d, 0.0) + max(-d, 0.0) * 0.8) * 1.3;
+        c *= u.ambient.rgb + (max(d, 0.0) * shade + max(-d, 0.0) * 0.8) * 1.3;
     }
     if u.opts.y > 0.0 {
         c *= mix(0.45, 1.0, in.ao);
+    }
+    if u.view.y > 0.0 {
+        // Wireframe: keep only a thin border around each voxel face.
+        let d = min(in.local, 1.0 - in.local) / lgrad;
+        if min(d.x, d.y) > 1.0 {
+            discard;
+        }
     }
     if u.edge.w > 0.0 {
         // Distance in pixels to each outline edge of this face.
