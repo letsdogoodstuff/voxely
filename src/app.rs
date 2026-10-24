@@ -46,6 +46,8 @@ pub struct EditState {
     pub matter_tab: ui::MatterTab,
     pub material_clipboard: Option<crate::scene::GpuMaterial>,
     pub image: ui::ImageSettings,
+    pub transform_text: ui::TransformText,
+    pub palette: ui::PaletteState,
     /// Canvas size being typed into the Canvas panel.
     pub canvas: IVec3,
     canvas_for: IVec3,
@@ -66,6 +68,8 @@ impl EditState {
             matter_tab: ui::MatterTab::default(),
             material_clipboard: None,
             image: ui::ImageSettings::default(),
+            transform_text: ui::TransformText::default(),
+            palette: ui::PaletteState::default(),
             shaders: ui::ShaderState { files: list_shaders(source.as_deref()), current: None, values: Vec::new(), error: None },
             editor: Editor::new(color),
             hover: None,
@@ -144,7 +148,8 @@ fn render_final(r: &Renderer, scene: &Scene, image: ui::ImageSettings) {
 /// Run the chosen shader over the volume.
 fn shader_output(r: &Renderer, scene: &Scene, ed: &mut EditState) -> Option<crate::scene::Volume> {
     let (_, shader) = ed.shaders.current.as_ref()?;
-    match crate::xs::run(&r.device, &r.queue, shader, &ed.shaders.values, &scene.volume, &scene.palette, ed.editor.color, &[]) {
+    let sels: Vec<u8> = (1..256).filter(|&i| ed.palette.selected[i]).map(|i| i as u8).collect();
+    match crate::xs::run(&r.device, &r.queue, shader, &ed.shaders.values, &scene.volume, &scene.palette, ed.editor.color, &sels) {
         Ok(v) => {
             ed.shaders.error = None;
             Some(v)
@@ -298,12 +303,42 @@ fn apply_op(op: Op, scene: &Scene, editor: &Editor) -> Option<crate::scene::Volu
         Op::Loop(a, d) => ops::loop_shift(v, sel, a, d),
         Op::Mirror(a) => ops::mirror(v, a),
         Op::Shape(k) => ops::shape(v, k, c),
+        Op::Diagonal(a) => ops::diagonal(v, a),
+        Op::Maze => ops::maze(v, c, 4),
+        Op::Perlin => ops::perlin(v, c, seed()),
         Op::Rotate(a) => ops::rotate(v, a),
         Op::Hull => ops::hull(v),
         Op::Flood => ops::flood(v, c),
         Op::Dilate => ops::dilate(v),
         Op::Erode => ops::erode(v),
     })
+}
+
+/// A seed that changes every call, for Perlin and Rand.
+fn seed() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.subsec_nanos() | 1)
+}
+
+/// Selected palette colors, or the current color if none are selected.
+fn selected_colors(ed: &EditState) -> Vec<u8> {
+    let sel: Vec<u8> = (1..256).filter(|&i| ed.palette.selected[i]).map(|i| i as u8).collect();
+    if sel.is_empty() { vec![ed.editor.color] } else { sel }
+}
+
+/// Apply a Scale / Shear / Rotate / Repeat text like "xyz 2".
+fn transform(kind: ui::TransformKind, text: &str, v: &crate::scene::Volume) -> Option<crate::scene::Volume> {
+    let Some((axes, nums)) = ops::parse_axes_args(text) else {
+        eprintln!("expected [axes] [values], e.g. \"xyz 2\", got {text:?}");
+        return None;
+    };
+    let first = axes.iter().position(|&a| a)?;
+    let n = |k: usize| nums.get(k).copied();
+    match kind {
+        ui::TransformKind::Scale => ops::scale(v, axes, n(0)?),
+        ui::TransformKind::Shear => Some(ops::shear(v, first, n(0)?, n(1).unwrap_or(n(0)?))),
+        ui::TransformKind::Rotate => Some(ops::rotate_angle(v, first, n(0)?)),
+        ui::TransformKind::Repeat => ops::repeat(v, axes, n(0)?.max(1.0) as u32),
+    }
 }
 
 /// Run a button or hotkey command.
@@ -437,6 +472,37 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             let i = ed.editor.color;
             set_material(r, scene, i, crate::scene::material(i as u32, scene.palette[i as usize], None));
             false
+        }
+        Command::Transform(kind, text) => match transform(kind, &text, &scene.volume) {
+            Some(new) => ed.editor.commit(&mut scene.volume, new),
+            None => false,
+        },
+        Command::PaletteSort => {
+            let (palette, remap) = crate::palette_ops::sort(&scene.palette, &scene.volume);
+            let new = crate::palette_ops::apply_remap(&scene.volume, &remap);
+            // Materials follow their colors to the new indices.
+            let mut materials = scene.materials.clone();
+            for (old, &to) in remap.iter().enumerate() {
+                materials[to as usize] = scene.materials[old];
+            }
+            scene.palette = palette;
+            scene.materials = materials;
+            ed.editor.color = remap[ed.editor.color as usize];
+            let old_sel = ed.palette.selected.clone();
+            for (old, &to) in remap.iter().enumerate() {
+                ed.palette.selected[to as usize] = old_sel[old];
+            }
+            r.upload_materials(&scene.materials);
+            r.set_palette(&scene.palette);
+            // Sorting isn't undoable as one step with the palette, so the
+            // voxel remap is committed without history.
+            scene.volume = new;
+            true
+        }
+        Command::PaletteRandom => {
+            let colors = selected_colors(ed);
+            let new = crate::palette_ops::random_colors(&scene.volume, ed.editor.selection(), &colors, seed());
+            ed.editor.commit(&mut scene.volume, new)
         }
         Command::RenderImage => {
             render_final(r, scene, ed.image);
@@ -627,11 +693,11 @@ pub fn build_ui(
         });
         egui::Panel::left("palette").exact_size(140.0).resizable(false).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                edit = ui::palette_panel(ui, &mut ed.editor, scene, r.modeling, &ed.palettes, cmds);
+                edit = ui::palette_panel(ui, &mut ed.editor, scene, &mut ed.palette, &ed.palettes, cmds);
             });
         });
         // The Project column shows in both modes, like MagicaVoxel.
-        egui::Panel::right("project").exact_size(130.0).resizable(false).show(ui, |ui| {
+        egui::Panel::right("project").exact_size(150.0).resizable(false).show(ui, |ui| {
             let current = ed.source.clone().unwrap_or_default();
             let pattern = ed.editor.pattern.as_ref().map(|p| p.name.clone());
             ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &current, pattern.as_deref(), &mut ed.shaders, cmds);
@@ -639,7 +705,7 @@ pub fn build_ui(
         if r.modeling {
             egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
             if let Some(m) = r.modeler.as_mut() {
-                egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut m.options, cmds));
+                egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut m.options, &mut ed.transform_text, cmds));
             }
             egui::Panel::top("viewbar").show(ui, |ui| ui::view_bar(ui, dims, &mut ed.canvas, cmds));
         } else {

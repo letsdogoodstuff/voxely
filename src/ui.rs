@@ -29,7 +29,10 @@ pub enum Op {
     /// Shift by one voxel along an axis, wrapping around.
     Loop(usize, i32),
     Mirror(usize),
+    Diagonal(usize),
     Shape(crate::ops::Shape),
+    Maze,
+    Perlin,
     Hull,
     Flood,
     Dilate,
@@ -73,6 +76,54 @@ pub enum Command {
     ResetMaterial,
     /// Render the final image at the Image size and save it.
     RenderImage,
+    /// Scale / Shear / Rotate / Repeat with MagicaVoxel's "axes values"
+    /// text, e.g. "xyz 2".
+    Transform(TransformKind, String),
+    PaletteSort,
+    /// Recolor voxels randomly with the selected palette colors.
+    PaletteRandom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransformKind {
+    Scale,
+    Shear,
+    Rotate,
+    Repeat,
+}
+
+/// Text in the Edit panel's transform fields.
+#[derive(Clone, Debug)]
+pub struct TransformText {
+    pub scale: String,
+    pub shear: String,
+    pub rotate: String,
+    pub repeat: String,
+}
+
+impl Default for TransformText {
+    fn default() -> Self {
+        TransformText { scale: "xyz 2".into(), shear: "z 0.2 0.2".into(), rotate: "z 45".into(), repeat: "xy 2".into() }
+    }
+}
+
+/// Palette state beyond the current color: the multi-color selection and
+/// display options.
+pub struct PaletteState {
+    /// Selected palette colors (Shift/Ctrl+click), used by Rand and shaders.
+    pub selected: Vec<bool>,
+    /// Dim colors no voxel uses.
+    pub mask_unused: bool,
+    /// Show RGB sliders instead of HSV.
+    pub rgb: bool,
+    /// Color code being typed.
+    pub code: String,
+}
+
+impl Default for PaletteState {
+    fn default() -> Self {
+        PaletteState { selected: vec![false; 256], mask_unused: false, rgb: false, code: String::new() }
+    }
 }
 
 /// The chosen voxel shader and its argument values.
@@ -474,34 +525,66 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
 
 /// Left column: palette pages, swatches, the color editor, and in the
 /// renderer the material of the selected color.
-pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: bool, pages: &[PathBuf], cmds: &mut Vec<Command>) -> EditActions {
+pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut PaletteState, pages: &[PathBuf], cmds: &mut Vec<Command>) -> EditActions {
     let mut a = EditActions::default();
     heading(ui, "Palette");
-    if !pages.is_empty() {
-        ui.horizontal(|ui| {
-            for (k, p) in pages.iter().enumerate() {
-                let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                if ui.small_button(k.to_string()).on_hover_text(format!("Load palette {name}")).clicked() {
-                    cmds.push(Command::LoadPalette(p.clone()));
+    ui.horizontal(|ui| {
+        for (k, p) in pages.iter().enumerate() {
+            let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if ui.small_button(k.to_string()).on_hover_text(format!("Load palette {name}")).clicked() {
+                cmds.push(Command::LoadPalette(p.clone()));
+            }
+        }
+        ui.menu_button("☰", |ui| {
+            if ui.button("Sort").on_hover_text("Sort palette").clicked() {
+                cmds.push(Command::PaletteSort);
+                ui.close();
+            }
+            ui.checkbox(&mut pal.mask_unused, "Mask").on_hover_text("Mask unused voxel colors");
+            if ui.button("Rand").on_hover_text("Random voxel colors from the selected palette colors").clicked() {
+                cmds.push(Command::PaletteRandom);
+                ui.close();
+            }
+            if ui.button("Inverse").on_hover_text("Inverse color selection").clicked() {
+                for s in pal.selected.iter_mut().skip(1) {
+                    *s = !*s;
                 }
+                ui.close();
+            }
+            if ui.button("Clear selection").clicked() {
+                pal.selected.fill(false);
+                ui.close();
             }
         });
-    }
+    });
+    let used = if pal.mask_unused { crate::palette_ops::mask_unused(&scene.palette, &scene.volume) } else { Vec::new() };
     // 8 columns like MagicaVoxel, color index 1..=255.
     let swatch = 14.0;
     egui::Grid::new("palette").spacing([1.0, 1.0]).min_col_width(swatch).show(ui, |ui| {
         for i in 1..=255usize {
             let p = scene.palette[i];
-            let fill = egui::Color32::from_rgb(p[0], p[1], p[2]);
+            let mut fill = egui::Color32::from_rgb(p[0], p[1], p[2]);
+            if used.get(i) == Some(&false) {
+                fill = fill.gamma_multiply(0.15);
+            }
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(swatch, swatch), egui::Sense::click());
             ui.painter().rect_filled(rect, 1.0, fill);
+            if pal.selected[i] {
+                ui.painter().rect_stroke(rect.shrink(1.0), 1.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 160, 255)), egui::StrokeKind::Inside);
+            }
             if e.color as usize == i {
                 ui.painter().rect_stroke(rect.expand(1.0), 1.0, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
             }
             if resp.clicked() {
-                e.color = i as u8;
+                // Shift/Ctrl+click toggles the color selection.
+                let m = ui.input(|i| i.modifiers);
+                if m.shift || m.command {
+                    pal.selected[i] ^= true;
+                } else {
+                    e.color = i as u8;
+                }
             }
-            resp.on_hover_text(format!("#{i}"));
+            resp.on_hover_text(format!("#{i} · Shift+click to select"));
             if i % 8 == 0 {
                 ui.end_row();
             }
@@ -509,16 +592,45 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, modeling: b
     });
     ui.separator();
     let i = e.color as usize;
+    let mut rgb = [scene.palette[i][0], scene.palette[i][1], scene.palette[i][2]];
+    let before = rgb;
+    ui.spacing_mut().slider_width = 60.0;
     ui.horizontal(|ui| {
-        let mut rgb = [scene.palette[i][0], scene.palette[i][1], scene.palette[i][2]];
-        if ui.color_edit_button_srgb(&mut rgb).changed() {
-            scene.palette[i] = [rgb[0], rgb[1], rgb[2], scene.palette[i][3]];
-            scene.sync_color(i);
-            a.materials_changed = true;
-        }
+        ui.color_edit_button_srgb(&mut rgb);
         ui.label(format!("#{i}"));
+        ui.selectable_value(&mut pal.rgb, false, "HSV");
+        ui.selectable_value(&mut pal.rgb, true, "RGB");
     });
-    let _ = modeling;
+    if pal.rgb {
+        for (k, n) in ["R", "G", "B"].iter().enumerate() {
+            ui.add(Slider::new(&mut rgb[k], 0..=255).text(*n));
+        }
+    } else {
+        let mut hsv = egui::ecolor::Hsva::from_srgb(rgb);
+        let mut changed = false;
+        changed |= ui.add(Slider::new(&mut hsv.h, 0.0..=1.0).text("H")).changed();
+        changed |= ui.add(Slider::new(&mut hsv.s, 0.0..=1.0).text("S")).changed();
+        changed |= ui.add(Slider::new(&mut hsv.v, 0.0..=1.0).text("V")).changed();
+        if changed {
+            rgb = hsv.to_srgb();
+        }
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("Copy").on_hover_text("Copy color code").clicked() {
+            ui.ctx().copy_text(crate::palette_ops::color_code(scene.palette[i]));
+        }
+        let r = ui.add(egui::TextEdit::singleline(&mut pal.code).hint_text("#RRGGBB").desired_width(70.0)).on_hover_text("Paste a color code, then Enter");
+        if r.lost_focus() && ui.input(|k| k.key_pressed(egui::Key::Enter)) {
+            if let Some(c) = crate::palette_ops::parse_color_code(&pal.code) {
+                rgb = [c[0], c[1], c[2]];
+            }
+        }
+    });
+    if rgb != before {
+        scene.palette[i] = [rgb[0], rgb[1], rgb[2], scene.palette[i][3]];
+        scene.sync_color(i);
+        a.materials_changed = true;
+    }
     a
 }
 
@@ -587,13 +699,6 @@ pub fn brush_panel(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
             });
         }
     }
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("Mirror");
-        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-            ui.toggle_value(&mut e.mirror[i], *n).on_hover_text(format!("F{}", 5 + i));
-        }
-    });
 }
 
 fn axis_row(ui: &mut Ui, cmds: &mut Vec<Command>, op: fn(usize) -> Op) {
@@ -605,7 +710,7 @@ fn axis_row(ui: &mut Ui, cmds: &mut Vec<Command>, op: fn(usize) -> Op) {
 }
 
 /// Right column in the modeler: MagicaVoxel's Edit panel.
-pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, cmds: &mut Vec<Command>) {
+pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, text: &mut TransformText, cmds: &mut Vec<Command>) {
     use crate::ops::Shape;
     heading(ui, "Edit");
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -652,12 +757,32 @@ pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, cmds: &mut Ve
                 });
             }
         });
+        for (label, hint, kind, field) in [
+            ("Scale", "Scale model : [axis] [scale], e.g. xyz 2", TransformKind::Scale, &mut text.scale),
+            ("Shear", "Shear model : [axis] [scale], e.g. z 0.2 0.2", TransformKind::Shear, &mut text.shear),
+            ("Rotate", "Rotate model : [axis] [angle], e.g. z 45", TransformKind::Rotate, &mut text.rotate),
+            ("Repeat", "Repeat model : [axis] [count], e.g. xy 2", TransformKind::Repeat, &mut text.repeat),
+        ] {
+            CollapsingHeader::new(label).show(ui, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(field).desired_width(110.0)).on_hover_text(format!("{hint} : apply [Enter]"));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    cmds.push(Command::Transform(kind, field.clone()));
+                }
+            });
+        }
         CollapsingHeader::new("Mirror").show(ui, |ui| axis_row(ui, cmds, Op::Mirror));
+        CollapsingHeader::new("Diagonal").show(ui, |ui| axis_row(ui, cmds, Op::Diagonal));
         CollapsingHeader::new("Shape").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                command(ui, cmds, "Sphere", "Add an ellipsoid filling the canvas", Command::Op(Op::Shape(Shape::Ellipsoid)));
-                command(ui, cmds, "Cyli", "Add a cylinder", Command::Op(Op::Shape(Shape::Cylinder)));
-                command(ui, cmds, "Cone", "Add a cone", Command::Op(Op::Shape(Shape::Cone)));
+            egui::Grid::new("shape_ops").num_columns(2).show(ui, |ui| {
+                command(ui, cmds, "Elli", "Ellipsoid", Command::Op(Op::Shape(Shape::Ellipsoid)));
+                command(ui, cmds, "Cyli", "Cylinder", Command::Op(Op::Shape(Shape::Cylinder)));
+                ui.end_row();
+                command(ui, cmds, "Pyra", "Pyramid", Command::Op(Op::Shape(Shape::Pyramid)));
+                command(ui, cmds, "Cone", "Cone", Command::Op(Op::Shape(Shape::Cone)));
+                ui.end_row();
+                command(ui, cmds, "Maze", "Maze", Command::Op(Op::Maze));
+                command(ui, cmds, "Perlin", "Perlin noise", Command::Op(Op::Perlin));
+                ui.end_row();
             });
         });
         CollapsingHeader::new("Modify").show(ui, |ui| {
@@ -780,6 +905,7 @@ pub fn project_panel(
 ) {
     heading(ui, "Project");
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
         ui.selectable_value(tab, ProjectTab::Project, "Proj").on_hover_text("Project list");
         ui.selectable_value(tab, ProjectTab::Pattern, "Patt").on_hover_text("Pattern list");
         ui.selectable_value(tab, ProjectTab::Shader, "Shdr").on_hover_text("Shader list");
