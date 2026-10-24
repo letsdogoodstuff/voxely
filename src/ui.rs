@@ -957,21 +957,22 @@ pub fn project_panel(
                     if list.is_empty() && title == "Samples" {
                         continue;
                     }
-                    ui.label(egui::RichText::new(title).small().strong());
-                    if list.is_empty() {
-                        ui.add(egui::Label::new(egui::RichText::new("Saved projects appear here").weak()).wrap());
-                    }
-                    for p in list {
-                        let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        if pattern_tab {
-                            if ui.selectable_label(pattern == Some(name.as_str()), name).clicked() {
-                                cmds.push(Command::LoadPattern(p.clone()));
-                            }
-                        } else if ui.selectable_label(p == current, name).on_hover_text(p.display().to_string()).clicked() {
-                            cmds.push(Command::OpenPath(p.clone()));
+                    // Fold-out sections like the Edit column's.
+                    CollapsingHeader::new(title).id_salt((title, pattern_tab)).default_open(true).show(ui, |ui| {
+                        if list.is_empty() {
+                            ui.add(egui::Label::new(egui::RichText::new("Saved projects appear here").weak()).wrap());
                         }
-                    }
-                    ui.add_space(6.0);
+                        for p in list {
+                            let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            if pattern_tab {
+                                if ui.selectable_label(pattern == Some(name.as_str()), name).clicked() {
+                                    cmds.push(Command::LoadPattern(p.clone()));
+                                }
+                            } else if ui.selectable_label(p == current, name).on_hover_text(p.display().to_string()).clicked() {
+                                cmds.push(Command::OpenPath(p.clone()));
+                            }
+                        }
+                    });
                 }
             }
             ProjectTab::Shader => {
