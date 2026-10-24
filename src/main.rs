@@ -38,6 +38,15 @@ usage: voxely <model.vox> [options]
   --proj <mode>        pers | ortho | stereo | pano | cyl
   --dof <aperture>     depth of field aperture (0 = off), focus on target
   --blades <n>         aperture polygon sides
+  --denoise            denoise the image
+  --denoise-view <v>   denoised | original | split
+  --edges [r,g,b]      draw voxel edges (sRGB 0-255, default black)
+  --edge-width <f>     edge width as a fraction of a voxel
+  --grid [n]           draw a grid every n voxels (default 1)
+  --grid-ground        grid on the ground only
+  --no-ground          hide the ground plane
+  --bg-color <r,g,b>   solid background color (sRGB 0-255)
+  --bg-transparent     transparent background (PNG alpha 0)
   --cam <yaw>,<pitch>,<dist>[,<x>,<y>,<z>]
                        camera orbit in degrees/voxels, optional target
 
@@ -80,15 +89,58 @@ struct Args {
     out: Option<PathBuf>,
     xs: Option<PathBuf>,
     xs_args: Vec<f32>,
+    denoise: bool,
+    denoise_view: Option<scene::DenoiseView>,
+    edges: Option<Option<glam::Vec3>>,
+    edge_width: Option<f32>,
+    grid: Option<u32>,
+    grid_ground: bool,
+    no_ground: bool,
+    bg: Option<(scene::BgMode, glam::Vec3)>,
+}
+
+/// "r,g,b" in sRGB 0-255 to linear.
+fn parse_rgb(v: &str) -> Result<glam::Vec3> {
+    let c: Vec<f32> = v.split(',').map(str::parse).collect::<Result<_, _>>()?;
+    if c.len() != 3 {
+        bail!("color needs r,g,b");
+    }
+    Ok(scene::srgb_to_linear(glam::Vec3::new(c[0], c[1], c[2]) / 255.0))
 }
 
 fn parse_args() -> Result<Args> {
-    let mut it = std::env::args().skip(1);
+    let it = std::env::args().skip(1);
     let mut model = None;
     let mut args = Args { spp: 256, size: (960, 640), ..Default::default() };
+    let mut it = it.peekable();
     while let Some(a) = it.next() {
+        // An optional value: the next argument unless it is an option.
+        let opt = |it: &mut std::iter::Peekable<_>| -> Option<String> { it.next_if(|v: &String| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.')) };
+        if a == "--edges" {
+            args.edges = Some(opt(&mut it).map(|v| parse_rgb(&v)).transpose()?);
+            continue;
+        }
+        if a == "--grid" {
+            args.grid = Some(opt(&mut it).map(|v| v.parse()).transpose()?.unwrap_or(1));
+            continue;
+        }
         let mut val = || it.next().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
+            "--denoise" => args.denoise = true,
+            "--denoise-view" => {
+                use scene::DenoiseView::*;
+                args.denoise_view = Some(match val()?.as_str() {
+                    "denoised" => Denoised,
+                    "original" => Original,
+                    "split" => Split,
+                    other => bail!("unknown denoise view {other}"),
+                })
+            }
+            "--edge-width" => args.edge_width = Some(val()?.parse()?),
+            "--grid-ground" => args.grid_ground = true,
+            "--no-ground" => args.no_ground = true,
+            "--bg-color" => args.bg = Some((scene::BgMode::Color, parse_rgb(&val()?)?)),
+            "--bg-transparent" => args.bg = Some((scene::BgMode::Transparent, glam::Vec3::ZERO)),
             "--render" => args.render = Some(PathBuf::from(val()?)),
             "--spp" => args.spp = val()?.parse()?,
             "--size" => {
@@ -214,6 +266,31 @@ fn load_scene(args: &Args) -> Result<Scene> {
     }
     if let Some(b) = args.blades {
         s.blades = b;
+    }
+    s.denoise |= args.denoise;
+    if let Some(v) = args.denoise_view {
+        s.denoise_view = v;
+    }
+    if let Some(c) = args.edges {
+        s.show_edges = true;
+        s.edge_color = c.unwrap_or(s.edge_color);
+    }
+    if let Some(w) = args.edge_width {
+        s.edge_width = w;
+    }
+    if let Some(n) = args.grid {
+        s.show_grid = true;
+        s.grid_spacing = n;
+    }
+    s.grid_ground_only |= args.grid_ground;
+    if args.no_ground {
+        s.ground = false;
+    }
+    if let Some((mode, c)) = args.bg {
+        s.bg_mode = mode;
+        if mode == scene::BgMode::Color {
+            s.bg_color = c;
+        }
     }
     let d = scene.volume.dims;
     let filled = scene.volume.cells.iter().filter(|&&c| c != 0).count();

@@ -17,6 +17,36 @@ struct Params {
     env: vec4<u32>,        // env map width, height, light face count, unused
     lens: vec4<f32>,       // projection, aperture blades, blade rotation (rad), unused
     view: vec4<f32>,       // viewport offset in the window (pixels), unused
+    aux: vec4<u32>,        // FLAG_* bits, denoise view, background mode, grid spacing
+    bg_col: vec4<f32>,     // solid background rgb (linear), unused
+    edge_col: vec4<f32>,   // edge line rgb (linear), width (fraction of a voxel)
+    grid_col: vec4<f32>,   // grid line rgb (linear), width (fraction of a voxel)
+}
+
+const FLAG_DENOISE: u32 = 1u;
+const FLAG_EDGES: u32 = 2u;
+const FLAG_GRID: u32 = 4u;
+const FLAG_GRID_GROUND_ONLY: u32 = 8u;
+const FLAG_BG_HIDDEN: u32 = 16u;
+
+const VIEW_DENOISED: u32 = 0u;
+const VIEW_ORIGINAL: u32 = 1u;
+const VIEW_SPLIT: u32 = 2u;
+
+const BG_SKY: u32 = 0u;
+const BG_COLOR: u32 = 1u;
+const BG_TRANSPARENT: u32 = 2u;
+
+// Floor on albedo when dividing it out of radiance for denoising.
+const DEMOD_EPS: f32 = 0.02;
+
+fn luminance(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// 1 / number of accumulated samples (valid in the post passes).
+fn inv_samples(p: Params) -> f32 {
+    return 1.0 / f32(max(p.frame.x, 1u));
 }
 
 fn aces(x: vec3<f32>) -> vec3<f32> {
