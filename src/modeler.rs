@@ -153,6 +153,10 @@ struct Uniforms {
     context: [f32; 4],
     /// rgb color context fades toward, w = how far.
     ghost: [f32; 4],
+    /// Highlighted cells that hold voxels: rgb, w = opacity where visible.
+    mark: [f32; 4],
+    /// Highlighted empty cells: rgb, w = opacity where hidden.
+    mark_empty: [f32; 4],
     palette: [[f32; 4]; 256],
 }
 
@@ -177,6 +181,11 @@ pub struct Modeler {
     vertex_count: u32,
     /// The other models while editing one, drawn dimmed.
     context: Option<(wgpu::Buffer, u32, Vec3)>,
+    /// Faces of highlighted cells (color 1 solid, 2 empty), drawn over
+    /// everything, faint where hidden.
+    highlight: Option<(wgpu::Buffer, u32)>,
+    mark_pipeline: wgpu::RenderPipeline,
+    mark_xray_pipeline: wgpu::RenderPipeline,
     palette: [[f32; 4]; 256],
     dims: Vec3,
     depth: Option<(wgpu::TextureView, (u32, u32))>,
@@ -288,6 +297,26 @@ impl Modeler {
             multiview_mask: None,
             cache: None,
         });
+        let mark = |label: &str, entry: &str, compare: wgpu::CompareFunction| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&plain_pl),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_mark"), compilation_options: Default::default(), buffers: &vertex_layout },
+                primitive: wgpu::PrimitiveState { cull_mode: Some(wgpu::Face::Back), ..Default::default() },
+                depth_stencil: depth(false, compare),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let mark_pipeline = mark("modeler_mark", "fs_mark", wgpu::CompareFunction::LessEqual);
+        let mark_xray_pipeline = mark("modeler_mark_xray", "fs_mark_xray", wgpu::CompareFunction::Always);
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("modeler_uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -342,6 +371,9 @@ impl Modeler {
             bounds: bounds_buffer(device, volume.dims),
             vertex_count,
             context: None,
+            highlight: None,
+            mark_pipeline,
+            mark_xray_pipeline,
             palette: [[0.0; 4]; 256],
             dims: volume.dims.as_vec3(),
             depth: None,
@@ -372,6 +404,12 @@ impl Modeler {
             }
             Some((mesh_buffer(device, &mesh), mesh.len() as u32, offset.as_vec3()))
         });
+    }
+
+    /// Highlight `cells` (with whether each holds a voxel) of a volume of
+    /// size `dims`, or nothing if empty.
+    pub fn set_highlight(&mut self, device: &wgpu::Device, dims: IVec3, cells: &[(IVec3, bool)]) {
+        self.highlight = highlight_mesh(dims, cells).map(|mesh| (mesh_buffer(device, &mesh), mesh.len() as u32));
     }
 
     /// The modeler shows palette colors as-is, like MagicaVoxel.
@@ -423,6 +461,8 @@ impl Modeler {
             view: [o.shadow as u32 as f32, o.wire as u32 as f32, 0.0, 0.0],
             context: self.context.as_ref().map_or(Vec3::ZERO, |c| c.2).extend(0.0).to_array(),
             ghost: o.background.extend(0.6).to_array(),
+            mark: [1.0, 0.15, 0.85, 0.55],
+            mark_empty: [1.0, 0.85, 0.1, 0.3],
             palette: self.palette,
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
@@ -479,6 +519,14 @@ impl Modeler {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..*count, 0..1);
             }
+            if let Some((buf, count)) = &self.highlight {
+                pass.set_bind_group(0, &self.plain_bind_group, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.set_pipeline(&self.mark_xray_pipeline);
+                pass.draw(0..*count, 0..1);
+                pass.set_pipeline(&self.mark_pipeline);
+                pass.draw(0..*count, 0..1);
+            }
             if o.bounds {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_bind_group(0, &self.plain_bind_group, &[]);
@@ -488,6 +536,26 @@ impl Modeler {
         }
         queue.submit([enc.finish()]);
     }
+}
+
+/// Outer faces of the highlighted cells inside `dims`: color 1 where the
+/// cell holds a voxel, 2 where it's empty (e.g. just erased).
+fn highlight_mesh(dims: IVec3, cells: &[(IVec3, bool)]) -> Option<Vec<Vertex>> {
+    let mut v = Volume::new(dims);
+    let mut any = false;
+    for &(p, solid) in cells {
+        if v.contains(p) {
+            let i = v.index(p);
+            v.set_index(i, if solid { 1 } else { 2 });
+            any = true;
+        }
+    }
+    if !any {
+        return None;
+    }
+    let mut mesh = build_mesh(&v, None);
+    mesh.truncate(mesh.len() - 6);
+    Some(mesh)
 }
 
 /// The 12 edges of the canvas box as a line list.
@@ -606,6 +674,16 @@ mod tests {
         let mesh = build_mesh(&v, None);
         assert_eq!(mesh.len(), 6 * 6 + 6);
         assert!(mesh[..36].iter().all(|m| (m.data >> 16) & 3 == 3 && (m.data >> 8) & 255 == 7));
+    }
+
+    #[test]
+    fn highlight_marks_solid_and_empty_cells() {
+        let dims = IVec3::splat(4);
+        assert!(highlight_mesh(dims, &[(IVec3::splat(9), true)]).is_none());
+        let mesh = highlight_mesh(dims, &[(IVec3::ZERO, true), (IVec3::X, false)]).unwrap();
+        // Two touching cubes: 10 faces, no ground quad.
+        assert_eq!(mesh.len(), 10 * 6);
+        assert!(mesh.iter().any(|m| (m.data >> 8) & 255 == 2) && mesh.iter().any(|m| (m.data >> 8) & 255 == 1));
     }
 
     #[test]

@@ -234,9 +234,6 @@ fn base_tools() -> Value {
             "edges": { "type": "boolean" }, "grid": { "type": "boolean" },
             "aperture": { "type": "number", "description": "Depth of field, 0 = off" },
         }), &[]),
-        tool("screenshot", "Fast image of the model in the editor's modeler view from the current camera.", json!({
-            "width": { "type": "integer" }, "height": { "type": "integer" },
-        }), &[]),
         tool("render", "Path-traced image from the current camera and render settings.", json!({
             "width": { "type": "integer" }, "height": { "type": "integer" },
             "samples": { "type": "integer", "description": "Samples per pixel (default 128; more is smoother and slower)" },
@@ -1453,11 +1450,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             ctx.r.reset();
             Ok(vec![text(if set.is_empty() { "No settings given".to_string() } else { format!("Set {}", set.join(", ")) })])
         }
-        "screenshot" => {
-            let (w, h) = (int(a, "width").unwrap_or(800).clamp(16, 4096) as u32, int(a, "height").unwrap_or(600).clamp(16, 4096) as u32);
-            let px = ctx.r.modeler_image(w, h)?;
-            Ok(vec![image(w, h, &px)?])
-        }
+        // "screenshot" lives in view.rs.
         "render" => {
             let (w, h) = (int(a, "width").unwrap_or(960).clamp(16, 8192) as u32, int(a, "height").unwrap_or(640).clamp(16, 8192) as u32);
             let spp = int(a, "samples").unwrap_or(128).clamp(1, 65536) as u32;
