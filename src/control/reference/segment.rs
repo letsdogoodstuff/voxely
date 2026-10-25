@@ -85,7 +85,10 @@ impl Background {
         for k in 0..3 {
             bg.coef[k][0] = color[k] as f32;
         }
-        if transparent * 2 > samples.len() {
+        // Any real transparency (even a sprite cropped tight, with no
+        // transparent border) makes alpha the silhouette.
+        let clear = img.px.iter().filter(|p| p[3] < 128).count();
+        if transparent * 2 > samples.len() || (clear > 0 && clear < img.px.len()) {
             bg.alpha = true;
             return bg;
         }
@@ -805,6 +808,20 @@ mod tests {
         // Found to within one shading step of its edge.
         assert!(b.x0 <= 66 && b.x1 >= 133 && b.y0 <= 54 && b.y1 >= 142, "{b:?}");
         assert!(b.area > 65 * 85);
+    }
+
+    #[test]
+    fn tightly_cropped_sprite_uses_alpha() {
+        // Opaque right up to the border except two transparent corners: the
+        // dark subject must not merge with a "black" background.
+        let mut img = canvas(60, 60, [20, 20, 20, 255]);
+        rect(&mut img, 0, 0, 9, 9, [0, 0, 0, 0]);
+        rect(&mut img, 50, 50, 59, 59, [0, 0, 0, 0]);
+        let seg = segment(&img, None);
+        assert!(seg.bg.alpha);
+        let subjects: Vec<&Blob> = seg.blobs.iter().filter(|b| !b.text).collect();
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].area, 60 * 60 - 200);
     }
 
     #[test]

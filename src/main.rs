@@ -551,10 +551,10 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<app::UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     // Agents connect through `voxely mcp`, which talks to this socket.
-    app::serve_control(event_loop.create_proxy());
+    let control = app::serve_control(event_loop.create_proxy());
     let mut app = app::App::new(scene, panel, source, save_path);
     let result = event_loop.run_app(&mut app);
-    let _ = std::fs::remove_file(mcp::socket_path());
+    app::release_control(control);
     result?;
     Ok(())
 }

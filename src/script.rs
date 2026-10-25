@@ -21,6 +21,15 @@ use crate::scene::Volume;
 /// Default time limit for a script.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The script thread's stack, and QuickJS's limit well inside it, so deep
+/// recursion throws a RangeError instead of overflowing the native stack.
+/// (rquickjs treats limits over 16 MB as "no limit".)
+const THREAD_STACK: usize = 64 << 20;
+const JS_STACK: usize = 16 << 20;
+
+/// How much `console` output a run keeps.
+const MAX_LOG: usize = 64 << 10;
+
 /// Tools that replace the document (or rewind history), after which a
 /// script's edits can't be folded into one undo step.
 const RESETS_HISTORY: [&str; 6] = ["new_scene", "new_project", "open_project", "open_file", "undo", "redo"];
@@ -55,7 +64,7 @@ pub fn run(ctx: &mut ToolCtx, source: String, file: String, args: Value, timeout
     let world = ctx.scene.synced_world().into_owned();
     let mut squash = true;
     let (tx, rx) = mpsc::channel();
-    let js = std::thread::spawn(move || run_js(&source, &file, &args, timeout, tx));
+    let js = spawn_js(source, file, args, timeout, tx);
     // Serve the script until it finishes and drops its sender.
     for req in rx {
         match req {
@@ -64,7 +73,7 @@ pub fn run(ctx: &mut ToolCtx, source: String, file: String, args: Value, timeout
                     tool_error("run_script can't be called from a script")
                 } else {
                     squash &= !RESETS_HISTORY.contains(&name.as_str());
-                    control::call(ctx, &name, &args)
+                    crate::mcp::call_guarded(ctx, &name, &args)
                 };
                 let _ = reply.send(result);
             }
@@ -100,6 +109,14 @@ pub fn run(ctx: &mut ToolCtx, source: String, file: String, args: Value, timeout
     outcome
 }
 
+fn spawn_js(source: String, file: String, args: Value, timeout: Duration, tx: Sender<Request>) -> std::thread::JoinHandle<Outcome> {
+    std::thread::Builder::new()
+        .name("script".into())
+        .stack_size(THREAD_STACK)
+        .spawn(move || run_js(&source, &file, &args, timeout, tx))
+        .expect("spawning the script thread")
+}
+
 fn run_js(source: &str, file: &str, args: &Value, timeout: Duration, tx: Sender<Request>) -> Outcome {
     let log = Rc::new(RefCell::new(Vec::new()));
     let result = eval(source, file, args, timeout, tx, log.clone());
@@ -111,7 +128,7 @@ fn eval(source: &str, file: &str, args: &Value, timeout: Duration, tx: Sender<Re
     let rt = Runtime::new().map_err(fail)?;
     // A safety net, not a budget: big canvases are big Uint8Arrays.
     rt.set_memory_limit(4 << 30);
-    rt.set_max_stack_size(4 << 20);
+    rt.set_max_stack_size(JS_STACK);
     let deadline = Instant::now() + timeout;
     rt.set_interrupt_handler(Some(Box::new(move || Instant::now() > deadline)));
     let cx = Context::full(&rt).map_err(fail)?;
@@ -132,25 +149,60 @@ fn eval(source: &str, file: &str, args: &Value, timeout: Duration, tx: Sender<Re
             if Instant::now() > deadline {
                 return format!("the script ran past its {}s time limit", timeout.as_secs_f32());
             }
-            // Keep the stack to the script's own frames.
-            e.to_string().lines().filter(|l| !l.contains("(voxely.js:")).collect::<Vec<_>>().join("\n")
+            describe(&ctx, e)
         })?;
         if value.is_undefined() {
             return Ok(None);
         }
-        Ok(ctx.json_stringify(value).map_err(fail)?.map(|s| s.to_string()).transpose().map_err(fail)?)
+        let show: Function = globals.get("__show").map_err(fail)?;
+        show.call::<_, String>((value,)).catch(&ctx).map(Some).map_err(|e| describe(&ctx, e))
     })
+}
+
+/// A thrown value as readable text: an Error's message and the script's
+/// own stack frames, or anything else thrown shown as a value.
+fn describe<'js>(ctx: &Ctx<'js>, e: rquickjs::CaughtError<'js>) -> String {
+    let text = match e {
+        rquickjs::CaughtError::Value(v) => {
+            let shown = ctx.globals().get::<_, Function>("__show").and_then(|f| f.call::<_, String>((v,)));
+            format!("Uncaught {}", shown.unwrap_or_else(|_| "exception".into()))
+        }
+        e => e.to_string(),
+    };
+    // Keep the stack to the script's own frames.
+    text.lines().filter(|l| !l.contains("(voxely.js:")).collect::<Vec<_>>().join("\n")
 }
 
 /// The native functions the prelude builds `voxely` from.
 fn install<'js>(ctx: &Ctx<'js>, tx: Sender<Request>, log: Rc<RefCell<Vec<String>>>) -> rquickjs::Result<()> {
     let g = ctx.globals();
-    g.set("__log", Function::new(ctx.clone(), move |line: String| log.borrow_mut().push(line))?)?;
+    let size = std::cell::Cell::new(0);
+    g.set(
+        "__log",
+        Function::new(ctx.clone(), move |mut line: String| {
+            if size.get() > MAX_LOG {
+                return;
+            }
+            size.set(size.get() + line.len() + 1);
+            if size.get() > MAX_LOG {
+                let mut cut = line.len().saturating_sub(size.get() - MAX_LOG);
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                line.truncate(cut);
+                line.push_str(&format!("\n... console output truncated (over {} KB)", MAX_LOG >> 10));
+            }
+            log.borrow_mut().push(line);
+        })?,
+    )?;
     let t = tx.clone();
     g.set(
         "__call",
         Function::new(ctx.clone(), move |name: String, args: String| -> String {
-            let args = serde_json::from_str(&args).unwrap_or(json!({}));
+            let args = match serde_json::from_str(&args) {
+                Ok(a) => a,
+                Err(e) => return tool_error(format!("arguments for {name} aren't valid JSON ({e})")).to_string(),
+            };
             let (reply, rx) = mpsc::channel();
             let _ = t.send(Request::Call(name, args, reply));
             rx.recv().unwrap_or_else(|_| json!({ "content": [], "isError": true })).to_string()
@@ -192,7 +244,14 @@ fn install<'js>(ctx: &Ctx<'js>, tx: Sender<Request>, log: Rc<RefCell<Vec<String>
 
 /// Builds `voxely`, `Volume` and `console` on top of the natives.
 const PRELUDE: &str = r##"
-const fmt = (v) => typeof v === "string" ? v : (() => { try { return JSON.stringify(v); } catch { return String(v); } })();
+// Values as text: JSON where possible (typed arrays as arrays, BigInts as
+// digits), else String(v).
+const jsonable = (k, x) => typeof x === "bigint" ? x.toString() : ArrayBuffer.isView(x) && !(x instanceof DataView) ? Array.from(x) : x;
+globalThis.__show = (v) => {
+  try { const s = JSON.stringify(v, jsonable); if (s !== undefined) return s; } catch {}
+  try { return String(v); } catch { return Object.prototype.toString.call(v); }
+};
+const fmt = (v) => typeof v === "string" ? v : __show(v);
 globalThis.console = Object.fromEntries(["log", "info", "warn", "error", "debug"].map((k) => [k, (...a) => __log(a.map(fmt).join(" "))]));
 
 function unwrap(name, raw) {
@@ -547,6 +606,13 @@ pub fn cli(argv: &[String]) -> Result<()> {
 pub fn report(o: &Outcome) -> Result<String> {
     let mut lines = o.log.clone();
     match &o.result {
+        Ok(Some(v)) if v.len() > MAX_LOG => {
+            let mut cut = MAX_LOG;
+            while !v.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            lines.push(format!("=> {}... (truncated: the value is {} KB)", &v[..cut], v.len() >> 10));
+        }
         Ok(Some(v)) => lines.push(format!("=> {v}")),
         Ok(None) => {}
         Err(e) => return Err(anyhow!("{}{}", lines.iter().map(|l| format!("{l}\n")).collect::<String>(), e)),
@@ -563,7 +629,7 @@ mod tests {
     fn run_fake(source: &str) -> (Outcome, Vec<String>) {
         let (tx, rx) = mpsc::channel();
         let src = source.to_string();
-        let js = std::thread::spawn(move || run_js(&src, "test.js", &json!(["a"]), Duration::from_secs(5), tx));
+        let js = spawn_js(src, "test.js".into(), json!(["a"]), Duration::from_secs(5), tx);
         let mut seen = Vec::new();
         let mut cells = vec![0u8; 64];
         for req in rx {
@@ -616,6 +682,43 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let o = run_js("for (;;) {}", "spin.js", &Value::Null, Duration::from_millis(200), tx);
         assert!(o.result.unwrap_err().contains("time limit"));
+    }
+
+    #[test]
+    fn deep_recursion_is_a_catchable_error() {
+        let (o, _) = run_fake("function r() { return r() + 1 } r()");
+        let e = o.result.unwrap_err();
+        assert!(e.contains("RangeError") || e.contains("stack"), "{e}");
+        let (o, _) = run_fake("try { (function r() { return r() + 1 })() } catch (e) { 'caught' }");
+        assert_eq!(o.result, Ok(Some("\"caught\"".into())));
+        let (o, _) = run_fake("JSON.parse('['.repeat(100000) + ']'.repeat(100000)).length");
+        assert_eq!(o.result, Ok(Some("1".into())));
+        let (o, _) = run_fake("JSON.parse('['.repeat(3000000) + ']'.repeat(3000000))");
+        assert!(o.result.unwrap_err().contains("stack"));
+    }
+
+    #[test]
+    fn thrown_values_and_results_are_readable() {
+        let (o, _) = run_fake("throw 'plain'");
+        assert_eq!(o.result, Err("Uncaught \"plain\"".into()));
+        let (o, _) = run_fake("throw { code: 7 }");
+        assert_eq!(o.result, Err("Uncaught {\"code\":7}".into()));
+        let (o, _) = run_fake("1n");
+        assert_eq!(o.result, Ok(Some("\"1\"".into())));
+        let (o, _) = run_fake("const a = {}; a.a = a; a");
+        assert_eq!(o.result, Ok(Some("[object Object]".into())));
+        let (o, _) = run_fake("console.log(undefined, new Uint8Array([1, 2]), null); new Uint8Array([3])");
+        assert_eq!(o.log, vec!["undefined [1,2] null"]);
+        assert_eq!(o.result, Ok(Some("[3]".into())));
+    }
+
+    #[test]
+    fn console_output_is_capped() {
+        let (o, _) = run_fake("for (let i = 0; i < 100000; i++) console.log('line ' + i); 1");
+        let total: usize = o.log.iter().map(|l| l.len() + 1).sum();
+        assert!(total < MAX_LOG + 100, "{total}");
+        assert!(o.log.last().unwrap().contains("truncated"));
+        assert_eq!(o.result, Ok(Some("1".into())));
     }
 
     #[test]

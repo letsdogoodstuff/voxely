@@ -18,7 +18,7 @@ pub fn tools() -> Vec<Value> {
         "screenshot",
         "Fast image of the model in the editor's modeler view, plus a text summary (part, size, voxel count, bounds, top colors, views, last edit). \
          views: \"single\" (default: the current camera, as the window shows it), \"quad\" (2x2: front, right, top orthographic and a 3/4 perspective), \
-         \"all\" (front, back, left, right, top, iso), or a list of names from current, front, back, left, right, top, bottom, iso, 3/4. \
+         \"all\" (front, back, left, right, top, iso), \"turnaround\" (front, right, back, left), or a list of 1-16 names from current, front, back, left, right, top, bottom, iso, 3/4. \
          scope \"scene\" (default when the project has more than one part) shows every visible part at full color, framed together, with rulers \
          in world coordinates; scope \"part\" (default with one part) frames the part being edited with the other parts dimmed, rulers in the part's \
          own coordinates (what the voxel tools use). Either way the window's mode and camera are left as they were. \
@@ -28,11 +28,11 @@ pub fn tools() -> Vec<Value> {
          coordinates: on front/back/left/right/top/bottom along the image edges, otherwise along the framed box's edges. Ticks mark cell centers. \
          highlight_last_edit marks the cells the last edit changed: magenta where they hold voxels, yellow where they're now empty, faint through other voxels.",
         json!({
-            "width": { "type": "integer", "description": "Whole image width (default 800 for one view, 512 per tile otherwise)" },
-            "height": { "type": "integer", "description": "Whole image height (default 600 for one view, 384 per tile otherwise)" },
-            "views": { "type": ["string", "array"], "items": { "type": "string" }, "description": "\"single\", \"quad\", \"all\", one view name, or a list of view names" },
+            "width": { "type": "integer", "minimum": 16, "maximum": 4096, "description": "Whole image width, up to 4096 and at least 16 per tile column (default 800 for one view, 512 per tile otherwise)" },
+            "height": { "type": "integer", "minimum": 16, "maximum": 4096, "description": "Whole image height, up to 4096 and at least 16 per tile row (default 600 for one view, 384 per tile otherwise)" },
+            "views": { "type": ["string", "array"], "items": { "type": "string" }, "minItems": 1, "maxItems": 16, "description": "\"single\", \"quad\", \"all\", \"turnaround\" (front, right, back, left), one view name, or a list of 1-16 view names" },
             "overlay": { "type": "boolean", "description": "Axis gizmo, rulers and titles (default: on unless the only view is the current camera)" },
-            "grid_step": { "type": "integer", "description": "Voxels between labeled ruler ticks (default 8; widened if labels would crowd)" },
+            "grid_step": { "type": "integer", "minimum": 1, "maximum": 1024, "description": "Voxels between labeled ruler ticks (default 8; widened if labels would crowd)" },
             "fit": { "type": "string", "enum": ["canvas", "voxels"], "description": "What named views frame: the whole canvas (default; in scene scope the box around all parts) or just the solid voxels" },
             "scope": { "type": "string", "enum": ["scene", "part"], "description": "\"scene\": all parts, world coordinates; \"part\": the edited part, its own coordinates, others dimmed. Default: scene if there is more than one part" },
             "focus": {
@@ -359,11 +359,26 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let cols = (n as f32).sqrt().ceil() as u32;
     let rows = n.div_ceil(cols);
     let (dw, dh) = if n == 1 { (800, 600) } else { (512 * cols, 384 * rows) };
-    let width = int(a, "width").map_or(dw, |v| v as u32).clamp(16 * cols, 4096);
-    let height = int(a, "height").map_or(dh, |v| v as u32).clamp(16 * rows, 4096);
-    let (tw, th) = (width / cols, height / rows);
+    let size = |key: &str, default: u32, min: u32| -> Result<u32> {
+        match get(a, key) {
+            None => Ok(default.min(4096)),
+            Some(v) => match v.as_i64() {
+                Some(n) if (min as i64..=4096).contains(&n) => Ok(n as u32),
+                _ => bail!("`{key}` must be a whole number of pixels from {min} to 4096 (at least 16 per tile), not {v}"),
+            },
+        }
+    };
+    let (width, height) = (size("width", dw, 16 * cols)?, size("height", dh, 16 * rows)?);
+    // Tiles share the image exactly: column c spans [c * width / cols, (c + 1) * width / cols).
+    let (col_x, row_y) = (|c: u32| c * width / cols, |r: u32| r * height / rows);
     let overlay = boolean(a, "overlay").unwrap_or(views != [View::Current]);
-    let step = int(a, "grid_step").unwrap_or(8).clamp(1, 1024) as i32;
+    let step = match get(a, "grid_step") {
+        None => 8,
+        Some(v) => match v.as_i64() {
+            Some(n) if (1..=1024).contains(&n) => n as i32,
+            _ => bail!("`grid_step` must be a whole number of voxels from 1 to 1024, not {v}"),
+        },
+    };
     let fit_voxels = match string(a, "fit").unwrap_or("canvas") {
         "canvas" => false,
         "voxels" => true,
@@ -410,7 +425,7 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         }
     }
 
-    let mut out = Canvas::new(tw * cols, th * rows, [24, 24, 24, 255].repeat((tw * cols * th * rows) as usize));
+    let mut out = Canvas::new(width, height, [24, 24, 24, 255].repeat((width * height) as usize));
     let mut names = Vec::new();
     if let Some(c) = &whole {
         ctx.r.modeler_show(&c.volume, None, None);
@@ -418,6 +433,8 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     // World mode's pick highlight would tint the parts; agents see real colors.
     let result = super::unhighlighted(ctx, |ctx| -> Result<()> {
         for (i, &view) in views.iter().enumerate() {
+            let (c, r) = (i as u32 % cols, i as u32 / cols);
+            let (tw, th) = (col_x(c + 1) - col_x(c), row_y(r + 1) - row_y(r));
             let (w, h) = (tw as f32, th as f32);
             let sc = if tw.min(th) >= 280 { 2 } else { 1 };
             let shot = match view.orient() {
@@ -439,7 +456,7 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
                 tile.text(6, 6, &title, sc, WHITE);
             }
             names.push(title);
-            out.blit(&tile, (i as u32 % cols * tw) as i32, (i as u32 / cols * th) as i32);
+            out.blit(&tile, col_x(c) as i32, row_y(r) as i32);
         }
         Ok(())
     });
@@ -452,10 +469,10 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     result?;
     // Tile borders.
     for c in 1..cols {
-        out.rect((c * tw) as i32 - 1, 0, 2, out.h as i32, [0, 0, 0], 0.8);
+        out.rect(col_x(c) as i32 - 1, 0, 2, out.h as i32, [0, 0, 0], 0.8);
     }
     for r in 1..rows {
-        out.rect(0, (r * th) as i32 - 1, out.w as i32, 2, [0, 0, 0], 0.8);
+        out.rect(0, row_y(r) as i32 - 1, out.w as i32, 2, [0, 0, 0], 0.8);
     }
 
     let what = Shown { volume: whole.as_ref().map_or(&ctx.scene.volume, |c| &c.volume), whole: whole.is_some(), focus: focus.is_some(), fit_voxels: fit_voxels && solid.is_some() };

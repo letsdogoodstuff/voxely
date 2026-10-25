@@ -75,18 +75,18 @@ pub fn tools() -> Vec<Value> {
             "start_index": { "type": "integer", "description": "First slot to write (default: the first run of free slots)" },
             "overwrite": { "type": "boolean", "description": "Allow replacing colors that voxels use (they change color)" },
         }), &["name"]),
-        tool("voxelize_image", "Turn a PNG or JPEG (a sprite, logo or reference) into voxels in the current part, matching each pixel to the nearest palette color. E.g. {path, height: 32} voxelizes a sprite 32 voxels tall, standing up facing -y. The canvas grows if needed; transparent pixels stay empty and existing voxels are kept elsewhere.", json!({
+        tool("voxelize_image", "Turn a PNG or JPEG (a sprite, logo or reference) into voxels in the current part, matching each pixel to the nearest palette color, standing up facing -y by default. Pixel or voxel art (crisp blocks) becomes one voxel per picture block when no size is given; other pictures one voxel per pixel (scaled to fit 256). The reply says when a size you give stretches blocks unevenly. The canvas grows if needed; transparent pixels stay empty and existing voxels are kept elsewhere.", json!({
             "path": { "type": "string" },
-            "height": { "type": "integer", "description": "Image height in voxels; width follows the aspect ratio" },
-            "width": { "type": "integer", "description": "Image width in voxels (when height isn't given)" },
+            "height": { "type": "integer", "minimum": 1, "description": "Image height in voxels; width follows the aspect ratio. Default: one voxel per picture block (pixel art) or per pixel" },
+            "width": { "type": "integer", "minimum": 1, "description": "Image width in voxels" },
             "plane": { "type": "string", "enum": ["xz", "yz", "xy"], "description": "xz: standing, viewed from -y (default); yz: standing, viewed from +x; xy: lying on the floor, viewed from above" },
             "mode": { "type": "string", "enum": ["flat", "extrude", "heightmap"], "description": "flat: one voxel thick (default); extrude: `depth` thick; heightmap: columns 1..depth tall by brightness" },
-            "depth": { "type": "integer", "description": "extrude: thickness (default 4); heightmap: tallest column (default 8)" },
+            "depth": { "type": "integer", "minimum": 1, "description": "extrude: thickness (default 4); heightmap: tallest column (default 8)" },
             "invert": { "type": "boolean", "description": "heightmap: dark is tall" },
             "offset": xyz("Part coordinates of the image's minimum corner (default [0, 0, 0])"),
-            "alpha_threshold": { "type": "integer", "minimum": 0, "maximum": 255, "description": "Pixels with alpha below this are empty, 0-255 (default 128)" },
+            "alpha_threshold": { "type": "integer", "minimum": 0, "maximum": 255, "description": "Pixels with alpha below this are empty, 0-255 (default 128; 0 keeps even fully transparent pixels)" },
             "add_colors": { "type": "boolean", "description": "Put the image's main colors into free palette slots first, for exact colors" },
-            "max_colors": { "type": "integer", "description": "add_colors: most slots to use (default: every free slot)" },
+            "max_colors": { "type": "integer", "minimum": 0, "description": "add_colors: most slots to use (default: every free slot)" },
             "palette_range": range,
         }), &["path"]),
     ]
@@ -665,7 +665,7 @@ fn apply_preset(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let span = if slots.windows(2).all(|w| w[1] == w[0] + 1) { format!("slots {}-{}", slots[0], slots[n - 1]) } else { format!("slots {slots:?}") };
     let map: Vec<String> = slots.iter().zip(preset.colors).map(|(i, c)| format!("{i}={c}")).collect();
     let mut note = format!(
-        "Wrote {} ({n} colors) into {span}; use palette_range [{}, {}] in voxelize_image/shade_edges to stick to it.\n{}\nColors in use: {}. Free slots left: {free_left}.",
+        "Wrote {} ({n} colors) into {span}; draw with these indices, or use palette_range [{}, {}] in voxelize_image to stick to it.\n{}\nColors in use: {}. Free slots left: {free_left}.",
         preset.name,
         slots.iter().min().unwrap(),
         slots.iter().max().unwrap(),
@@ -776,18 +776,22 @@ pub fn load_image(path: &Path) -> Result<Image> {
 /// its source box is transparent, else the box's dominant color (pixel
 /// art stays crisp), or its average when no color dominates (photos).
 pub fn resample(img: &Image, w: usize, h: usize, alpha_threshold: u8) -> Vec<Option<[u8; 3]>> {
-    let mut out = Vec::with_capacity(w * h);
-    for v in 0..h {
-        let (y0, y1) = (v * img.h / h, ((v + 1) * img.h / h).max(v * img.h / h + 1));
-        for u in 0..w {
-            let (x0, x1) = (u * img.w / w, ((u + 1) * img.w / w).max(u * img.w / w + 1));
+    let spans = |n: usize, len: usize| (0..n).map(|i| (i * len / n, ((i + 1) * len / n).max(i * len / n + 1))).collect::<Vec<_>>();
+    resample_spans(img, &spans(w, img.w), &spans(h, img.h), alpha_threshold)
+}
+
+/// `resample` with each output column's and row's source pixel range given.
+fn resample_spans(img: &Image, cols: &[(usize, usize)], rows: &[(usize, usize)], alpha_threshold: u8) -> Vec<Option<[u8; 3]>> {
+    let mut out = Vec::with_capacity(cols.len() * rows.len());
+    for &(y0, y1) in rows {
+        for &(x0, x1) in cols {
             let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
             let (mut total, mut sum) = (0, [0u64; 3]);
             for y in y0..y1.min(img.h) {
                 for x in x0..x1.min(img.w) {
                     total += 1;
                     let p = img.px[y * img.w + x];
-                    if p[3] >= alpha_threshold.max(1) {
+                    if p[3] >= alpha_threshold {
                         *counts.entry([p[0], p[1], p[2]]).or_default() += 1;
                         for k in 0..3 {
                             sum[k] += p[k] as u64;
@@ -807,37 +811,103 @@ pub fn resample(img: &Image, w: usize, h: usize, alpha_threshold: u8) -> Vec<Opt
     out
 }
 
+/// The source pixel range of each block along an axis `len` pixels long,
+/// with block edges at `phase` + k * `pitch`. A sliver under half a block
+/// at either end (a crop through a block) is left out.
+fn block_spans(len: usize, phase: f32, pitch: f32) -> Vec<(usize, usize)> {
+    let mut edges: Vec<usize> = Vec::new();
+    let mut x = phase;
+    while x <= len as f32 + 0.5 {
+        edges.push((x.round() as usize).min(len));
+        x += pitch;
+    }
+    if edges.first().is_some_and(|&e| e as f32 > pitch / 2.0) {
+        edges.insert(0, 0);
+    }
+    if edges.last().is_some_and(|&e| (len - e) as f32 > pitch / 2.0) {
+        edges.push(len);
+    }
+    edges.dedup();
+    edges.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// The voxel size for a height and/or width, keeping the aspect ratio.
+fn sized(img: &Image, w: Option<i64>, h: Option<i64>) -> (usize, usize) {
+    let max = crate::ops::MAX_DIM as usize;
+    match (w, h) {
+        (Some(w), Some(h)) => (w as usize, h as usize),
+        (None, Some(h)) => ((((h as usize) * img.w + img.h / 2) / img.h).clamp(1, max), h as usize),
+        (Some(w), None) => (w as usize, (((w as usize) * img.h + img.w / 2) / img.w).clamp(1, max)),
+        (None, None) => (img.w, img.h),
+    }
+}
+
 fn voxelize_image(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let path = string(a, "path").context("missing `path`")?;
     let img = load_image(Path::new(path))?;
     ensure!(img.w > 0 && img.h > 0, "empty image");
     let max = crate::ops::MAX_DIM as usize;
-    let (w, h, note) = match (int(a, "height"), int(a, "width")) {
-        (Some(h), _) => {
-            let h = (h.max(1) as usize).min(max);
-            ((h * img.w + img.h / 2) / img.h, h, "")
+    let whole = |key: &str, lo: i64, hi: i64| -> Result<Option<i64>> {
+        match get(a, key) {
+            None => Ok(None),
+            Some(v) => match v.as_i64() {
+                Some(n) if (lo..=hi).contains(&n) => Ok(Some(n)),
+                _ => bail!("`{key}` must be a whole number from {lo} to {hi}, not {v}"),
+            },
         }
-        (None, Some(w)) => {
-            let w = (w.max(1) as usize).min(max);
-            (w, (w * img.h + img.w / 2) / img.w, "")
-        }
-        (None, None) if img.w.max(img.h) > 256 => {
-            let k = 256.0 / img.w.max(img.h) as f32;
-            ((img.w as f32 * k).round() as usize, (img.h as f32 * k).round() as usize, " (scaled down to 256; pass height or width)")
-        }
-        _ => (img.w, img.h, ""),
     };
-    let (w, h) = (w.max(1), h.max(1));
+    let (want_h, want_w) = (whole("height", 1, max as i64)?, whole("width", 1, max as i64)?);
     let mode = string(a, "mode").unwrap_or("flat");
-    let depth = match mode {
-        "flat" => 1,
-        "extrude" => int(a, "depth").unwrap_or(4),
-        "heightmap" => int(a, "depth").unwrap_or(8),
-        m => bail!("unknown mode {m:?}; use flat, extrude or heightmap"),
-    }
-    .clamp(1, max as i64) as i32;
-    let alpha = int(a, "alpha_threshold").unwrap_or(128).clamp(0, 255) as u8;
-    let pixels = resample(&img, w, h, alpha);
+    let depth = match (mode, whole("depth", 1, max as i64)?) {
+        ("flat", None | Some(1)) => 1,
+        ("flat", Some(_)) => bail!("`depth` is for mode extrude or heightmap; flat is one voxel thick"),
+        ("extrude", d) => d.unwrap_or(4),
+        ("heightmap", d) => d.unwrap_or(8),
+        (m, _) => bail!("unknown mode {m:?}; use flat, extrude or heightmap"),
+    } as i32;
+    let alpha = whole("alpha_threshold", 0, 255)?.unwrap_or(128) as u8;
+    // Pixel or voxel art: one picture block = one voxel.
+    let opaque = |x: usize, y: usize| img.px[y * img.w + x][3] >= alpha;
+    let grid = super::reference::pitch::crisp_grid(&img, &opaque, [0, 0, img.w - 1, img.h - 1]).filter(|g| g.pitch >= 2.0);
+    let blocks = grid.map(|g| (block_spans(img.w, g.phase[0], g.pitch), block_spans(img.h, g.phase[1], g.pitch), g.pitch));
+    let mut note = String::new();
+    let (pixels, w, h) = match (&blocks, want_w, want_h) {
+        (Some((cols, rows, p)), _, _) => {
+            let (bw, bh) = (cols.len(), rows.len());
+            // A whole number of voxels per block keeps blocks even.
+            let k = match (want_w, want_h) {
+                (None, None) => Some(1),
+                (Some(w), None) => (w as usize % bw == 0).then(|| w as usize / bw),
+                (None, Some(h)) => (h as usize % bh == 0).then(|| h as usize / bh),
+                (Some(w), Some(h)) => (w as usize % bw == 0 && w as usize / bw * bh == h as usize).then(|| w as usize / bw),
+            };
+            match k {
+                Some(k) => {
+                    let rep = |s: &[(usize, usize)]| s.iter().flat_map(|&r| std::iter::repeat_n(r, k)).collect::<Vec<_>>();
+                    note = format!(" (its blocks are {p:.1} px: {bw}x{bh} blocks{})", if k == 1 { ", one voxel each".to_string() } else { format!(", {k}x{k} voxels each") });
+                    (resample_spans(&img, &rep(cols), &rep(rows), alpha), bw * k, bh * k)
+                }
+                None => {
+                    let (w, h) = sized(&img, want_w, want_h);
+                    note = format!(
+                        ". Note: the picture is {bw}x{bh} blocks of {p:.1} px, so {w}x{h} stretches some blocks more than others; leave out height and width for one voxel per block (or use a multiple of {bh} tall)"
+                    );
+                    (resample(&img, w, h, alpha), w, h)
+                }
+            }
+        }
+        (None, None, None) if img.w.max(img.h) > 256 => {
+            let k = 256.0 / img.w.max(img.h) as f32;
+            let (w, h) = (((img.w as f32 * k).round() as usize).max(1), ((img.h as f32 * k).round() as usize).max(1));
+            note = " (no block grid found, so it was scaled down to fit 256 by averaging pixels; pass height or width)".into();
+            (resample(&img, w, h, alpha), w, h)
+        }
+        _ => {
+            let (w, h) = sized(&img, want_w, want_h);
+            (resample(&img, w, h, alpha), w, h)
+        }
+    };
+    ensure!(w.max(h) <= max, "{w}x{h} voxels is over {max} per axis; pass a smaller height or width");
     ensure!(pixels.iter().any(Option::is_some), "every pixel is transparent at alpha_threshold {alpha}");
 
     // Colors: optionally add the main ones to free slots, then match.
@@ -847,7 +917,7 @@ fn voxelize_image(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         let used = used_slots(ctx.scene);
         let reserved = &ctx.ed.tools.surface.reserved;
         let free: Vec<u8> = (1..256).rev().filter(|&i| !used[i] && !reserved.contains(&(i as u8))).map(|i| i as u8).collect();
-        let limit = int(a, "max_colors").map_or(free.len(), |m| (m.max(0) as usize).min(free.len()));
+        let limit = whole("max_colors", 0, 255)?.map_or(free.len(), |m| (m as usize).min(free.len()));
         let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
         for c in pixels.iter().flatten() {
             *counts.entry(*c).or_default() += 1;
@@ -884,7 +954,8 @@ fn voxelize_image(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         "xy" => (0, 1, 2),
         p => bail!("unknown plane {p:?}; use xz, yz or xy"),
     };
-    let offset = super::opt_ivec3(a, "offset")?.unwrap_or(IVec3::ZERO).max(IVec3::ZERO);
+    let offset = super::opt_ivec3(a, "offset")?.unwrap_or(IVec3::ZERO);
+    ensure!(offset.cmpge(IVec3::ZERO).all(), "`offset` is the image's minimum corner in the part, 0 or more per axis, not {:?}", offset.to_array());
     let invert = boolean(a, "invert").unwrap_or(false);
     let mut cells: Vec<(IVec3, u8)> = Vec::new();
     for (k, px) in pixels.iter().enumerate() {
@@ -1064,6 +1135,19 @@ mod tests {
         let img = Image { w: 4, h: 4, px };
         assert_eq!(resample(&img, 2, 2, 128), vec![Some([255, 0, 0]), Some([0, 255, 0]), None, Some([0, 0, 255])]);
         assert_eq!(resample(&img, 8, 8, 128).len(), 64);
+        // alpha_threshold 0 keeps fully transparent pixels.
+        assert_eq!(resample(&img, 2, 2, 0)[2], Some([0, 0, 0]));
+    }
+
+    #[test]
+    fn block_spans_follow_the_grid() {
+        assert_eq!(block_spans(32, 0.0, 8.0), vec![(0, 8), (8, 16), (16, 24), (24, 32)]);
+        // A 3 px sliver at the start is dropped, a 6 px one at the end kept.
+        assert_eq!(block_spans(25, 3.0, 8.0), vec![(3, 11), (11, 19), (19, 25)]);
+        // Scaled by an odd factor: blocks 3 or 4 px.
+        let s = block_spans(25, 0.0, 3.125);
+        assert_eq!(s.len(), 8);
+        assert!(s.iter().all(|&(a, b)| (3..=4).contains(&(b - a))));
     }
 
     #[test]

@@ -1820,7 +1820,8 @@ pub enum UserEvent {
 
 /// Listen on the control socket and forward each request to the window.
 /// Requests are one JSON line `{"tool", "args"}`; replies are one line.
-pub fn serve_control(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+/// Returns the socket file's inode, for `release_control`.
+pub fn serve_control(proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Option<u64> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     let path = crate::mcp::socket_path();
@@ -1830,13 +1831,14 @@ pub fn serve_control(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("control socket {}: {e}", path.display());
-            return;
+            return None;
         }
     };
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
+    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).ok()?);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let proxy = proxy.clone();
@@ -1862,6 +1864,20 @@ pub fn serve_control(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
             });
         }
     });
+    Some(inode)
+}
+
+/// Remove the control socket on close, unless a newer window has taken it
+/// over (it's then a different file).
+pub fn release_control(inode: Option<u64>) {
+    remove_if_ours(&crate::mcp::socket_path(), inode);
+}
+
+fn remove_if_ours(path: &Path, inode: Option<u64>) {
+    let ours = std::fs::symlink_metadata(path).is_ok_and(|m| Some(std::os::unix::fs::MetadataExt::ino(&m)) == inode);
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 pub struct App {
@@ -2522,7 +2538,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.track_changes(true);
                 let g = self.gfx.as_mut().unwrap();
                 let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true };
-                let result = crate::control::call(&mut ctx, &tool, &args);
+                let result = crate::mcp::call_guarded(&mut ctx, &tool, &args);
                 self.edit.agent.record(&tool, &result);
                 g.window.request_redraw();
                 self.track_changes(false);
@@ -2656,5 +2672,25 @@ mod tests {
         assert!(ed.notice.as_ref().is_some_and(|n| n.error));
         ed.say("Saved x.vox");
         assert!(ed.notice.as_ref().is_some_and(|n| !n.error && n.text == "Saved x.vox"));
+    }
+
+    #[test]
+    fn closing_an_older_window_keeps_a_newer_socket() {
+        let dir = std::env::temp_dir().join(format!("voxely-sock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.sock");
+        let _ = std::fs::remove_file(&path);
+        let old = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let old_ino = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+        // A newer window takes over the path.
+        std::fs::remove_file(&path).unwrap();
+        let new = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let new_ino = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+        remove_if_ours(&path, Some(old_ino));
+        assert!(path.exists());
+        remove_if_ours(&path, Some(new_ino));
+        assert!(!path.exists());
+        drop((old, new));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
