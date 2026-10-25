@@ -15,6 +15,8 @@ const SHADOW_SIZE: u32 = 2048;
 const LIGHT: Vec3 = Vec3::new(0.42, 0.55, 0.72);
 /// `kind` of the ground quad's vertices; voxel faces use 0..6.
 const FLOOR: u32 = 6;
+/// Vertex `data` bit marking context (other models) faces.
+const CONTEXT: u32 = 1 << 23;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -147,6 +149,10 @@ struct Uniforms {
     shadow_vp: [[f32; 4]; 4],
     /// x shadows on, y wireframe on.
     view: [f32; 4],
+    /// Offset of the context mesh (other models).
+    context: [f32; 4],
+    /// rgb color context fades toward, w = how far.
+    ghost: [f32; 4],
     palette: [[f32; 4]; 256],
 }
 
@@ -169,6 +175,8 @@ pub struct Modeler {
     line_pipeline: wgpu::RenderPipeline,
     bounds: wgpu::Buffer,
     vertex_count: u32,
+    /// The other models while editing one, drawn dimmed.
+    context: Option<(wgpu::Buffer, u32, Vec3)>,
     palette: [[f32; 4]; 256],
     dims: Vec3,
     depth: Option<(wgpu::TextureView, (u32, u32))>,
@@ -333,6 +341,7 @@ impl Modeler {
             line_pipeline,
             bounds: bounds_buffer(device, volume.dims),
             vertex_count,
+            context: None,
             palette: [[0.0; 4]; 256],
             dims: volume.dims.as_vec3(),
             depth: None,
@@ -347,6 +356,22 @@ impl Modeler {
             self.bounds = bounds_buffer(device, volume.dims);
         }
         self.dims = volume.dims.as_vec3();
+    }
+
+    /// Show `context` (voxels and the offset of their cell 0) dimmed
+    /// around the edited volume, or nothing.
+    pub fn set_context(&mut self, device: &wgpu::Device, context: Option<&(Volume, IVec3)>) {
+        self.context = context.and_then(|(v, offset)| {
+            let mut mesh = build_mesh(v, None);
+            mesh.truncate(mesh.len().saturating_sub(6));
+            if mesh.is_empty() {
+                return None;
+            }
+            for m in &mut mesh {
+                m.data |= CONTEXT;
+            }
+            Some((mesh_buffer(device, &mesh), mesh.len() as u32, offset.as_vec3()))
+        });
     }
 
     /// The modeler shows palette colors as-is, like MagicaVoxel.
@@ -396,6 +421,8 @@ impl Modeler {
             line: [1.0, 1.0, 1.0, 0.45],
             shadow_vp: shadow_view_proj(self.dims).to_cols_array_2d(),
             view: [o.shadow as u32 as f32, o.wire as u32 as f32, 0.0, 0.0],
+            context: self.context.as_ref().map_or(Vec3::ZERO, |c| c.2).extend(0.0).to_array(),
+            ghost: o.background.extend(0.6).to_array(),
             palette: self.palette,
         };
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
@@ -448,6 +475,10 @@ impl Modeler {
             // The ground quad (the last 6 vertices) shows with grid lines.
             let n = if o.grid || o.frame { self.vertex_count } else { self.vertex_count - 6 };
             pass.draw(0..n, 0..1);
+            if let Some((buf, count, _)) = &self.context {
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..*count, 0..1);
+            }
             if o.bounds {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_bind_group(0, &self.plain_bind_group, &[]);
@@ -483,15 +514,19 @@ fn bounds_buffer(device: &wgpu::Device, dims: IVec3) -> wgpu::Buffer {
 
 fn vertex_buffer(device: &wgpu::Device, volume: &Volume, sel: Option<&[bool]>) -> (wgpu::Buffer, u32) {
     let mesh = build_mesh(volume, sel);
+    (mesh_buffer(device, &mesh), mesh.len() as u32)
+}
+
+fn mesh_buffer(device: &wgpu::Device, mesh: &[Vertex]) -> wgpu::Buffer {
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("modeler_mesh"),
-        size: std::mem::size_of_val(mesh.as_slice()) as u64,
+        size: std::mem::size_of_val(mesh) as u64,
         usage: wgpu::BufferUsages::VERTEX,
         mapped_at_creation: true,
     });
-    buf.slice(..).get_mapped_range_mut().expect("mapped at creation").copy_from_slice(bytemuck::cast_slice(&mesh));
+    buf.slice(..).get_mapped_range_mut().expect("mapped at creation").copy_from_slice(bytemuck::cast_slice(mesh));
     buf.unmap();
-    (buf, mesh.len() as u32)
+    buf
 }
 
 /// Right-handed view matrix looking from `eye` along `fwd`.

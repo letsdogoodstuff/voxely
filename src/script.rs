@@ -25,11 +25,16 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// script's edits can't be folded into one undo step.
 const RESETS_HISTORY: [&str; 6] = ["new_scene", "new_project", "open_project", "open_file", "undo", "redo"];
 
-/// What the script thread asks the scene's owner for.
+/// What the script thread asks the scene's owner for. Volumes belong to a
+/// part: the one named (if any), else the part being edited.
 enum Request {
     Call(String, Value, Sender<Value>),
-    GetVolume(Sender<(IVec3, Vec<u8>)>),
-    SetVolume(IVec3, Vec<u8>, Sender<Value>),
+    GetVolume(Option<Value>, Sender<Result<(IVec3, Vec<u8>), String>>),
+    SetVolume(IVec3, Vec<u8>, Option<Value>, Sender<Value>),
+}
+
+fn tool_error(msg: impl std::fmt::Display) -> Value {
+    json!({ "content": [{ "type": "text", "text": msg.to_string() }], "isError": true })
 }
 
 /// The result of a script run.
@@ -44,8 +49,10 @@ pub struct Outcome {
 /// Run `source` against the scene. Edits made by the script form a single
 /// undo step.
 pub fn run(ctx: &mut ToolCtx, source: String, file: String, args: Value, timeout: Duration) -> Outcome {
-    let before = ctx.scene.volume.clone();
-    let mark = ctx.ed.editor.history_len();
+    // Where history stands, to fold the script's edits into one step.
+    let (mode, steps) = (ctx.scene.mode, ctx.scene.tree_steps());
+    let (volume, mark) = (ctx.scene.volume.clone(), ctx.ed.editor.history_len());
+    let world = ctx.scene.synced_world().into_owned();
     let mut squash = true;
     let (tx, rx) = mpsc::channel();
     let js = std::thread::spawn(move || run_js(&source, &file, &args, timeout, tx));
@@ -54,20 +61,22 @@ pub fn run(ctx: &mut ToolCtx, source: String, file: String, args: Value, timeout
         match req {
             Request::Call(name, args, reply) => {
                 let result = if name == "run_script" {
-                    json!({ "content": [{ "type": "text", "text": "run_script can't be called from a script" }], "isError": true })
+                    tool_error("run_script can't be called from a script")
                 } else {
                     squash &= !RESETS_HISTORY.contains(&name.as_str());
                     control::call(ctx, &name, &args)
                 };
                 let _ = reply.send(result);
             }
-            Request::GetVolume(reply) => {
-                let v = &ctx.scene.volume;
-                let _ = reply.send((v.dims, v.cells.clone()));
+            Request::GetVolume(part, reply) => {
+                let result = control::focus_part(ctx, part.as_ref()).map(|()| (ctx.scene.volume.dims, ctx.scene.volume.cells.clone()));
+                let _ = reply.send(result.map_err(|e| format!("{e:#}")));
             }
-            Request::SetVolume(dims, cells, reply) => {
+            Request::SetVolume(dims, cells, part, reply) => {
                 let result = if dims.cmplt(IVec3::ONE).any() || dims.max_element() > crate::ops::MAX_DIM {
-                    json!({ "content": [{ "type": "text", "text": format!("volume size must be 1-{} per axis", crate::ops::MAX_DIM) }], "isError": true })
+                    tool_error(format!("volume size must be 1-{} per axis", crate::ops::MAX_DIM))
+                } else if let Err(e) = control::focus_part(ctx, part.as_ref()) {
+                    tool_error(format!("{e:#}"))
                 } else {
                     let changed = control::apply(ctx, Volume::from_cells(dims, cells));
                     json!({ "content": control::edited(ctx, changed, "Set volume"), "isError": false })
@@ -78,7 +87,15 @@ pub fn run(ctx: &mut ToolCtx, source: String, file: String, args: Value, timeout
     }
     let outcome = js.join().unwrap_or_else(|_| Outcome { log: Vec::new(), result: Err("the script thread panicked".into()) });
     if squash {
-        ctx.ed.editor.squash(&mut ctx.scene.volume, mark, before);
+        if ctx.scene.mode == mode && ctx.scene.tree_steps() == steps {
+            // Voxel edits to the one part being edited.
+            ctx.ed.editor.squash(&mut ctx.scene.volume, mark, volume);
+        } else {
+            // Other parts or the tree changed: one step back to the whole
+            // tree as it was.
+            ctx.scene.squash_tree(steps, world);
+            ctx.ed.editor.reset();
+        }
     }
     outcome
 }
@@ -142,28 +159,31 @@ fn install<'js>(ctx: &Ctx<'js>, tx: Sender<Request>, log: Rc<RefCell<Vec<String>
     let t = tx.clone();
     g.set(
         "__getVolume",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Object<'js>> {
+        Function::new(ctx.clone(), move |ctx: Ctx<'js>, part: String| -> rquickjs::Result<Object<'js>> {
             let (reply, rx) = mpsc::channel();
-            let _ = t.send(Request::GetVolume(reply));
-            let (dims, cells) = rx.recv().map_err(|_| rquickjs::Error::new_from_js("voxely", "volume"))?;
+            let _ = t.send(Request::GetVolume(serde_json::from_str(&part).ok(), reply));
             let out = Object::new(ctx.clone())?;
-            out.set("size", dims.to_array().to_vec())?;
-            out.set("cells", TypedArray::<u8>::new(ctx, cells)?)?;
+            match rx.recv().unwrap_or_else(|_| Err("voxely stopped".into())) {
+                Ok((dims, cells)) => {
+                    out.set("size", dims.to_array().to_vec())?;
+                    out.set("cells", TypedArray::<u8>::new(ctx, cells)?)?;
+                }
+                Err(e) => out.set("error", e)?,
+            }
             Ok(out)
         })?,
     )?;
     g.set(
         "__setVolume",
-        Function::new(ctx.clone(), move |x: i32, y: i32, z: i32, cells: TypedArray<'js, u8>| -> String {
+        Function::new(ctx.clone(), move |x: i32, y: i32, z: i32, cells: TypedArray<'js, u8>, part: String| -> String {
             // SAFETY: copied out before any more JavaScript runs.
             let cells = unsafe { cells.as_slice() }.to_vec();
             let dims = IVec3::new(x, y, z);
             if cells.len() as i64 != dims.x as i64 * dims.y as i64 * dims.z as i64 {
-                let msg = format!("cells has {} entries but the size {x}x{y}x{z} needs {}", cells.len(), x as i64 * y as i64 * z as i64);
-                return json!({ "content": [{ "type": "text", "text": msg }], "isError": true }).to_string();
+                return tool_error(format!("cells has {} entries but the size {x}x{y}x{z} needs {}", cells.len(), x as i64 * y as i64 * z as i64)).to_string();
             }
             let (reply, rx) = mpsc::channel();
-            let _ = tx.send(Request::SetVolume(dims, cells, reply));
+            let _ = tx.send(Request::SetVolume(dims, cells, serde_json::from_str(&part).ok(), reply));
             rx.recv().unwrap_or_else(|_| json!({ "content": [], "isError": true })).to_string()
         })?,
     )?;
@@ -220,12 +240,13 @@ const voxely = {
   call(name, args = {}) {
     return unwrap(name, __call(name, JSON.stringify(args)));
   },
-  getVolume() {
-    const v = __getVolume();
+  getVolume({ part = null } = {}) {
+    const v = __getVolume(JSON.stringify(part));
+    if (v.error) throw new Error(`getVolume: ${v.error}`);
     return new Volume(v.size, v.cells);
   },
-  setVolume(volume) {
-    return unwrap("setVolume", __setVolume(volume.size[0], volume.size[1], volume.size[2], volume.cells));
+  setVolume(volume, { part = null } = {}) {
+    return unwrap("setVolume", __setVolume(volume.size[0], volume.size[1], volume.size[2], volume.cells, JSON.stringify(part)));
   },
   /** The nearest palette index (1-255) to "#rrggbb". */
   color(hex) {
@@ -279,10 +300,10 @@ pub fn typings() -> String {
          declare const voxely: {\n\
          \x20 /** Call any tool by its MCP name. Throws if the tool fails. */\n\
          \x20 call(name: string, args?: object): any;\n\
-         \x20 /** A copy of the canvas. */\n\
-         \x20 getVolume(): Volume;\n\
-         \x20 /** Replace the canvas (resizing it to the volume's size). */\n\
-         \x20 setVolume(volume: Volume): string;\n\
+         \x20 /** A copy of a part's voxels, in the part's own coordinates. Default: the part being edited. */\n\
+         \x20 getVolume(options?: { part?: string | number }): Volume;\n\
+         \x20 /** Replace a part's voxels (resizing it to the volume's size). Default: the part being edited. */\n\
+         \x20 setVolume(volume: Volume, options?: { part?: string | number }): string;\n\
          \x20 /** The nearest palette index to \"#rrggbb\". */\n\
          \x20 color(hex: string): number;\n",
     );
@@ -421,10 +442,12 @@ mod tests {
                     };
                     let _ = reply.send(json!({ "content": [{ "type": "text", "text": text }], "isError": name == "fail" }));
                 }
-                Request::GetVolume(reply) => {
-                    let _ = reply.send((IVec3::splat(4), cells.clone()));
+                Request::GetVolume(part, reply) => {
+                    seen.push(format!("get {}", part.unwrap_or_default()));
+                    let _ = reply.send(if cells[0] == 99 { Err("no such part".into()) } else { Ok((IVec3::splat(4), cells.clone())) });
                 }
-                Request::SetVolume(_, c, reply) => {
+                Request::SetVolume(_, c, part, reply) => {
+                    seen.push(format!("set {}", part.unwrap_or_default()));
                     cells = c;
                     let _ = reply.send(json!({ "content": [{ "type": "text", "text": "Set volume" }], "isError": false }));
                 }
@@ -444,9 +467,11 @@ mod tests {
 
     #[test]
     fn volumes_round_trip_and_colors_match() {
-        let (o, seen) = run_fake("const v = voxely.getVolume(); v.set(1, 2, 3, voxely.color('#ee1100')); v.set(9, 9, 9, 1); voxely.setVolume(v); v.get(1, 2, 3)");
+        let (o, seen) = run_fake("const v = voxely.getVolume(); v.set(1, 2, 3, voxely.color('#ee1100')); v.set(9, 9, 9, 1); voxely.setVolume(v, { part: 'arm' }); v.get(1, 2, 3)");
         assert_eq!(o.result, Ok(Some("7".into())));
-        assert_eq!(seen.last().unwrap(), "solid 1");
+        assert_eq!(seen, ["get null", "get_palette", "set \"arm\"", "solid 1"]);
+        let (o, _) = run_fake("const v = new Volume([4, 4, 4]); v.cells[0] = 99; voxely.setVolume(v); voxely.getVolume()");
+        assert!(o.result.unwrap_err().contains("getVolume: no such part"));
     }
 
     #[test]

@@ -8,6 +8,9 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use glam::{IVec3, Mat3};
 
+use crate::scene::Volume;
+use crate::world::{Kind, Rot, World, ROOT};
+
 pub type Dict = HashMap<String, String>;
 
 #[derive(Debug, Clone)]
@@ -242,45 +245,179 @@ fn put_chunk(out: &mut Vec<u8>, id: &[u8; 4], content: &[u8], children: &[u8]) {
 /// MagicaVoxel models are at most 256 voxels on a side.
 const MAX_MODEL: i32 = 256;
 
-/// Write a dense volume as a `.vox` file, split into <= 256^3 models placed
-/// by a flat scene graph. `palette` is indexed by color index.
-pub fn write(
-    path: &std::path::Path,
-    dims: IVec3,
-    cells: &[u8],
-    palette: &[[u8; 4]],
-    materials: &[(u32, Dict)],
-    render: &[Dict],
-) -> Result<()> {
-    let tiles = (dims + IVec3::splat(MAX_MODEL - 1)) / MAX_MODEL;
-    let mut models: Vec<(IVec3, IVec3, Vec<u8>)> = Vec::new();
-    for tz in 0..tiles.z {
-        for ty in 0..tiles.y {
-            for tx in 0..tiles.x {
-                let origin = IVec3::new(tx, ty, tz) * MAX_MODEL;
-                let size = (dims - origin).min(IVec3::splat(MAX_MODEL));
-                let mut xyzi = Vec::new();
-                for z in 0..size.z {
-                    for y in 0..size.y {
-                        for x in 0..size.x {
-                            let p = origin + IVec3::new(x, y, z);
-                            let c = cells[(p.x + dims.x * (p.y + dims.y * p.z)) as usize];
-                            if c != 0 {
-                                xyzi.extend_from_slice(&[x as u8, y as u8, z as u8, c]);
-                            }
-                        }
+/// Builds the scene graph chunks: node ids are handed out in pre-order and
+/// every group or shape is wrapped in a transform, as MagicaVoxel expects.
+struct Graph {
+    next: i32,
+    nodes: Vec<(i32, Vec<u8>)>,
+    models: Vec<(IVec3, Vec<u8>)>,
+}
+
+impl Graph {
+    fn id(&mut self) -> i32 {
+        self.next += 1;
+        self.next - 1
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transform(&mut self, id: i32, child: i32, name: &str, hidden: bool, layer: i32, rot: u8, t: IVec3) {
+        self.transform_with(id, child, name, hidden, layer, rot, t, Dict::new());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transform_with(&mut self, id: i32, child: i32, name: &str, hidden: bool, layer: i32, rot: u8, t: IVec3, mut attrs: Dict) {
+        if !name.is_empty() {
+            attrs.insert("_name".into(), name.into());
+        }
+        if hidden {
+            attrs.insert("_hidden".into(), "1".into());
+        }
+        let mut frame = Dict::new();
+        if rot != Rot::IDENTITY.to_byte() {
+            frame.insert("_r".into(), rot.to_string());
+        }
+        if t != IVec3::ZERO {
+            frame.insert("_t".into(), format!("{} {} {}", t.x, t.y, t.z));
+        }
+        let mut c = Vec::new();
+        put_i32(&mut c, id);
+        put_dict(&mut c, &attrs);
+        put_i32(&mut c, child);
+        put_i32(&mut c, -1);
+        put_i32(&mut c, layer);
+        put_i32(&mut c, 1);
+        put_dict(&mut c, &frame);
+        self.nodes.push((id, chunk(b"nTRN", &c)));
+    }
+
+    fn group(&mut self, id: i32, children: &[i32]) {
+        let mut c = Vec::new();
+        put_i32(&mut c, id);
+        put_dict(&mut c, &Dict::new());
+        put_i32(&mut c, children.len() as i32);
+        for &k in children {
+            put_i32(&mut c, k);
+        }
+        self.nodes.push((id, chunk(b"nGRP", &c)));
+    }
+
+    fn shape(&mut self, id: i32, v: &Volume, origin: IVec3, size: IVec3) {
+        let mut xyzi = Vec::new();
+        for z in 0..size.z {
+            for y in 0..size.y {
+                for x in 0..size.x {
+                    let c = v.get(origin + IVec3::new(x, y, z));
+                    if c != 0 {
+                        xyzi.extend_from_slice(&[x as u8, y as u8, z as u8, c]);
                     }
                 }
-                // Keep at least one model so an empty canvas keeps its size.
-                if !xyzi.is_empty() || (models.is_empty() && (tx, ty, tz) == (tiles.x - 1, tiles.y - 1, tiles.z - 1)) {
-                    models.push((origin, size, xyzi));
-                }
+            }
+        }
+        let mut c = Vec::new();
+        put_i32(&mut c, id);
+        put_dict(&mut c, &Dict::new());
+        put_i32(&mut c, 1);
+        put_i32(&mut c, self.models.len() as i32);
+        put_dict(&mut c, &Dict::new());
+        self.nodes.push((id, chunk(b"nSHP", &c)));
+        self.models.push((size, xyzi));
+    }
+
+    /// Write world node `n` as transform `trn` (already allocated), its
+    /// translation shifted by `offset` (children of parts are stored in the
+    /// part's voxel space, `.vox` groups are centered).
+    fn node(&mut self, w: &World, n: usize, trn: i32, offset: IVec3) {
+        let Some(node) = w.node(n) else { return };
+        let child = self.id();
+        let (name, rot, layer, t) = (node.name.as_str(), node.rot.to_byte(), node.layer, node.t + offset);
+        let mut extras = Dict::new();
+        crate::world::write_extras(node, &mut extras);
+        match &node.kind {
+            Kind::Group => {
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
+                self.children(w, child, &[], &node.children, IVec3::ZERO);
+            }
+            Kind::Model(v) if node.children.is_empty() => {
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
+                self.model(child, v, layer);
+            }
+            Kind::Model(v) => {
+                // A part with attached parts: a group holding the part and
+                // them, marked so voxely reads it back as one part.
+                extras.insert("_vx_part".into(), "1".into());
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
+                let (shape_trn, shape) = (self.id(), self.id());
+                self.children(w, child, &[shape_trn], &node.children, -(v.dims / 2));
+                self.transform(shape_trn, shape, "", false, layer, Rot::IDENTITY.to_byte(), IVec3::ZERO);
+                self.model(shape, v, layer);
             }
         }
     }
 
+    /// Group `id` holding the transforms `first` plus world nodes `children`.
+    fn children(&mut self, w: &World, id: i32, first: &[i32], children: &[usize], offset: IVec3) {
+        let ids: Vec<i32> = children.iter().map(|_| self.id()).collect();
+        self.group(id, &[first, &ids].concat());
+        for (&c, &cid) in children.iter().zip(&ids) {
+            self.node(w, c, cid, offset);
+        }
+    }
+
+    /// A model's voxels as shape `id`, or a group of tiles when it is over
+    /// 256 on a side (landing on the same cells).
+    fn model(&mut self, id: i32, v: &Volume, layer: i32) {
+        if v.dims.cmple(IVec3::splat(MAX_MODEL)).all() {
+            return self.shape(id, v, IVec3::ZERO, v.dims);
+        }
+        let tiles = (v.dims + IVec3::splat(MAX_MODEL - 1)) / MAX_MODEL;
+        let mut placed = Vec::new();
+        for tz in 0..tiles.z {
+            for ty in 0..tiles.y {
+                for tx in 0..tiles.x {
+                    let o = IVec3::new(tx, ty, tz) * MAX_MODEL;
+                    placed.push((o, (v.dims - o).min(IVec3::splat(MAX_MODEL))));
+                }
+            }
+        }
+        let ids: Vec<i32> = placed.iter().map(|_| self.id()).collect();
+        self.group(id, &ids);
+        for (&(o, size), &tid) in placed.iter().zip(&ids) {
+            let shape = self.id();
+            self.transform(tid, shape, "", false, layer, Rot::IDENTITY.to_byte(), o + size / 2 - v.dims / 2);
+            self.shape(shape, v, o, size);
+        }
+    }
+}
+
+fn chunk(id: &[u8; 4], content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_chunk(&mut out, id, content, &[]);
+    out
+}
+
+/// Write the scene tree as a `.vox` file. `palette` is indexed by color
+/// index. Models over 256 on a side are split into tiles.
+pub fn write(
+    path: &std::path::Path,
+    world: &World,
+    palette: &[[u8; 4]],
+    materials: &[(u32, Dict)],
+    render: &[Dict],
+) -> Result<()> {
+    let mut g = Graph { next: 0, nodes: Vec::new(), models: Vec::new() };
+    // Root transform 0 -> group 1 -> a transform per top-level node.
+    let (root, top) = (g.id(), g.id());
+    g.transform(root, top, "", false, -1, Rot::IDENTITY.to_byte(), IVec3::ZERO);
+    let children = world.node(ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
+    let ids: Vec<i32> = children.iter().map(|_| g.id()).collect();
+    g.group(top, &ids);
+    for (&c, &id) in children.iter().zip(&ids) {
+        g.node(world, c, id, IVec3::ZERO);
+    }
+    g.nodes.sort_by_key(|(id, _)| *id);
+
     let mut body = Vec::new();
-    for (_, size, xyzi) in &models {
+    for (size, xyzi) in &g.models {
         let mut c = Vec::new();
         put_i32(&mut c, size.x);
         put_i32(&mut c, size.y);
@@ -291,48 +428,23 @@ pub fn write(
         c.extend_from_slice(xyzi);
         put_chunk(&mut body, b"XYZI", &c, &[]);
     }
-
-    // Scene graph: root transform -> group -> (transform -> shape) per model.
-    let empty = Dict::new();
-    let transform = |out: &mut Vec<u8>, id: i32, child: i32, layer: i32, frame: &Dict| {
+    for (_, bytes) in &g.nodes {
+        body.extend_from_slice(bytes);
+    }
+    for l in &world.layers {
+        let mut attrs = Dict::new();
+        if !l.name.is_empty() {
+            attrs.insert("_name".into(), l.name.clone());
+        }
+        if l.hidden {
+            attrs.insert("_hidden".into(), "1".into());
+        }
         let mut c = Vec::new();
-        put_i32(&mut c, id);
-        put_dict(&mut c, &empty);
-        put_i32(&mut c, child);
+        put_i32(&mut c, l.id);
+        put_dict(&mut c, &attrs);
         put_i32(&mut c, -1);
-        put_i32(&mut c, layer);
-        put_i32(&mut c, 1);
-        put_dict(&mut c, frame);
-        put_chunk(out, b"nTRN", &c, &[]);
-    };
-    transform(&mut body, 0, 1, -1, &empty);
-    let mut c = Vec::new();
-    put_i32(&mut c, 1);
-    put_dict(&mut c, &empty);
-    put_i32(&mut c, models.len() as i32);
-    for k in 0..models.len() as i32 {
-        put_i32(&mut c, 2 + 2 * k);
+        put_chunk(&mut body, b"LAYR", &c, &[]);
     }
-    put_chunk(&mut body, b"nGRP", &c, &[]);
-    for (k, (origin, size, _)) in models.iter().enumerate() {
-        let k = k as i32;
-        // The reader centers each model on its translation.
-        let t = *origin + *size / 2;
-        let frame: Dict = [("_t".to_string(), format!("{} {} {}", t.x, t.y, t.z))].into();
-        transform(&mut body, 2 + 2 * k, 3 + 2 * k, 0, &frame);
-        let mut c = Vec::new();
-        put_i32(&mut c, 3 + 2 * k);
-        put_dict(&mut c, &empty);
-        put_i32(&mut c, 1);
-        put_i32(&mut c, k);
-        put_dict(&mut c, &empty);
-        put_chunk(&mut body, b"nSHP", &c, &[]);
-    }
-    let mut c = Vec::new();
-    put_i32(&mut c, 0);
-    put_dict(&mut c, &empty);
-    put_i32(&mut c, -1);
-    put_chunk(&mut body, b"LAYR", &c, &[]);
 
     // Palette entry k holds color index k + 1.
     let mut c = Vec::with_capacity(1024);

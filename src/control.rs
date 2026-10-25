@@ -35,8 +35,12 @@ a named one, list_projects / open_project to flip between them, and save_file to
 Typical flow: new_project -> draw with fill_box / draw_shape / draw_line / set_voxels -> look with \
 screenshot (fast) -> set_material and set_render_settings -> render (path traced) -> save_file. \
 For loops, procedural builds or anything needing many calls, use run_script: one JavaScript program \
-that calls every tool as voxely.<camelCaseName>({...}) and can edit the whole grid as a Uint8Array. \
-Every edit is undoable. If the voxely window is open, edits appear in it live.";
+that calls every tool as voxely.<camelCaseName>({...}) and can edit a part's whole grid as a Uint8Array. \
+Every edit is undoable. If the voxely window is open, edits appear in it live.
+
+Scenes are a tree of parts (models) and groups, like MagicaVoxel's World editor. Voxel tools work on one part at a time, in that part's own coordinates (0..size-1): the part being edited (see get_scene_info), or the one named by a tool's `part` argument. Build separate pieces (body, head, arms, wheels, props) as separate parts with create_part, place them with transform_part (move, 90° rotate, flip) and group_parts, and inspect the tree with list_parts. Give parts pivots (set_pivot: a shoulder, a hinge) \
+and named sockets (set_socket: hand, muzzle, seat), then attach parts with transform_part attach_to (\"arm:hand\") so they follow, like a skeleton; \
+both carry into glTF exports for game engines. Part positions are world voxel coordinates of the part's minimum corner; a new project's first part spans [0, size).";
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
@@ -57,8 +61,8 @@ fn color_schema() -> Value {
     json!({ "type": ["integer", "string"], "description": COLOR })
 }
 
-/// The tool list for MCP `tools/list`.
-pub fn tools() -> Value {
+/// Every tool's definition (see `tools`).
+fn base_tools() -> Value {
     let axis = json!({ "type": "string", "enum": ["x", "y", "z"] });
     json!([
         tool("get_scene_info", "Canvas size, voxel count and bounds, colors in use, file, selection, camera and mode.", json!({}), &[]),
@@ -74,7 +78,7 @@ pub fn tools() -> Value {
             "size": xyz("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
             "fill": color_schema(),
         }), &[]),
-        tool("open_file", "Open a MagicaVoxel .vox file (all models are merged into one canvas).", json!({ "path": { "type": "string" } }), &["path"]),
+        tool("open_file", "Open a MagicaVoxel .vox file, keeping its models and groups as parts.", json!({ "path": { "type": "string" } }), &["path"]),
         tool("save_file", "Save the project as .vox. Without `path`, saves the current project in the workspace.", json!({ "path": { "type": "string" } }), &[]),
         tool("set_voxels", "Set individual voxels. Color 0 erases.", json!({
             "voxels": { "type": "array", "description": "[[x, y, z, color], ...]; color is an index or \"#rrggbb\"", "items": { "type": "array", "items": { "type": ["integer", "string"] } } },
@@ -176,7 +180,7 @@ pub fn tools() -> Value {
                 "description": "gltf: a .glb for game engines (Godot, Unity, Unreal, Three.js, Bevy) with metal/roughness, emission and glass materials; use a .gltf path for JSON" },
             "path": { "type": "string", "description": "Output file (default: <workspace>/export/<project>.<ext>)" },
         }), &["format"]),
-        tool("run_script", "Run a JavaScript program (QuickJS) inside voxely: one call instead of many. Every tool is voxely.<camelCase name>(args) with the same arguments, e.g. voxely.fillBox({from: [0, 0, 0], to: [9, 9, 0], color: \"#88aa44\"}); it returns parsed JSON or text and throws on errors. For bulk edits, v = voxely.getVolume() gives v.size and v.cells (a Uint8Array of palette indices, x fastest, then y, then z) with v.get(x, y, z), v.set(x, y, z, c) and v.forEach(fn); voxely.setVolume(v) writes it back (new Volume([x, y, z]) starts empty and resizes the canvas). voxely.color(\"#rrggbb\") gives the nearest palette index. Returns console.log output and the last expression's value. The whole script is one undo step. No file or network access.", json!({
+        tool("run_script", "Run a JavaScript program (QuickJS) inside voxely: one call instead of many. Every tool is voxely.<camelCase name>(args) with the same arguments, e.g. voxely.fillBox({from: [0, 0, 0], to: [9, 9, 0], color: \"#88aa44\"}); it returns parsed JSON or text and throws on errors. For bulk edits, v = voxely.getVolume({part}) gives a part's grid in its own coordinates (default: the part being edited): v.size and v.cells (a Uint8Array of palette indices, x fastest, then y, then z) with v.get(x, y, z), v.set(x, y, z, c) and v.forEach(fn); voxely.setVolume(v, {part}) writes it back (new Volume([x, y, z]) starts empty and resizes the part). voxely.color(\"#rrggbb\") gives the nearest palette index. Returns console.log output and the last expression's value. The whole script is one undo step. No file or network access.", json!({
             "source": { "type": "string", "description": "JavaScript source" },
             "path": { "type": "string", "description": "Or a .js file to run" },
             "args": { "description": "Any JSON value, available to the script as `args`" },
@@ -185,7 +189,67 @@ pub fn tools() -> Value {
         tool("set_view_mode", "Show the modeler or the live path tracer in the window.", json!({
             "mode": { "type": "string", "enum": ["model", "render"] },
         }), &["mode"]),
+        tool("list_parts", "The scene tree: every part (model) and group with its id, name, position (world min corner), size and children.", json!({}), &[]),
+        tool("edit_part", "Edit a part's voxels (the voxel tools then work in its coordinates), or pass \"world\" for World mode, where the window shows every part and you arrange them.", json!({
+            "part": { "type": ["string", "integer"], "description": "Part name or id, or \"world\"" },
+        }), &["part"]),
+        tool("create_part", "Add a new empty part (a separate model) and start editing it.", json!({
+            "name": { "type": "string" },
+            "size": xyz("Size in voxels, up to 256 per axis for MagicaVoxel compatibility"),
+            "position": xyz("World position of its minimum corner (default: beside the existing parts)"),
+            "parent": { "type": ["string", "integer"], "description": "Group to put it in (default: the top level)" },
+            "fill": color_schema(),
+        }), &["name", "size"]),
+        tool("transform_part", "Move, rotate or flip a part or group as a whole. 90° turns and flips are exact and turn about its pivot (default: its center), around world axes. free_rotation adds any angle (shown resampled; edit the part upright). attach_to attaches it to another part (snapping its pivot or own socket onto that part's socket) so it follows that part from then on, like a sword in a hand.", json!({
+            "part": { "type": ["string", "integer"] },
+            "move": xyz("[dx, dy, dz] offset"),
+            "position": xyz("New world position of its minimum corner"),
+            "rotate_axis": axis,
+            "quarter_turns": { "type": "integer", "description": "Counter-clockwise quarter turns about rotate_axis (negative for clockwise)" },
+            "flip_axis": axis,
+            "free_rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees about the pivot, applied x then y then z; replaces any previous free rotation. [0, 0, 0] straightens." },
+            "attach_to": { "type": "string", "description": "\"part:socket\" (e.g. \"body:shoulder_r\") to snap onto a socket and attach, or \"part\" to attach where it is. Attached parts follow their parent's moves and turns (and nest in glTF exports)." },
+            "link": { "type": "boolean", "description": "With attach_to: false only lines it up without attaching (default true)" },
+            "attach_socket": { "type": "string", "description": "With attach_to: this part's own socket to line up (default: its pivot). It becomes the pivot if none was set, so later turns keep it attached." },
+        }), &["part"]),
+        tool("set_pivot", "Set the point a part or group turns about (and its origin in glTF exports), in the part's own coordinates (the ones the voxel tools use while editing it; world coordinates for groups). E.g. a shoulder for an arm, the hinge for a door.", json!({
+            "part": { "type": ["string", "integer"] },
+            "pivot": { "type": ["array", "string"], "items": { "type": "number" }, "description": "[x, y, z], or \"center\" (default), or \"bottom\" (middle of the bottom face)" },
+        }), &["part", "pivot"]),
+        tool("set_socket", "Add, move or remove a named attachment point (socket) on a part, in its own coordinates. Other parts attach to sockets with transform_part attach_to; glTF exports them as empty nodes engines can parent things to (hand, muzzle, seat ...).", json!({
+            "part": { "type": ["string", "integer"] },
+            "name": { "type": "string" },
+            "position": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z]; omit to remove the socket" },
+        }), &["part", "name"]),
+        tool("modify_part", "Rename, duplicate, delete, hide, show or ungroup a part or group.", json!({
+            "part": { "type": ["string", "integer"] },
+            "action": { "type": "string", "enum": ["rename", "duplicate", "delete", "hide", "show", "ungroup", "detach"], "description": "detach: stop following what it's attached to (it stays where it is)" },
+            "name": { "type": "string", "description": "New name (rename) or the copy's name (duplicate)" },
+            "offset": xyz("duplicate: where the copy goes relative to the original (default: just beside it on x)"),
+        }), &["part", "action"]),
+        tool("group_parts", "Put parts and groups into a new group, so they move and turn together.", json!({
+            "parts": { "type": "array", "items": { "type": ["string", "integer"] } },
+            "name": { "type": "string" },
+        }), &["parts"]),
     ])
+}
+
+/// Tools that change or read one part's voxels; they take an optional
+/// `part` to edit first.
+const PART_TOOLS: &[&str] = &[
+    "set_voxels", "fill_box", "draw_shape", "draw_line", "get_voxels", "get_slice", "edit_model", "transform_model",
+    "resize_canvas", "run_shader", "select", "move_selection",
+];
+
+/// The tool list for MCP `tools/list`, with the shared `part` argument.
+pub fn tools() -> Value {
+    let mut list = base_tools();
+    for t in list.as_array_mut().into_iter().flatten() {
+        if PART_TOOLS.contains(&t["name"].as_str().unwrap_or_default()) {
+            t["inputSchema"]["properties"]["part"] = json!({ "type": ["string", "integer"], "description": "Part to work on (name or id); default: the part being edited" });
+        }
+    }
+    list
 }
 
 /// Run one tool and build the MCP `tools/call` result.
@@ -250,7 +314,11 @@ fn string<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn axis(args: &Value) -> Result<usize> {
-    match string(args, "axis").unwrap_or("z") {
+    axis_named(args, "axis")
+}
+
+fn axis_named(args: &Value, key: &str) -> Result<usize> {
+    match string(args, key).unwrap_or("z") {
         "x" | "X" => Ok(0),
         "y" | "Y" => Ok(1),
         "z" | "Z" => Ok(2),
@@ -403,9 +471,336 @@ fn render_pixels(ctx: &Ctx, w: u32, h: u32, spp: u32) -> Result<Vec<u8>> {
 
 // ---------------------------------------------------------------- tools
 
+fn part_key(v: &Value) -> Option<String> {
+    v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string()))
+}
+
+fn find_part(scene: &Scene, v: Option<&Value>) -> Result<usize> {
+    let key = v.and_then(part_key).ok_or_else(|| anyhow!("missing `part`"))?;
+    scene.world.find(&key).filter(|&id| id != crate::world::ROOT).ok_or_else(|| anyhow!("no part named `{key}`; see list_parts"))
+}
+
+/// A node and its subtree as JSON.
+fn part_json(scene: &Scene, id: usize) -> Value {
+    let w = &scene.world;
+    let Some(n) = w.node(id) else { return Value::Null };
+    let (lo, size) = w.bounds(id).unwrap_or((IVec3::ZERO, IVec3::ZERO));
+    let mut v = json!({
+        "id": id,
+        "name": w.label(id),
+        "kind": if n.is_group() { "group" } else { "part" },
+        "position": arr(lo),
+        "size": arr(size),
+    });
+    if n.hidden {
+        v["hidden"] = json!(true);
+    }
+    if scene.editing() == Some(id) {
+        v["editing"] = json!(true);
+    }
+    if let Some(m) = n.volume() {
+        v["voxels"] = json!(if scene.editing() == Some(id) { count(&scene.volume) } else { count(m) });
+    }
+    if n.pivot.is_some() {
+        v["pivot"] = json!(w.to_part(id, w.pivot_local(id)).to_array());
+    }
+    if n.tilted() {
+        v["free_rotation"] = json!(n.tilt.to_array());
+    }
+    if !n.sockets.is_empty() {
+        v["sockets"] = n
+            .sockets
+            .iter()
+            .map(|s| json!({ "name": s.name, "position": w.to_part(id, s.pos).to_array(), "world": w.affine(id).transform_point3(s.pos).to_array() }))
+            .collect();
+    }
+    if !n.children().is_empty() {
+        let key = if n.is_group() { "children" } else { "attached" };
+        v[key] = n.children().iter().map(|&c| part_json(scene, c)).collect();
+    }
+    v
+}
+
+fn vec3_value(v: &Value) -> Option<Vec3> {
+    let a: Vec<f32> = v.as_array()?.iter().map(|x| x.as_f64().map(|f| f as f32)).collect::<Option<_>>()?;
+    (a.len() == 3).then(|| Vec3::new(a[0], a[1], a[2]))
+}
+
+/// After a tree change: reset voxel history and upload.
+fn tree_changed(ctx: &mut Ctx) {
+    ctx.ed.editor.reset();
+    app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+}
+
+/// Switch to editing `part` (a name or id) for a voxel tool, or check that
+/// some part is being edited if none is given.
+pub(crate) fn focus_part(ctx: &mut Ctx, part: Option<&Value>) -> Result<()> {
+    if let Some(p) = part.filter(|p| !p.is_null()) {
+        let id = find_part(ctx.scene, Some(p))?;
+        if ctx.scene.editing() != Some(id) {
+            if ctx.scene.world.node(id).is_some_and(|n| n.is_group()) {
+                bail!("`{}` is a group; pass one of its parts", ctx.scene.world.label(id));
+            }
+            app::set_mode(ctx.scene, ctx.ed, Some(id));
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+        }
+    } else if ctx.scene.editing().is_none() {
+        bail!("the window is in World mode; pass `part` or call edit_part first (list_parts shows the parts)");
+    }
+    Ok(())
+}
+
 fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
     let a = args;
+    if PART_TOOLS.contains(&name) {
+        focus_part(ctx, get(a, "part"))?;
+    }
     match name {
+        "list_parts" => {
+            let top = ctx.scene.world.node(crate::world::ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
+            let tree: Vec<Value> = top.iter().map(|&c| part_json(ctx.scene, c)).collect();
+            Ok(vec![text(serde_json::to_string_pretty(&json!({ "mode": if ctx.scene.editing().is_some() { "edit" } else { "world" }, "parts": tree }))?)])
+        }
+        "edit_part" => {
+            if get(a, "part").and_then(Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case("world")) {
+                app::set_mode(ctx.scene, ctx.ed, None);
+                app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+                return Ok(vec![text(format!("World mode: {} parts", ctx.scene.world.models().len()))]);
+            }
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            if !app::set_mode(ctx.scene, ctx.ed, Some(id)) {
+                bail!("`{}` has no parts to edit", ctx.scene.world.label(id));
+            }
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            let id = ctx.scene.editing().unwrap_or(id);
+            Ok(edited(ctx, true, &format!("Editing `{}` at {:?}", ctx.scene.world.label(id), arr(ctx.scene.origin))))
+        }
+        "create_part" => {
+            let name = string(a, "name").context("missing `name`")?.trim().to_string();
+            let size = ivec3(a, "size")?;
+            if size.cmplt(IVec3::ONE).any() || size.cmpgt(IVec3::splat(ops::MAX_DIM)).any() {
+                bail!("size must be 1..={} per axis", ops::MAX_DIM);
+            }
+            if !name.is_empty() && ctx.scene.world.find(&name).is_some() {
+                bail!("a part named `{name}` already exists");
+            }
+            let parent = match get(a, "parent") {
+                Some(p) => find_part(ctx.scene, Some(p))?,
+                None => crate::world::ROOT,
+            };
+            let w = &ctx.scene.world;
+            let position = match opt_ivec3(a, "position")? {
+                Some(p) => p,
+                None => w.bounds(crate::world::ROOT).map_or(IVec3::ZERO, |(lo, s)| IVec3::new(lo.x + s.x + 2, lo.y, lo.z.max(0))),
+            };
+            let mut v = Volume::new(size);
+            if let Some(c) = get(a, "fill") {
+                v = ops::full(&v, color(ctx.scene, c)?);
+            }
+            let id = ctx.scene.change(|w| w.add_model(parent, &name, v, position));
+            app::set_mode(ctx.scene, ctx.ed, Some(id));
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            Ok(edited(ctx, true, &format!("Created part `{}` (id {id}) at {:?}; now editing it", ctx.scene.world.label(id), arr(position))))
+        }
+        "transform_part" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            let mv = opt_ivec3(a, "move")?;
+            let pos = opt_ivec3(a, "position")?;
+            let turn = match (get(a, "rotate_axis"), int(a, "quarter_turns")) {
+                (Some(_), q) => Some((axis_named(a, "rotate_axis")?, q.unwrap_or(1) as i32)),
+                (None, Some(_)) => bail!("quarter_turns needs rotate_axis"),
+                _ => None,
+            };
+            let flip = match get(a, "flip_axis") {
+                Some(_) => Some(axis_named(a, "flip_axis")?),
+                None => None,
+            };
+            let tilt = match get(a, "free_rotation") {
+                Some(v) => Some(vec3_value(v).context("free_rotation is [x, y, z] degrees")?),
+                None => None,
+            };
+            let attach = match string(a, "attach_to") {
+                Some(spec) => {
+                    let (p, sock) = match spec.split_once(':') {
+                        Some((p, s)) => (p, Some(s.to_string())),
+                        None => (spec, None),
+                    };
+                    let target = find_part(ctx.scene, Some(&json!(p)))?;
+                    if let Some(sock) = &sock {
+                        ctx.scene.world.socket_world(target, sock).with_context(|| format!("`{p}` has no socket `{sock}`"))?;
+                    }
+                    let own = string(a, "attach_socket").map(str::to_string);
+                    Some((target, sock, own))
+                }
+                None => None,
+            };
+            let link = boolean(a, "link").unwrap_or(true);
+            if mv.is_none() && pos.is_none() && turn.is_none() && flip.is_none() && tilt.is_none() && attach.is_none() {
+                bail!("give move, position, rotate_axis, flip_axis, free_rotation or attach_to");
+            }
+            if let Some((_, _, Some(own))) = &attach {
+                if ctx.scene.world.socket_world(id, own).is_none() {
+                    bail!("`{}` has no socket `{own}`", ctx.scene.world.label(id));
+                }
+            }
+            let linked = ctx.scene.change(|w| {
+                if let Some((axis, q)) = turn {
+                    w.reorient(id, crate::world::Rot::turn(axis, q));
+                }
+                if let Some(axis) = flip {
+                    w.reorient(id, crate::world::Rot::flip(axis));
+                }
+                if let Some(p) = pos {
+                    if let Some((lo, _)) = w.bounds(id) {
+                        w.translate(id, p - lo);
+                    }
+                }
+                if let Some(d) = mv {
+                    w.translate(id, d);
+                }
+                if let Some(t) = tilt {
+                    w.set_tilt(id, t);
+                }
+                match &attach {
+                    Some((target, sock, own)) if link => Some(w.attach_to(id, *target, sock.as_deref(), own.as_deref())),
+                    Some((target, Some(sock), own)) => {
+                        // Snap only: line up, don't link.
+                        let at = w.socket_world(*target, sock).unwrap_or_default();
+                        let own_pos = own.as_deref().and_then(|o| w.node(id)?.sockets.iter().find(|s| s.name.eq_ignore_ascii_case(o)).map(|s| s.pos));
+                        if let (Some(n), Some(pos)) = (w.node_mut(id), own_pos) {
+                            n.pivot = n.pivot.or(Some(pos));
+                        }
+                        let from = own_pos.map_or_else(|| w.pivot_world(id), |p| w.affine(id).transform_point3(p));
+                        w.translate(id, (at - from).round().as_ivec3());
+                        None
+                    }
+                    _ => None,
+                }
+            });
+            tree_changed(ctx);
+            if linked == Some(false) {
+                bail!("can't attach `{}` to something attached to it", ctx.scene.world.label(id));
+            }
+            let (lo, size) = ctx.scene.world.bounds(id).unwrap_or_default();
+            let w = &ctx.scene.world;
+            let to = w.node(id).and_then(|n| n.parent).filter(|&p| p != crate::world::ROOT).map(|p| format!(", attached to `{}`", w.label(p))).unwrap_or_default();
+            Ok(vec![text(format!("`{}` now at {:?}, size {:?}{to}", w.label(id), arr(lo), arr(size)))])
+        }
+        "set_pivot" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            let w = &ctx.scene.world;
+            let pivot = match get(a, "pivot") {
+                Some(Value::String(s)) if s == "center" => None,
+                Some(Value::String(s)) if s == "bottom" => {
+                    let (_, size) = w.bounds(id).context("empty")?;
+                    Some(w.from_part(id, Vec3::new(size.x as f32 * 0.5, size.y as f32 * 0.5, 0.0)))
+                }
+                Some(v) => Some(w.from_part(id, vec3_value(v).context("pivot is [x, y, z], \"center\" or \"bottom\"")?)),
+                None => bail!("missing `pivot`"),
+            };
+            ctx.scene.change(|w| w.node_mut(id).map(|n| n.pivot = pivot));
+            tree_changed(ctx);
+            let w = &ctx.scene.world;
+            Ok(vec![text(format!("`{}` pivot at {:?} (part coordinates), {:?} world", w.label(id), w.to_part(id, w.pivot_local(id)).to_array(), w.pivot_world(id).to_array()))])
+        }
+        "set_socket" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            let name = string(a, "name").context("missing `name`")?.trim().to_string();
+            if name.is_empty() || name.contains(['|', ':']) {
+                bail!("socket names can't be empty or contain | or :");
+            }
+            let pos = match get(a, "position") {
+                Some(v) => Some(ctx.scene.world.from_part(id, vec3_value(v).context("position is [x, y, z]")?)),
+                None => None,
+            };
+            let existed = ctx.scene.world.node(id).is_some_and(|n| n.sockets.iter().any(|s| s.name == name));
+            if pos.is_none() && !existed {
+                bail!("`{}` has no socket `{name}`", ctx.scene.world.label(id));
+            }
+            ctx.scene.change(|w| {
+                let Some(n) = w.node_mut(id) else { return };
+                n.sockets.retain(|s| s.name != name);
+                if let Some(pos) = pos {
+                    n.sockets.push(crate::world::Socket { name: name.clone(), pos });
+                }
+            });
+            tree_changed(ctx);
+            let w = &ctx.scene.world;
+            Ok(vec![text(match pos {
+                Some(_) => format!("Socket `{name}` on `{}` at {:?} world", w.label(id), w.socket_world(id, &name).unwrap_or_default().to_array()),
+                None => format!("Removed socket `{name}`"),
+            })])
+        }
+        "modify_part" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            let label = ctx.scene.world.label(id);
+            let msg = match string(a, "action").context("missing `action`")? {
+                "rename" => {
+                    let name = string(a, "name").context("rename needs `name`")?.trim().to_string();
+                    ctx.scene.change(|w| w.node_mut(id).map(|n| n.name = name.clone()));
+                    format!("Renamed `{label}` to `{name}`")
+                }
+                "duplicate" => {
+                    let width = ctx.scene.world.bounds(id).map_or(0, |b| b.1.x);
+                    let offset = opt_ivec3(a, "offset")?.unwrap_or(IVec3::new(width + 1, 0, 0));
+                    let name = string(a, "name").map(|n| n.trim().to_string());
+                    let copy = ctx.scene.change(|w| {
+                        let c = w.duplicate(id)?;
+                        w.translate(c, offset);
+                        if let (Some(n), Some(name)) = (w.node_mut(c), name) {
+                            n.name = name;
+                        }
+                        Some(c)
+                    });
+                    let copy = copy.context("can't duplicate the root")?;
+                    format!("Copied `{label}` to `{}` (id {copy})", ctx.scene.world.label(copy))
+                }
+                "delete" => {
+                    let mut left = ctx.scene.world.clone();
+                    left.delete(id);
+                    if left.models().is_empty() {
+                        bail!("can't delete the last part");
+                    }
+                    ctx.scene.change(|w| w.delete(id));
+                    format!("Deleted `{label}`")
+                }
+                act @ ("hide" | "show") => {
+                    ctx.scene.change(|w| w.node_mut(id).map(|n| n.hidden = act == "hide"));
+                    format!("{} `{label}`", if act == "hide" { "Hid" } else { "Showed" })
+                }
+                "detach" => {
+                    if !ctx.scene.change(|w| w.detach(id)) {
+                        bail!("`{label}` isn't attached to anything");
+                    }
+                    format!("Detached `{label}`")
+                }
+                "ungroup" => {
+                    if !ctx.scene.world.node(id).is_some_and(|n| n.is_group()) {
+                        bail!("`{label}` isn't a group");
+                    }
+                    ctx.scene.change(|w| w.ungroup(id));
+                    format!("Ungrouped `{label}`")
+                }
+                other => bail!("unknown action `{other}`"),
+            };
+            tree_changed(ctx);
+            Ok(vec![text(msg)])
+        }
+        "group_parts" => {
+            let parts = get(a, "parts").and_then(Value::as_array).context("missing `parts`")?;
+            let ids = parts.iter().map(|p| find_part(ctx.scene, Some(p))).collect::<Result<Vec<_>>>()?;
+            let name = string(a, "name").unwrap_or_default().trim().to_string();
+            let g = ctx.scene.change(|w| {
+                let g = w.group(&ids)?;
+                if let Some(n) = w.node_mut(g) {
+                    n.name = name;
+                }
+                Some(g)
+            });
+            let g = g.context("nothing to group")?;
+            tree_changed(ctx);
+            Ok(vec![text(format!("Grouped {} into `{}` (id {g})", ids.len(), ctx.scene.world.label(g)))])
+        }
         "get_scene_info" => {
             let v = &ctx.scene.volume;
             let mut counts = [0usize; 256];
@@ -428,7 +823,10 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "selected": ctx.ed.editor.selected_count(),
                 "file": ctx.ed.source.as_ref().map(|p| p.display().to_string()),
                 "save_path": ctx.ed.save_path.display().to_string(),
-                "can_undo": ctx.ed.editor.can_undo(),
+                "can_undo": ctx.ed.editor.can_undo() || ctx.scene.can_undo_tree(),
+                "editing_part": ctx.scene.editing().map(|id| ctx.scene.world.label(id)),
+                "part_position": arr(ctx.scene.origin),
+                "parts": ctx.scene.world.models().len(),
                 "camera": { "yaw": cam.yaw.to_degrees(), "pitch": cam.pitch.to_degrees(), "distance": cam.dist, "target": cam.target.to_array() },
             });
             Ok(vec![text(serde_json::to_string_pretty(&info)?)])
@@ -886,7 +1284,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let steps = int(a, "steps").unwrap_or(1).max(1);
             let mut done = 0;
             for _ in 0..steps {
-                let ok = if name == "undo" { ctx.ed.editor.undo(&mut ctx.scene.volume) } else { ctx.ed.editor.redo(&mut ctx.scene.volume) };
+                let ok = app::history_step(ctx.scene, ctx.ed, name == "redo");
                 if !ok {
                     break;
                 }

@@ -137,7 +137,8 @@ pub fn export(format: Format, scene: &Scene, path: &Path) -> Result<Vec<PathBuf>
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let v = &scene.volume;
+    let flat = scene.flat();
+    let v = &*flat;
     let pal = &scene.palette;
     let mut files = vec![path.clone()];
     match format {
