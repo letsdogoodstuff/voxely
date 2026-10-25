@@ -9,6 +9,7 @@ mod export;
 mod gltf;
 mod gltf_import;
 mod gpu;
+mod import;
 mod grid;
 mod mcp;
 mod modeler;
