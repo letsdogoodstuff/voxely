@@ -148,7 +148,7 @@ fn autosave(ctx: &mut Ctx, when: &str) {
     let n = ctx.ed.tools.inspect.unsaved;
     let path = ctx.ed.save_path.clone();
     let when = if when.is_empty() { String::new() } else { format!(" {when}") };
-    let note = match app::save_project(ctx.scene, ctx.ed, path.clone()) {
+    let note = match app::save_project(ctx.r, ctx.scene, ctx.ed, path.clone()) {
         Ok(p) => format!("Autosaved {} to {}{when}.", plural(n, "edit"), p.display()),
         Err(e) => format!("Autosave to {} failed ({e:#}); call save_file with a path to keep this work.", path.display()),
     };

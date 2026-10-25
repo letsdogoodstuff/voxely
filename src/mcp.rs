@@ -23,11 +23,7 @@ pub fn socket_path() -> PathBuf {
 
 /// MagicaVoxel's install folder (for shaders, palettes and models).
 pub(crate) fn assets_dir(arg: Option<PathBuf>) -> Option<PathBuf> {
-    arg.or_else(|| std::env::var_os("VOXELY_ASSETS").map(PathBuf::from)).or_else(|| {
-        let home = std::env::var_os("HOME")?;
-        let guess = PathBuf::from(home).join("Downloads/MagicaVoxel-0.99.6.2-macos-10.15");
-        guess.join("vox").is_dir().then_some(guess)
-    })
+    arg.or_else(app::magicavoxel_dir)
 }
 
 /// The in-process session used when no window is open.

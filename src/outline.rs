@@ -36,6 +36,18 @@ pub enum TreeOp {
     Attach(usize, usize, Option<String>),
     /// Stop following; stays where it is.
     Detach(usize),
+    /// Timeline settings.
+    SetAnim(crate::anim::Anim),
+    /// Key a node's pose on the current frame, or remove that key.
+    Key(usize),
+    DeleteKey(usize),
+    /// Flipbook: own voxels from the current frame on, or drop them.
+    SplitFrame(usize),
+    MergeFrame(usize),
+    /// Add a rig template (true: four-legged).
+    AddRig(bool),
+    /// Key a motion preset onto the rig over this many frames.
+    Motion(String, u32),
     /// New pivot, free rotation and sockets for a node. `true` starts an
     /// undo step (false continues a drag).
     Extras(usize, Extras, bool),
@@ -110,6 +122,8 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
         ui.set_max_width(ui.available_width());
         CollapsingHeader::new("Objects").default_open(true).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("tree").max_height(260.0).show(ui, |ui| {
+                // Rigs nest deep; keep names readable.
+                ui.spacing_mut().indent = 8.0;
                 for &c in w.node(ROOT).map(|n| n.children()).unwrap_or_default() {
                     row(ui, w, c, picked, scene.editing(), cmds);
                 }
@@ -132,6 +146,13 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                     cmds.push(Command::EditPart(picked[0]));
                 }
                 ui.end_row();
+            });
+        });
+        CollapsingHeader::new("Rig").default_open(false).show(ui, |ui| {
+            ui.weak("A character of blocks with joints, ready for the motions in the timeline. Redraw each part to taste.");
+            ui.horizontal_wrapped(|ui| {
+                op(ui, cmds, "+ Humanoid", "Hips, torso, head, two-piece arms and legs", true, TreeOp::AddRig(false));
+                op(ui, cmds, "+ Four-legged", "Body, head, tail and four legs", true, TreeOp::AddRig(true));
             });
         });
         CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {

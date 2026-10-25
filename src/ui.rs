@@ -86,9 +86,15 @@ pub enum Command {
     Export(crate::export::Format),
     /// Switch between editing a model and the World view [Tab].
     ToggleWorld,
+    /// Show or hide the Preferences window [Ctrl+,].
+    Preferences,
     /// Edit this node's model (a group's first model).
     EditPart(usize),
     Tree(crate::outline::TreeOp),
+    /// Show this animation frame.
+    Frame(u32),
+    /// Pick a glTF file to import clips from (None), or import clip k.
+    ImportAnimation(Option<(PathBuf, usize)>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -485,6 +491,8 @@ pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, history: (bool, boo
         ui.add_space(24.0);
         ui.label(egui::RichText::new(name).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            command(ui, cmds, "Preferences", "Preferences [Ctrl+,]", Command::Preferences);
+            ui.separator();
             command(ui, cmds, "Save As", "Save as [Ctrl+Shift+S]", Command::SaveAs);
             command(ui, cmds, "Save", "Save [Ctrl+S]", Command::Save);
             command(ui, cmds, "Open", "Open [Ctrl+O]", Command::Open);
@@ -500,6 +508,26 @@ pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, history: (bool, boo
     });
 }
 
+/// The Preferences window. Returns true when a preference changed.
+pub fn preferences_window(ctx: &egui::Context, open: &mut bool, prefs: &mut crate::prefs::Prefs, in_use: f32) -> bool {
+    let before = prefs.clone();
+    // Under the Preferences button, at the right of the top bar.
+    let window = egui::Window::new("Preferences").open(open).collapsible(false).resizable(false);
+    window.anchor(egui::Align2::RIGHT_TOP, [-8.0, 40.0]).show(ctx, |ui| {
+        ui.label(egui::RichText::new("Interface scale").strong());
+        ui.horizontal_wrapped(|ui| {
+            for s in crate::prefs::SCALES {
+                ui.selectable_value(&mut prefs.ui_scale, s, format!("{}%", (s * 100.0).round()));
+            }
+        });
+        ui.label(egui::RichText::new("Bigger [Ctrl+=]  Smaller [Ctrl+-]  100% [Ctrl+0]").weak().small());
+        if in_use < prefs.ui_scale - 1e-3 {
+            ui.label(format!("Showing {}% so the panels fit this window; widen it for more.", (in_use * 100.0).round()));
+        }
+    });
+    *prefs != before
+}
+
 /// What the bottom bar shows and changes.
 pub struct Status<'a> {
     pub options: Option<&'a mut ModelerOptions>,
@@ -510,6 +538,8 @@ pub struct Status<'a> {
     /// Free camera: rotating turns the view around the eye.
     pub free: &'a mut bool,
     pub agent: &'a mut crate::agents::AgentState,
+    /// The animation timeline is showing.
+    pub timeline: &'a mut bool,
     pub hint: &'a str,
 }
 
@@ -557,6 +587,7 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
         command(ui, cmds, "Reset", "Reset camera [F12]", Command::ResetCamera);
         command(ui, cmds, "Snap", "Snapshot [6]", Command::Snapshot);
         ui.separator();
+        ui.toggle_value(s.timeline, "Anim").on_hover_text("Animation timeline");
         crate::agents::badge(ui, s.agent);
         ui.separator();
         ui.weak(s.hint);

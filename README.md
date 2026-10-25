@@ -73,6 +73,8 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Area | Tools |
 |---|---|
 | Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
+| Animation | `set_animation`, `go_to_frame`, `play` (plays it in the window), `set_keyframe`, `delete_keyframe`, `new_drawing`, `remove_drawing`, `frame_strip` (several frames in one image) |
+| Rigs | `create_rig` (humanoid, quadruped), `apply_motion` (idle, walk, run, jump, attack, wave, death, quad_walk, quad_idle), `import_animation` (glTF clips) |
 | Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup, detach), `group_parts` |
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
 | Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid, frustum, torus, capsule, rounded_box, wedge; any `rotation`), `draw_line`, `draw_tube` (curves with tapering radius), `extrude_polygon`, `set_symmetry` (mirror every edit) |
@@ -136,6 +138,29 @@ still opens there, just without them):
   In `.vox` files an attached chain is saved as a MagicaVoxel group, so MagicaVoxel shows and moves
   it as one object. Positions are whole voxels, so a socket on a voxel corner and one on a voxel
   center line up to within half a voxel.
+
+## Animation
+
+Click **Anim** in the bottom bar for the timeline: play / pause (`/`), step frames (`,` `.`), frame
+count, speed, loop, and smooth (blended) or stepped keys. Frames are numbered from 0.
+
+- **Keyframes**: with more than one frame, moving or turning a part keys it on the current frame
+  (the first key off frame 0 also keys frame 0 with where it was). The timeline's **Key** /
+  **Remove key** buttons work on the picked part, and its keys show as diamonds. Keys blend about
+  the part's pivot, and attached parts follow, so animate from the root down.
+- **Flipbook drawings**: **New drawing here** gives the picked part its own copy of its voxels from
+  this frame on, to redraw (a blink, a lifted foot). Drawings show as squares.
+- Both are saved the way MagicaVoxel stores animation (`nTRN` frames, `nSHP` models with `_f`).
+- **Rigs and motions**: World panel ▸ Rig adds a humanoid or four-legged rig of jointed blocks
+  (redraw each part as your character). The timeline's motion menu keys a ready-made motion onto
+  it: idle, walk, run, jump, attack, wave, death, quad_walk, quad_idle.
+- **Importing clips**: **Import...** reads the clips in a `.glb` / `.gltf` file and retargets one onto
+  the rig (picked part's rig, or the first one): joints are matched to parts by name (voxely, Mixamo,
+  Unreal and Rigify naming), rest poses are lined up so T-pose clips drive arms-down rigs, each part
+  turns rigidly like its joint, and the hips carry the clip's movement, scaled to the rig. A good
+  free source is Quaternius's [Universal Animation Library](https://quaternius.com/packs/universalanimationlibrary.html)
+  (CC0, 45 clips in the free Standard pack; use the Godot `.glb`).
+- **glTF export** includes the animation as one clip (sampled every frame; drawings switch by scale).
 
 ## Scripting
 

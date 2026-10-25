@@ -427,6 +427,29 @@ fn flag(d: &Dict, k: &str) -> Option<bool> {
     d.get(k).map(|s| s.trim() == "1")
 }
 
+/// The render chunk for settings MagicaVoxel has no key for.
+const VOXELY: &str = "_voxely";
+
+fn linear_to_srgb(c: Vec3) -> Vec3 {
+    let f = |v: f32| if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+    Vec3::new(f(c.x), f(c.y), f(c.z))
+}
+
+fn rgb_255(c: Vec3) -> String {
+    let c = (c.clamp(Vec3::ZERO, Vec3::ONE) * 255.0).round();
+    format!("{} {} {}", c.x as u8, c.y as u8, c.z as u8)
+}
+
+/// A linear color as `color` reads it back.
+fn srgb_255(c: Vec3) -> String {
+    rgb_255(linear_to_srgb(c))
+}
+
+/// A scattering ratio as `raw_color` reads it back.
+fn raw_255(c: Vec3) -> String {
+    rgb_255(c)
+}
+
 impl RenderSettings {
     pub fn from_vox(f: &VoxFile) -> Self {
         let mut s = Self::default();
@@ -522,12 +545,172 @@ impl RenderSettings {
             s.ground_color = color(d, "_color").unwrap_or(s.ground_color);
             s.ground = flag(d, "_enable").unwrap_or(s.ground);
         }
+        if let Some(d) = f.render.get("_bg") {
+            s.bg_color = color(d, "_color").unwrap_or(s.bg_color);
+            if flag(d, "_enable") == Some(true) {
+                s.bg_mode = BgMode::Color;
+            }
+        }
+        if let Some(d) = f.render.get("_edge") {
+            s.edge_color = color(d, "_color").unwrap_or(s.edge_color);
+            s.edge_width = num(d, "_width").unwrap_or(s.edge_width);
+            s.show_edges = flag(d, "_enable").unwrap_or(s.show_edges);
+        }
+        if let Some(d) = f.render.get("_grid") {
+            s.grid_color = color(d, "_color").unwrap_or(s.grid_color);
+            s.grid_spacing = num(d, "_spacing").map(|v| (v as u32).clamp(1, 1024)).unwrap_or(s.grid_spacing);
+            s.grid_width = num(d, "_width").unwrap_or(s.grid_width);
+            s.show_grid = flag(d, "_enable").unwrap_or(s.show_grid);
+        }
+        // Newer files keep the display toggles here.
         if let Some(d) = f.render.get("_setting") {
             s.ground = flag(d, "_ground").unwrap_or(s.ground);
+            s.show_grid = flag(d, "_grid").unwrap_or(s.show_grid);
+            s.show_edges = flag(d, "_edge").unwrap_or(s.show_edges);
+            if flag(d, "_bg_c") == Some(true) {
+                s.bg_mode = BgMode::Color;
+            }
+            if flag(d, "_bg_a") == Some(true) {
+                s.bg_mode = BgMode::Transparent;
+            }
         }
         // Depth of field is opt-in: files store an aperture even when DOF is off.
         s.aperture = 0.0;
+        if let Some(d) = f.render.get(VOXELY) {
+            s.read_voxely(d);
+        }
         s
+    }
+
+    /// Settings MagicaVoxel has no key for, saved by voxely.
+    fn read_voxely(&mut self, d: &Dict) {
+        let s = self;
+        s.projection = match num(d, "_proj").map(|v| v as i32) {
+            Some(1) => Projection::Orthographic,
+            Some(2) => Projection::Stereographic,
+            Some(3) => Projection::Panorama,
+            Some(4) => Projection::Cylindrical,
+            Some(_) => Projection::Perspective,
+            None => s.projection,
+        };
+        s.aperture = num(d, "_dof").unwrap_or(s.aperture);
+        s.bloom = flag(d, "_bloom").unwrap_or(s.bloom);
+        s.denoise = flag(d, "_denoise").unwrap_or(s.denoise);
+        s.denoise_view = match num(d, "_denoise_view").map(|v| v as i32) {
+            Some(1) => DenoiseView::Original,
+            Some(2) => DenoiseView::Split,
+            Some(_) => DenoiseView::Denoised,
+            None => s.denoise_view,
+        };
+        s.bg_mode = match num(d, "_bg").map(|v| v as i32) {
+            Some(1) => BgMode::Color,
+            Some(2) => BgMode::Transparent,
+            Some(_) => BgMode::Sky,
+            None => s.bg_mode,
+        };
+        s.max_diffuse = num(d, "_diffuse").map_or(s.max_diffuse, |v| v as u32);
+        s.max_specular = num(d, "_specular").map_or(s.max_specular, |v| v as u32);
+        s.max_scatter = num(d, "_scatter").map_or(s.max_scatter, |v| v as u32);
+        s.clamp = num(d, "_clamp").unwrap_or(s.clamp);
+        s.translucent_shadows = flag(d, "_tr_shadow").unwrap_or(s.translucent_shadows);
+        s.grid_ground_only = flag(d, "_grid_ground").unwrap_or(s.grid_ground_only);
+        if let Some(p) = d.get("_ibl_path").filter(|p| !p.is_empty()) {
+            s.ibl_path = Some(PathBuf::from(p));
+        }
+    }
+
+    /// Write these settings into a file's render chunks, MagicaVoxel's keys
+    /// first, keeping any keys and chunks voxely doesn't know.
+    pub fn write_vox(&self, dicts: &mut Vec<Dict>) {
+        let s = self;
+        let b = |v: bool| if v { "1" } else { "0" }.to_string();
+        let n = |v: f32| v.to_string();
+        let mut put = |ty: &str, kv: Vec<(&str, String)>| {
+            let i = match dicts.iter().position(|d| d.get("_type").is_some_and(|t| t == ty)) {
+                Some(i) => i,
+                None => {
+                    dicts.push(Dict::from([("_type".to_string(), ty.to_string())]));
+                    dicts.len() - 1
+                }
+            };
+            for (k, v) in kv {
+                dicts[i].insert(k.to_string(), v);
+            }
+        };
+        put("_inf", vec![
+            ("_i", n(s.sun_intensity)),
+            ("_k", srgb_255(s.sun_color)),
+            ("_angle", format!("{} {}", s.sun_pitch, s.sun_yaw)),
+            ("_area", n(s.sun_area)),
+            ("_disk", b(s.sun_disk)),
+        ]);
+        put("_uni", vec![("_i", n(s.sky_intensity)), ("_k", srgb_255(s.sky_color))]);
+        let mode = match s.env_mode {
+            EnvMode::Uniform => 0,
+            EnvMode::Atmosphere => 1,
+            EnvMode::Image => 2,
+        };
+        put("_env", vec![("_mode", mode.to_string())]);
+        put("_ibl", vec![("_i", n(s.ibl_intensity)), ("_rot", n(s.ibl_rotation))]);
+        put("_atm", vec![
+            ("_ray_d", n(s.rayleigh_density)),
+            ("_ray_k", raw_255(s.rayleigh_color)),
+            ("_mie_d", n(s.mie_density)),
+            ("_mie_k", raw_255(s.mie_color)),
+            ("_mie_g", n(s.mie_g)),
+            ("_o3_d", n(s.ozone_density)),
+            ("_o3_k", raw_255(s.ozone_color)),
+        ]);
+        put("_fog_uni", vec![("_d", n(s.fog_density)), ("_k", srgb_255(s.fog_color)), ("_g", n(s.fog_g))]);
+        // MagicaVoxel's projection tabs; the rest are voxely's own.
+        let proj = match s.projection {
+            Projection::Stereographic => 1,
+            Projection::Panorama => 2,
+            _ => 0,
+        };
+        let mut lens = vec![("_proj", proj.to_string()), ("_fov", n(s.fov)), ("_blade_n", s.blades.to_string()), ("_blade_r", n(s.blade_rotation))];
+        if s.aperture > 0.0 {
+            lens.push(("_aperture", n(s.aperture)));
+        }
+        put("_lens", lens);
+        put("_film", vec![("_expo", n(s.exposure)), ("_vig", n(s.vignette)), ("_aces", b(s.aces)), ("_gam", n(s.gamma))]);
+        put("_bloom", vec![
+            ("_mix", n(s.bloom_mix)),
+            ("_scale", n(s.bloom_scale)),
+            ("_aspect", n(s.bloom_aspect)),
+            ("_threshold", n(s.bloom_threshold)),
+        ]);
+        put("_ground", vec![("_color", srgb_255(s.ground_color)), ("_enable", b(s.ground))]);
+        put("_bg", vec![("_color", srgb_255(s.bg_color)), ("_enable", b(s.bg_mode == BgMode::Color))]);
+        put("_edge", vec![("_color", srgb_255(s.edge_color)), ("_width", n(s.edge_width)), ("_enable", b(s.show_edges))]);
+        put("_grid", vec![
+            ("_color", srgb_255(s.grid_color)),
+            ("_spacing", s.grid_spacing.to_string()),
+            ("_width", n(s.grid_width)),
+            ("_enable", b(s.show_grid)),
+        ]);
+        put("_setting", vec![
+            ("_ground", b(s.ground)),
+            ("_grid", b(s.show_grid)),
+            ("_edge", b(s.show_edges)),
+            ("_bg_c", b(s.bg_mode == BgMode::Color)),
+            ("_bg_a", b(s.bg_mode == BgMode::Transparent)),
+        ]);
+        put(VOXELY, vec![
+            ("_proj", (s.projection as u32).to_string()),
+            ("_dof", n(s.aperture)),
+            ("_bloom", b(s.bloom)),
+            ("_denoise", b(s.denoise)),
+            ("_denoise_view", (s.denoise_view as u32).to_string()),
+            ("_bg", (s.bg_mode as u32).to_string()),
+            ("_diffuse", s.max_diffuse.to_string()),
+            ("_specular", s.max_specular.to_string()),
+            ("_scatter", s.max_scatter.to_string()),
+            ("_clamp", n(s.clamp)),
+            ("_tr_shadow", b(s.translucent_shadows)),
+            ("_grid_ground", b(s.grid_ground_only)),
+            ("_ibl_path", s.ibl_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
+        ]);
     }
 
     pub fn sun_dir(&self) -> Vec3 {
@@ -643,7 +826,9 @@ impl Scene {
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
         let mats: Vec<(u32, Dict)> =
             (1..256u32).filter_map(|i| material_dict(&self.materials[i as usize]).map(|d| (i, d))).collect();
-        crate::vox::write(path, &self.synced_world(), &self.palette, &mats, &self.render_dicts)
+        let mut render = self.render_dicts.clone();
+        self.settings.write_vox(&mut render);
+        crate::vox::write(path, &self.synced_world(), &self.palette, &mats, &render)
     }
 
     pub fn from_vox(f: &VoxFile) -> Result<Self> {
@@ -656,7 +841,7 @@ impl Scene {
         if cells > 1024 * 1024 * 1024 {
             bail!("scene too large");
         }
-        let render_dicts = f.render_order.iter().filter_map(|k| f.render.get(k).cloned()).collect();
+        let render_dicts = f.render_order.iter().filter(|k| *k != crate::vox::ANIM_TYPE).filter_map(|k| f.render.get(k).cloned()).collect();
         Ok(Self::assemble(world, f.palette.clone(), &f.materials, render_dicts, RenderSettings::from_vox(f)))
     }
 
@@ -871,8 +1056,28 @@ impl Scene {
     /// Change the tree without a new undo step, then refresh the view.
     pub fn apply<R>(&mut self, f: impl FnOnce(&mut World) -> R) -> R {
         let r = f(&mut self.world);
+        // When animating, moves and turns record keys on this frame.
+        if let Some(before) = self.history.last() {
+            self.world.autokey(before);
+        }
         self.view(self.mode);
         r
+    }
+
+    /// Change the tree as one undo step without recording keys (for
+    /// changes to the animation itself).
+    pub fn change_quiet<R>(&mut self, f: impl FnOnce(&mut World) -> R) -> R {
+        self.begin_change();
+        let r = f(&mut self.world);
+        self.view(self.mode);
+        r
+    }
+
+    /// Show another frame of the animation (edits so far are kept).
+    pub fn set_frame(&mut self, frame: u32) {
+        self.store();
+        self.world.set_frame(frame);
+        self.view(self.mode);
     }
 
     /// Recolor every model through `remap` (palette sorting).
@@ -960,6 +1165,157 @@ mod tests {
         assert!((back.materials[30].trans - 0.8).abs() < 1e-4);
     }
 
+    fn save_and_load(s: &Scene) -> Scene {
+        let path = std::env::temp_dir().join(format!("voxely-settings-{}-{:?}.vox", std::process::id(), std::thread::current().id()));
+        s.save(&path).unwrap();
+        let back = Scene::from_vox(&crate::vox::VoxFile::load(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        back
+    }
+
+    #[test]
+    fn render_settings_round_trip() {
+        let mut scene = Scene::empty(IVec3::splat(4));
+        let d = RenderSettings::default();
+        // Every field away from its default.
+        scene.settings = RenderSettings {
+            sun_pitch: 12.5,
+            sun_yaw: 200.0,
+            sun_area: 0.3,
+            sun_intensity: 1.7,
+            sun_color: Vec3::new(1.0, 0.5, 0.25),
+            sun_disk: true,
+            sky_intensity: 1.3,
+            sky_color: Vec3::new(0.2, 0.4, 0.8),
+            env_mode: EnvMode::Image,
+            ibl_path: Some(PathBuf::from("/some/sky.hdr")),
+            ibl_intensity: 2.5,
+            ibl_rotation: 0.25,
+            rayleigh_density: 1.1,
+            rayleigh_color: Vec3::new(0.3, 0.6, 0.9),
+            mie_density: 0.9,
+            mie_color: Vec3::new(0.9, 0.8, 0.7),
+            mie_g: 0.6,
+            ozone_density: 0.5,
+            ozone_color: Vec3::new(0.4, 0.9, 0.5),
+            fog_density: 0.8,
+            fog_color: Vec3::new(0.7, 0.7, 0.9),
+            fog_g: -0.3,
+            translucent_shadows: false,
+            fov: 70.0,
+            projection: Projection::Cylindrical,
+            aperture: 0.75,
+            blades: 6,
+            blade_rotation: 30.0,
+            exposure: 2.5,
+            gamma: 2.8,
+            aces: true,
+            vignette: 0.4,
+            ground: false,
+            ground_color: Vec3::new(0.1, 0.2, 0.3),
+            bloom: true,
+            bloom_mix: 0.7,
+            bloom_scale: 0.3,
+            bloom_aspect: 0.6,
+            bloom_threshold: 2.0,
+            max_diffuse: 9,
+            max_specular: 12,
+            max_scatter: 6,
+            clamp: 300.0,
+            denoise: true,
+            denoise_view: DenoiseView::Split,
+            show_edges: true,
+            edge_color: Vec3::new(1.0, 0.0, 0.0),
+            edge_width: 0.4,
+            show_grid: true,
+            grid_color: Vec3::new(0.0, 1.0, 0.0),
+            grid_spacing: 8,
+            grid_width: 0.2,
+            grid_ground_only: true,
+            bg_mode: BgMode::Transparent,
+            bg_color: Vec3::new(0.5, 0.0, 0.5),
+        };
+        let s = &scene.settings;
+        macro_rules! all_changed {
+            ($($f:ident),*) => {$( assert_ne!(s.$f, d.$f, stringify!($f)); )*};
+        }
+        all_changed!(sun_pitch, sun_yaw, sun_area, sun_intensity, sun_color, sun_disk, sky_intensity, sky_color, env_mode, ibl_path,
+            ibl_intensity, ibl_rotation, rayleigh_density, rayleigh_color, mie_density, mie_color, mie_g, ozone_density, ozone_color,
+            fog_density, fog_color, fog_g, translucent_shadows, fov, projection, aperture, blades, blade_rotation, exposure, gamma, aces,
+            vignette, ground, ground_color, bloom, bloom_mix, bloom_scale, bloom_aspect, bloom_threshold, max_diffuse, max_specular,
+            max_scatter, clamp, denoise, denoise_view, show_edges, edge_color, edge_width, show_grid, grid_color, grid_spacing,
+            grid_width, grid_ground_only, bg_mode, bg_color);
+
+        let mut back = save_and_load(&scene).settings;
+        // Colors are stored as 8-bit; compare them loosely, the rest exactly.
+        for (got, want) in [
+            (&mut back.sun_color, s.sun_color),
+            (&mut back.sky_color, s.sky_color),
+            (&mut back.rayleigh_color, s.rayleigh_color),
+            (&mut back.mie_color, s.mie_color),
+            (&mut back.ozone_color, s.ozone_color),
+            (&mut back.fog_color, s.fog_color),
+            (&mut back.ground_color, s.ground_color),
+            (&mut back.edge_color, s.edge_color),
+            (&mut back.grid_color, s.grid_color),
+            (&mut back.bg_color, s.bg_color),
+        ] {
+            assert!(got.abs_diff_eq(want, 0.01), "{got} vs {want}");
+            *got = want;
+        }
+        assert_eq!(&back, s);
+    }
+
+    #[test]
+    fn edited_magicavoxel_file_keeps_changes() {
+        // Open a file MagicaVoxel wrote, change settings, save, reopen.
+        let path = std::path::Path::new(env!("HOME")).join("Downloads/MagicaVoxel-0.99.6.2-macos-10.15/vox/monu10.vox");
+        if !path.exists() {
+            eprintln!("no MagicaVoxel samples; skipping");
+            return;
+        }
+        let mut scene = Scene::from_vox(&crate::vox::VoxFile::load(&path).unwrap()).unwrap();
+        let before = scene.settings.clone();
+        scene.settings.sun_pitch = 17.0;
+        scene.settings.exposure = 3.5;
+        scene.settings.fog_density = 0.6;
+        scene.settings.show_grid = true;
+        let back = save_and_load(&scene).settings;
+        assert_eq!((back.sun_pitch, back.exposure, back.fog_density, back.show_grid), (17.0, 3.5, 0.6, true));
+        // Untouched settings keep the file's values.
+        assert_eq!((back.sun_yaw, back.fov, back.env_mode, back.gamma), (before.sun_yaw, before.fov, before.env_mode, before.gamma));
+    }
+
+    #[test]
+    fn color_and_off_settings_round_trip() {
+        // The other display modes, and settings switched back off.
+        let mut scene = Scene::empty(IVec3::splat(4));
+        scene.settings.bg_mode = BgMode::Color;
+        scene.settings.projection = Projection::Panorama;
+        scene.settings.env_mode = EnvMode::Atmosphere;
+        let back = save_and_load(&scene).settings;
+        assert_eq!(back.bg_mode, BgMode::Color);
+        assert_eq!(back.projection, Projection::Panorama);
+        assert_eq!(back.env_mode, EnvMode::Atmosphere);
+        assert_eq!(back.aperture, 0.0);
+        assert!(back.ground && !back.show_grid && !back.show_edges && !back.bloom);
+    }
+
+    #[test]
+    fn magicavoxel_display_keys_load() {
+        // Grid, edge and background as MagicaVoxel 0.99.6 writes them.
+        let mut f = crate::vox::VoxFile::default();
+        let dict = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Dict>();
+        f.render.insert("_grid".into(), dict(&[("_type", "_grid"), ("_color", "108 108 108"), ("_spacing", "16"), ("_width", "0.1"), ("_enable", "0")]));
+        f.render.insert("_edge".into(), dict(&[("_type", "_edge"), ("_color", "0 0 0"), ("_width", "0.2"), ("_enable", "0")]));
+        f.render.insert("_setting".into(), dict(&[("_type", "_setting"), ("_grid", "1"), ("_edge", "1"), ("_bg_c", "1")]));
+        let s = RenderSettings::from_vox(&f);
+        assert!(s.show_grid && s.show_edges);
+        assert_eq!(s.grid_spacing, 16);
+        assert!((s.edge_width - 0.2).abs() < 1e-6);
+        assert_eq!(s.bg_mode, BgMode::Color);
+    }
+
     /// The pre-tree flattener, kept as the reference for placement.
     fn reference(f: &VoxFile) -> (IVec3, Vec<(IVec3, u8)>) {
         use crate::vox::Node;
@@ -1005,8 +1361,9 @@ mod tests {
             layer: 0,
             rotation: crate::vox::decode_rotation(r),
             translation: t,
+            frames: vec![[("_r".to_string(), r.to_string()), ("_t".to_string(), format!("{} {} {}", t.x, t.y, t.z))].into()],
         };
-        let shape = |m: i32| Node::Shape { attrs: Dict::new(), models: vec![m] };
+        let shape = |m: i32| Node::Shape { attrs: Dict::new(), models: vec![m], model_frames: vec![0] };
         let group = |c: Vec<i32>| Node::Group { attrs: Dict::new(), children: c };
         // Rotation bytes: 4 identity, 17 = turn about z, 36 = flip y.
         let nodes = [

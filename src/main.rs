@@ -1,18 +1,26 @@
+#![recursion_limit = "512"]
 mod agents;
+mod anim;
 mod app;
 mod control;
 mod edit;
 mod env;
 mod export;
 mod gltf;
+mod gltf_import;
 mod gpu;
 mod mcp;
 mod modeler;
 mod outline;
 mod ops;
 mod palette_ops;
+mod prefs;
+#[cfg(test)]
+mod render_knobs;
+mod rig;
 mod scene;
 mod script;
+mod timeline;
 mod ui;
 mod vox;
 mod world;
@@ -77,7 +85,10 @@ editor controls (MagicaVoxel layout; Cmd works for Ctrl on macOS):
   Ctrl+Z undo  Ctrl+Y redo         Ctrl+S save  Ctrl+Shift+S save as
   Ctrl+O open  Ctrl+P new          Ctrl+G grid  Ctrl+F frame  Ctrl+B bounds
   F1 model/render                  Ctrl+Tab  hide panels
+  Ctrl+, preferences               Ctrl+= / Ctrl+- / Ctrl+0  interface scale
   arrows sun angle                 6  save a PNG snapshot to export/
+
+animation: , / . previous / next frame   / play / pause   (Anim in the bottom bar)
 
 world mode (Tab switches between editing a model and the world):
   click pick object (Shift adds, Alt picks a model inside a group)
@@ -102,6 +113,10 @@ struct Args {
     ui_shot: Option<PathBuf>,
     /// Show the path tracer instead of the modeler in `--ui-shot`.
     pathtrace: bool,
+    /// Interface scale for `--ui-shot` (as chosen in Preferences).
+    ui_scale: Option<f32>,
+    /// Show the Preferences window in `--ui-shot`.
+    prefs_shot: bool,
     proj: Option<scene::Projection>,
     dof: Option<f32>,
     blades: Option<u32>,
@@ -185,6 +200,8 @@ fn parse_args() -> Result<Args> {
             "--fog" => args.fog = Some(val()?.parse()?),
             "--bloom" => args.bloom = true,
             "--pathtrace" => args.pathtrace = true,
+            "--ui-scale" => args.ui_scale = Some(val()?.parse()?),
+            "--prefs" => args.prefs_shot = true,
             "--ui-shot" => args.ui_shot = Some(PathBuf::from(val()?)),
             "--proj" => {
                 use scene::Projection::*;
@@ -234,22 +251,42 @@ fn parse_args() -> Result<Args> {
     Ok(args)
 }
 
-/// MagicaVoxel keeps environment images in an `ibl` folder next to `vox`.
+/// Environment images: the `ibl` folder next to the model's `vox` folder
+/// (MagicaVoxel's layout), then the workspace's and MagicaVoxel's own.
+pub fn ibl_files(model: &Path) -> Vec<PathBuf> {
+    let dirs = [
+        model.parent().and_then(Path::parent).map(|d| d.join("ibl")),
+        Some(app::workspace_dir().join("ibl")),
+        app::magicavoxel_dir().map(|d| d.join("ibl")),
+    ];
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dir in dirs.into_iter().flatten() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut hdrs: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")))
+            .collect();
+        hdrs.sort();
+        files.extend(hdrs.into_iter().filter(|p| seen.insert(std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))));
+    }
+    files
+}
+
+/// The default environment image for a model.
 pub fn find_ibl(model: &Path) -> Option<PathBuf> {
-    let dir = model.parent()?.parent()?.join("ibl");
-    let mut hdrs: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")))
-        .collect();
-    hdrs.sort();
-    hdrs.into_iter().next()
+    ibl_files(model).into_iter().next()
+}
+
+/// The image a file saved, if it is still there, else the default.
+fn ibl_for(saved: Option<PathBuf>, model: &Path) -> Option<PathBuf> {
+    saved.filter(|p| p.is_file()).or_else(|| find_ibl(model))
 }
 
 /// Load a `.vox` file for the editor's Open command.
 pub fn open_vox(path: &Path) -> Result<Scene> {
     let mut scene = Scene::from_vox(&vox::VoxFile::load(path)?)?;
-    scene.settings.ibl_path = find_ibl(path);
+    scene.settings.ibl_path = ibl_for(scene.settings.ibl_path.take(), path);
     Ok(scene)
 }
 
@@ -266,7 +303,7 @@ fn load_scene(args: &Args) -> Result<Scene> {
         None => Scene::from_vox(&vox::VoxFile::load(path)?)?,
     };
     let s = &mut scene.settings;
-    s.ibl_path = args.ibl.clone().or_else(|| find_ibl(path));
+    s.ibl_path = args.ibl.clone().or_else(|| ibl_for(s.ibl_path.take(), path));
     if let Some(m) = args.sky {
         s.env_mode = m;
     }
@@ -392,10 +429,18 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
     });
     let view = tex.create_view(&Default::default());
     let ctx = egui::Context::default();
-    let ppp = 2.0;
+    // Three passes are too few for windows to finish fading in.
+    ctx.all_styles_mut(|s| s.animation_time = 0.0);
+    // A Retina screen; the interface scale multiplies it as in the window.
+    let native = 2.0;
     let panel = ui::PanelState { ibl_files: list_ibl(&args.model, scene.settings.ibl_path.as_ref()) };
     let mut ed = app::EditState::new(1, Some(args.model.clone()), PathBuf::new());
     ed.enabled = r.modeling;
+    ed.prefs.ui_scale = args.ui_scale.unwrap_or(1.0);
+    ed.prefs_open = args.prefs_shot;
+    ed.ui_scale = prefs::effective_scale(ed.prefs.ui_scale, w as f32 / native);
+    ctx.set_zoom_factor(ed.ui_scale);
+    let ppp = native * ed.ui_scale;
     let mut out = None;
     // A few passes so layout and fonts settle; textures upload every pass.
     // The 3D view is fitted between the panels, then rendered.
@@ -410,7 +455,7 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32 / ppp, h as f32 / ppp))),
             ..Default::default()
         };
-        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(native);
         let o = ctx.run_ui(raw, |ui| {
             let a = app::build_ui(ui, &mut r, scene, &mut ed, &panel, true);
             if pass < 2 {
@@ -460,24 +505,14 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Every .hdr next to the model's `ibl` folder, plus the chosen one.
+/// Every environment image the IBL list offers, plus the chosen one.
 fn list_ibl(model: &Path, current: Option<&PathBuf>) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = model
-        .parent()
-        .and_then(Path::parent)
-        .and_then(|d| std::fs::read_dir(d.join("ibl")).ok())
-        .map(|rd| {
-            rd.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("hdr")))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut files = ibl_files(model);
     if let Some(c) = current {
         if !files.contains(c) {
             files.push(c.clone());
         }
     }
-    files.sort();
     files
 }
 

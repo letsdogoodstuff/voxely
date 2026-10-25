@@ -227,7 +227,9 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
 
     let mut out = Canvas::new(tw * cols, th * rows, [24, 24, 24, 255].repeat((tw * cols * th * rows) as usize));
     let mut names = Vec::new();
-    let result = (|| -> Result<()> {
+    let dims = vol.dims;
+    // World mode's pick highlight would tint the parts; agents see real colors.
+    let result = super::unhighlighted(ctx, |ctx| -> Result<()> {
         for (i, &view) in views.iter().enumerate() {
             let (w, h) = (tw as f32, th as f32);
             let sc = if tw.min(th) >= 280 { 2 } else { 1 };
@@ -251,9 +253,9 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             out.blit(&tile, (i as u32 % cols * tw) as i32, (i as u32 / cols * th) as i32);
         }
         Ok(())
-    })();
+    });
     if highlighted {
-        ctx.r.set_highlight(vol.dims, &[]);
+        ctx.r.set_highlight(dims, &[]);
     }
     result?;
     // Tile borders.

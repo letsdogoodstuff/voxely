@@ -176,11 +176,17 @@ pub struct Node {
     /// then z.
     pub tilt: Vec3,
     pub sockets: Vec<Socket>,
+    /// Transform keyframes, sorted by frame (see `anim`).
+    pub keys: Vec<crate::anim::Key>,
+    /// Flipbook models of a part, sorted by frame; empty if it has one.
+    pub flip: Vec<crate::anim::Slot>,
+    /// The flipbook slot whose voxels are in `kind`.
+    pub flip_active: usize,
 }
 
 impl Node {
     fn new(name: &str, parent: Option<usize>, layer: i32, kind: Kind) -> Node {
-        Node { name: name.to_string(), hidden: false, layer, rot: Rot::IDENTITY, t: IVec3::ZERO, parent, children: Vec::new(), kind, pivot: None, tilt: Vec3::ZERO, sockets: Vec::new() }
+        Node { name: name.to_string(), hidden: false, layer, rot: Rot::IDENTITY, t: IVec3::ZERO, parent, children: Vec::new(), kind, pivot: None, tilt: Vec3::ZERO, sockets: Vec::new(), keys: Vec::new(), flip: Vec::new(), flip_active: 0 }
     }
 
     pub fn tilted(&self) -> bool {
@@ -241,6 +247,9 @@ pub struct Layer {
 pub struct World {
     pub nodes: Vec<Option<Node>>,
     pub layers: Vec<Layer>,
+    pub anim: crate::anim::Anim,
+    /// The frame the tree is posed for.
+    pub frame: u32,
 }
 
 pub const ROOT: usize = 0;
@@ -262,7 +271,7 @@ impl World {
 
     /// One model filling the box `[0, size)`.
     pub fn single(volume: Volume) -> World {
-        let mut w = World { nodes: vec![Some(Self::root_group())], layers: vec![Layer { id: 0, name: String::new(), hidden: false }] };
+        let mut w = World { nodes: vec![Some(Self::root_group())], layers: vec![Layer { id: 0, name: String::new(), hidden: false }], anim: Default::default(), frame: 0 };
         w.add_model(ROOT, "", volume, IVec3::ZERO);
         w
     }
@@ -589,6 +598,8 @@ impl World {
         }
         let world = self.place(id);
         let Some(old) = self.node(id).and_then(|n| n.parent) else { return false };
+        let (from, to_frame) = (self.frame(old), self.frame(to));
+        self.rebase_keys(id, from, to_frame);
         if let Some(o) = self.node_mut(old) {
             o.children.retain(|&x| x != id);
         }
@@ -808,7 +819,7 @@ fn read_extras(n: &mut Node, attrs: &crate::vox::Dict) {
 
 impl World {
     pub fn from_vox(f: &VoxFile) -> World {
-        let mut w = World { nodes: vec![Some(Self::root_group())], layers: Vec::new() };
+        let mut w = World { nodes: vec![Some(Self::root_group())], layers: Vec::new(), anim: Default::default(), frame: 0 };
         let mut ids: Vec<i32> = f.layers.keys().copied().collect();
         ids.sort();
         for id in ids {
@@ -837,6 +848,22 @@ impl World {
             },
             _ => {}
         }
+        // Timeline: voxely's settings, or enough frames for the keys with
+        // MagicaVoxel's hold-until-next-key playback.
+        let last = w.nodes.iter().flatten().flat_map(|n| n.keys.iter().map(|k| k.frame).chain(n.flip.iter().map(|s| s.frame))).max();
+        w.anim = match f.render.get(crate::vox::ANIM_TYPE) {
+            Some(d) => {
+                let num = |k: &str| d.get(k).and_then(|v| v.trim().parse::<f32>().ok());
+                crate::anim::Anim {
+                    frames: num("_frames").map_or(1, |v| v.max(1.0) as u32),
+                    fps: num("_fps").unwrap_or(10.0).clamp(0.5, 120.0),
+                    looping: num("_loop").is_none_or(|v| v != 0.0),
+                    smooth: num("_smooth").is_none_or(|v| v != 0.0),
+                }
+            }
+            None => crate::anim::Anim { frames: last.map_or(1, |l| l + 1), smooth: false, ..Default::default() },
+        };
+        w.set_frame(0);
         w
     }
 
@@ -845,11 +872,19 @@ impl World {
         if depth > 64 {
             return;
         }
-        let Some(VoxNode::Transform { attrs, child, layer, rotation, translation }) = f.nodes.get(&trn) else { return };
+        let Some(VoxNode::Transform { attrs, child, layer, rotation, translation, frames }) = f.nodes.get(&trn) else { return };
         let name = attrs.get("_name").cloned().unwrap_or_default();
         let hidden = attrs.get("_hidden").is_some_and(|v| v == "1");
         let mut base = Node { hidden, rot: Rot::from_mat3(*rotation), t: *translation, ..Node::new(&name, Some(parent), *layer, Kind::Group) };
         read_extras(&mut base, attrs);
+        if frames.len() > 1 {
+            for (k, fd) in frames.iter().enumerate() {
+                let (r, t) = crate::vox::frame_transform(fd);
+                let frame = fd.get("_f").and_then(|v| v.trim().parse().ok()).unwrap_or(k as u32);
+                let tilt = fd.get("_vx_tilt").and_then(|s| parse_v3(s)).unwrap_or(Vec3::ZERO);
+                base.set_key(crate::anim::Key { frame, rot: Rot::from_mat3(r), t, tilt });
+            }
+        }
         match f.nodes.get(child) {
             Some(VoxNode::Group { attrs: gattrs, children }) => {
                 let mut n = base;
@@ -858,16 +893,15 @@ impl World {
                 // part's own shape, the rest are attached in its voxel space.
                 let shape = children.first().and_then(|c| match f.nodes.get(c) {
                     Some(VoxNode::Transform { child, .. }) => match f.nodes.get(child) {
-                        Some(VoxNode::Shape { models, .. }) => models.first().and_then(|&m| f.models.get(m as usize)),
+                        Some(VoxNode::Shape { models, model_frames, .. }) => shape_models(f, models, model_frames),
                         _ => None,
                     },
                     _ => None,
                 });
                 match shape.filter(|_| attrs.get("_vx_part").is_some_and(|v| v == "1")) {
-                    Some(m) => {
-                        let v = model_volume(m);
+                    Some((v, flip)) => {
                         let half = v.dims / 2;
-                        n.kind = Kind::Model(v);
+                        (n.kind, n.flip) = (Kind::Model(v), flip);
                         let id = self.push(parent, n);
                         for &c in &children[1..] {
                             self.read_node(f, c, id, depth + 1);
@@ -875,6 +909,7 @@ impl World {
                         for c in self.node(id).map(|n| n.children.clone()).unwrap_or_default() {
                             if let Some(cn) = self.node_mut(c) {
                                 cn.t += half;
+                                cn.keys.iter_mut().for_each(|k| k.t += half);
                             }
                         }
                     }
@@ -886,17 +921,36 @@ impl World {
                     }
                 }
             }
-            Some(VoxNode::Shape { attrs: sattrs, models }) => {
-                // Animated shapes keep their first frame.
-                let Some(m) = models.first().and_then(|&m| f.models.get(m as usize)) else { return };
+            Some(VoxNode::Shape { attrs: sattrs, models, model_frames }) => {
+                let Some((v, flip)) = shape_models(f, models, model_frames) else { return };
                 let mut n = base;
                 n.hidden |= sattrs.get("_hidden").is_some_and(|v| v == "1");
-                n.kind = Kind::Model(model_volume(m));
+                (n.kind, n.flip) = (Kind::Model(v), flip);
                 self.push(parent, n);
             }
             _ => {}
         }
     }
+}
+
+/// A shape's first model, plus flipbook slots when it has several.
+fn shape_models(f: &VoxFile, models: &[i32], frames: &[u32]) -> Option<(Volume, Vec<crate::anim::Slot>)> {
+    let vols: Vec<(u32, Volume)> = models.iter().zip(frames).filter_map(|(&m, &fr)| Some((fr, model_volume(f.models.get(m as usize)?)))).collect();
+    let mut vols = vols.into_iter();
+    let (_, first) = vols.next()?;
+    let rest: Vec<crate::anim::Slot> = vols.map(|(frame, v)| crate::anim::Slot { frame, volume: Some(v) }).collect();
+    if rest.is_empty() {
+        return Some((first, Vec::new()));
+    }
+    let mut flip = vec![crate::anim::Slot { frame: 0, volume: None }];
+    flip.extend(rest);
+    flip.sort_by_key(|s| s.frame);
+    Some((first, flip))
+}
+
+fn parse_v3(s: &str) -> Option<Vec3> {
+    let v: Vec<f32> = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+    (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
 }
 
 fn model_volume(m: &crate::vox::Model) -> Volume {
