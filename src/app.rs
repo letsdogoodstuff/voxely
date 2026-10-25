@@ -1597,7 +1597,10 @@ fn draw_markers(p: &egui::Painter, r: &Renderer, scene: &Scene, ppp: f32, id: us
         r.project(v).map(|(x, y)| egui::pos2(x / ppp, y / ppp))
     };
     let orange = egui::Color32::from_rgb(255, 160, 40);
-    if let Some(c) = at(w.pivot_local(id)) {
+    // Only a pivot someone set, and only in World mode: while editing, the
+    // default pivot would just be a cross in the middle of the model.
+    let pivot = n.pivot.is_some() && scene.mode == Mode::World;
+    if let Some(c) = at(w.pivot_local(id)).filter(|_| pivot) {
         let s = egui::Stroke::new(2.0, orange);
         p.line_segment([c - egui::vec2(6.0, 0.0), c + egui::vec2(6.0, 0.0)], s);
         p.line_segment([c - egui::vec2(0.0, 6.0), c + egui::vec2(0.0, 6.0)], s);

@@ -159,9 +159,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         c = mix(c, u.ghost.rgb, u.ghost.w);
     }
     if (in.data & (1u << 18u)) != 0u {
-        // Selected: tint toward the selection color and outline each voxel.
-        c = mix(c, vec3<f32>(0.25, 0.65, 1.0), 0.45);
-        c = mix(vec3<f32>(0.1, 0.35, 0.9), c, lines(uv, grad, 1.0));
+        // Selected, like MagicaVoxel: the voxel keeps its color, a little
+        // brighter, with a thin white outline.
+        c = mix(c, vec3<f32>(1.0), 0.12);
+        let d = abs(uv - floor(uv + 0.5)) / max(grad, vec2<f32>(1e-6));
+        c = mix(vec3<f32>(1.0), c, smoothstep(0.4, 1.4, min(d.x, d.y)));
     }
     return vec4<f32>(c, 1.0);
 }
