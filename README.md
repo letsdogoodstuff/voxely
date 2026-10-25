@@ -73,6 +73,7 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Area | Tools |
 |---|---|
 | Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
+| Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup, detach), `group_parts` |
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
 | Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid), `draw_line` |
 | Reading | `get_voxels`, `get_slice` (a text map of one layer) |
@@ -85,10 +86,49 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Export | `export`: **gltf** (`.glb` for game engines), plus MagicaVoxel's formats: obj, ply, mc, cube (meshes), xraw, slab, qb, vox (volumes), iso, 2d, slice (sprite images), point (point cloud) |
 
 Conventions:
-- Coordinates are voxel cells `[x, y, z]`, with z up.
+- Coordinates are voxel cells `[x, y, z]`, with z up. Voxel tools work in the edited part's own
+  coordinates; pass `part` to any of them to switch parts first. Part positions are world
+  coordinates of the part's minimum corner.
 - Colors are palette indices 1–255, or `"#rrggbb"`, which picks the nearest palette color.
   Use `set_palette_colors` for exact colors.
 - `screenshot` and `render` return PNG images that the agent can see.
+
+## Parts and the World view
+
+Like MagicaVoxel's World editor, a scene is a tree of models ("parts") and groups, each with a name,
+a hidden flag and a 90° rotation / flip plus a position. `.vox` files keep this tree when opened and
+saved, so files from MagicaVoxel round-trip with their objects, groups, names and layers.
+
+- **Tab** switches between editing one part and the **World** view (also the Edit / World switch above
+  the 3D view). While editing, the other parts show dimmed for reference, and every brush and Edit
+  operation works on the edited part only. Render mode always shows every part.
+- In World view, click a part to pick it (Shift adds, Alt picks a part inside a group), drag to move,
+  double-click to edit. The World panel on the right lists the tree and has New, Copy, Group,
+  Ungroup, Hide, Delete, and rotate / flip / move buttons. MagicaVoxel's World-editor keys work too
+  (arrows and PageUp/PageDown move, -/= and 9/0 turn, Ctrl+R group, Ctrl+H hide, Delete).
+- Undo steps through voxel edits in the current edit session, then whole-part changes.
+- A part's box stays put when you resize or reshape it, so cutting a piece out and fitting it no
+  longer shifts it.
+- Exports other than `.vox` and glTF flatten all visible parts.
+
+### Pivots, free rotation and sockets
+
+These go beyond MagicaVoxel (they are stored in `.vox` attributes MagicaVoxel ignores, so the file
+still opens there, just without them):
+
+- **Pivot**: the point a part or group turns about, e.g. an arm's shoulder or a door's hinge. Default:
+  the center. Set it in the World panel (Center / Bottom buttons or exact values) or with `set_pivot`.
+- **Free rotation**: any angle about the pivot, on top of the exact 90° turns. Shown resampled to the
+  voxel grid; the part is edited upright and on its own. MagicaVoxel shows such parts unrotated.
+- **Sockets**: named attachment points (hand, muzzle, seat). Shown as green dots on picked parts.
+- **Attaching**: a part can be attached to another part, like bones in a skeleton: it then follows
+  that part's moves and turns (raise the arm and the sword in its hand comes along). Set it with
+  "Attached to" in the World panel (with buttons to snap onto the parent's sockets), or
+  `transform_part` with `attach_to: "body:shoulder_r"`, which snaps the part's pivot (or its own
+  socket, `attach_socket`) onto that socket and attaches it. The joint becomes the part's pivot.
+  In `.vox` files an attached chain is saved as a MagicaVoxel group, so MagicaVoxel shows and moves
+  it as one object. Positions are whole voxels, so a socket on a voxel corner and one on a voxel
+  center line up to within half a voxel.
 
 ## glTF export
 
@@ -110,7 +150,12 @@ Name the file `.gltf` instead to get readable JSON with the data embedded.
     `"voxely_material": "cloud"`, `palette_index`, `color`, `density` (extinction per voxel,
     1 voxel = 0.1 m), `phase` and `opacity`. Find that node on import and swap in Godot's
     FogVolume, Unity/Unreal volumetric fog, or a custom shader.
-- Structure: a root node named after the project, with the model and each cloud as child nodes.
+- Structure: the scene tree. A root node named after the project, then a node per group and part
+  with its transform; attached parts are child nodes of their parent part, ready to animate as a
+  rig. Each node's origin is the part's pivot, so rotating it in an engine turns it the same way it
+  turns in voxely. Mirrored parts are baked into their meshes, so every node is a plain rotation
+  (some engines mishandle mirrored nodes). Sockets are empty child nodes (`extras.voxely_socket: true`) to
+  parent weapons, riders or effects to; clouds are child nodes of their part.
 
 Exports pass the Khronos glTF Validator with no errors or warnings (it can't yet check
 `KHR_materials_diffuse_transmission`, which is newer than the validator).

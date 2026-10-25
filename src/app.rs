@@ -16,11 +16,15 @@ use winit::window::{Window, WindowId};
 use crate::edit::{self, Editor, Pick, SelMode, Tool};
 use crate::gpu::{self, Camera, Renderer};
 use crate::ops;
-use crate::scene::{MaterialKind, Projection, Scene};
+use crate::outline::TreeOp;
+use crate::scene::{MaterialKind, Mode, Projection, Scene};
 use crate::ui::{self, Command, Op};
+use crate::world::{Rot, ROOT};
 
 /// Size of a new project, like MagicaVoxel's default.
 const NEW_SIZE: i32 = 40;
+/// Size of a new model made in World mode.
+const NEW_PART: i32 = 20;
 /// Camera slots: 0-9 on the number pad, plus the quick slot (7 / 8).
 const QUICK_SLOT: usize = 10;
 
@@ -61,7 +65,23 @@ pub struct EditState {
     canvas_for: IVec3,
     /// Marquee drag corners in window pixels.
     pub marquee: Option<(Vec2, Vec2)>,
+    pub outline: crate::outline::OutlineState,
+    /// World mode: parts being dragged.
+    pub world_drag: Option<WorldDrag>,
+    /// World mode: last click, for double-click to edit.
+    last_click: Option<(std::time::Instant, usize)>,
+    /// World mode: nodes copied with Ctrl+C.
+    pub part_clipboard: Vec<usize>,
     cameras: [Option<Camera>; QUICK_SLOT + 1],
+}
+
+/// Parts dragged across the plane of the face first clicked.
+pub struct WorldDrag {
+    ids: Vec<usize>,
+    /// World cell first clicked and the plane's axis.
+    anchor: IVec3,
+    axis: usize,
+    moved: IVec3,
 }
 
 impl EditState {
@@ -92,6 +112,10 @@ impl EditState {
             canvas: IVec3::ZERO,
             canvas_for: IVec3::ZERO,
             marquee: None,
+            outline: Default::default(),
+            world_drag: None,
+            last_click: None,
+            part_clipboard: Vec::new(),
             cameras: [None; QUICK_SLOT + 1],
         }
     }
@@ -330,13 +354,185 @@ pub fn save_project(r: &Renderer, scene: &mut Scene, ed: &mut EditState, path: P
 
 /// Push voxel edits to the GPU, refreshing emissive faces if any exist.
 pub fn sync_volume(r: &mut Renderer, scene: &mut Scene, editor: &mut Editor) {
-    r.upload_volume(&scene.volume, editor.selection());
+    let highlight = scene.highlight();
+    r.upload_scene(scene, highlight.as_deref().or(editor.selection()));
     editor.sel_dirty = false;
     let any_emit = scene.materials.iter().any(|m| m.kind == MaterialKind::Emit as u32 && m.emit > 0.0);
     if any_emit || !scene.lights.is_empty() {
         scene.rebuild_lights();
         r.set_lights(&scene.lights, scene.light_power);
     }
+}
+
+/// Refresh the modeler's highlight: selected voxels, or picked parts.
+pub fn sync_selection(r: &mut Renderer, scene: &Scene, editor: &mut Editor) {
+    let highlight = scene.highlight();
+    r.upload_selection(&scene.volume, highlight.as_deref().or(editor.selection()));
+    editor.sel_dirty = false;
+}
+
+/// Run a scene-tree change. Returns whether the view needs uploading.
+pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool {
+    let picked = scene.picked.clone();
+    let w = &scene.world;
+    let top: Vec<usize> = w.node(ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
+    match op {
+        TreeOp::Pick(id, add) => {
+            if !add {
+                scene.picked = vec![id];
+            } else if let Some(k) = picked.iter().position(|&p| p == id) {
+                scene.picked.remove(k);
+            } else {
+                scene.picked.push(id);
+            }
+            return true;
+        }
+        TreeOp::PickAll => {
+            scene.picked = top;
+            return true;
+        }
+        TreeOp::PickNone => {
+            scene.picked.clear();
+            return true;
+        }
+        TreeOp::PickInvert => {
+            scene.picked = top.into_iter().filter(|t| !picked.contains(t)).collect();
+            return true;
+        }
+        _ => {}
+    }
+    match op {
+        TreeOp::New => {
+            let near = picked.first().copied().unwrap_or(ROOT);
+            let at = w.bounds(near).or_else(|| w.bounds(ROOT)).map_or(IVec3::ZERO, |(lo, size)| IVec3::new(lo.x + size.x + 2, lo.y, lo.z.max(0)));
+            let parent = w.node(near).and_then(|n| n.parent).unwrap_or(ROOT);
+            let id = scene.change(|w| w.add_model(parent, "", crate::scene::Volume::new(IVec3::splat(NEW_PART)), at));
+            scene.picked = vec![id];
+        }
+        TreeOp::Delete => {
+            let mut left = scene.world.clone();
+            picked.iter().for_each(|&p| {
+                left.delete(p);
+            });
+            if picked.is_empty() || left.models().is_empty() {
+                return false;
+            }
+            scene.change(|w| picked.iter().for_each(|&p| {
+                w.delete(p);
+            }));
+        }
+        TreeOp::Duplicate => {
+            let copies = scene.change(|w| {
+                picked
+                    .iter()
+                    .filter_map(|&p| {
+                        let width = w.bounds(p)?.1.x;
+                        let c = w.duplicate(p)?;
+                        // Beside the original, so it's easy to see.
+                        w.translate(c, IVec3::new(width + 1, 0, 0));
+                        Some(c)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            scene.picked = copies;
+        }
+        TreeOp::Group if !picked.is_empty() => {
+            if let Some(g) = scene.change(|w| w.group(&picked)) {
+                scene.picked = vec![g];
+            }
+        }
+        TreeOp::Ungroup => {
+            let groups: Vec<usize> = picked.iter().copied().filter(|&p| w.node(p).is_some_and(|n| n.is_group())).collect();
+            if groups.is_empty() {
+                return false;
+            }
+            let children: Vec<usize> = groups.iter().flat_map(|&g| w.node(g).map(|n| n.children().to_vec()).unwrap_or_default()).collect();
+            scene.change(|w| groups.iter().for_each(|&g| {
+                w.ungroup(g);
+            }));
+            scene.picked = children;
+        }
+        TreeOp::Hide(hide) => {
+            scene.change(|w| {
+                if hide {
+                    for &p in &picked {
+                        if let Some(n) = w.node_mut(p) {
+                            n.hidden = true;
+                        }
+                    }
+                } else {
+                    w.nodes.iter_mut().flatten().for_each(|n| n.hidden = false);
+                    w.layers.iter_mut().for_each(|l| l.hidden = false);
+                }
+            });
+        }
+        TreeOp::ToggleHidden(id) => scene.change(|w| {
+            if let Some(n) = w.node_mut(id) {
+                n.hidden ^= true;
+            }
+        }),
+        TreeOp::Move(d) => scene.change(|w| picked.iter().for_each(|&p| w.translate(p, d))),
+        TreeOp::Turn(axis, q) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::turn(axis, q)))),
+        TreeOp::Flip(axis) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::flip(axis)))),
+        TreeOp::Attach(id, to, socket) => {
+            if !scene.change(|w| w.attach_to(id, to, socket.as_deref(), None)) {
+                return false;
+            }
+        }
+        TreeOp::Detach(id) => {
+            scene.change(|w| w.detach(id));
+        }
+        TreeOp::Extras(id, x, begin) => {
+            let set = |w: &mut crate::world::World| {
+                if let Some(n) = w.node_mut(id) {
+                    n.pivot = x.pivot;
+                    n.sockets = x.sockets.clone();
+                }
+                w.set_tilt(id, x.tilt);
+            };
+            if begin {
+                scene.change(set);
+            } else {
+                scene.apply(set);
+            }
+        }
+        TreeOp::Rename(id, name) => scene.change(|w| {
+            if let Some(n) = w.node_mut(id) {
+                n.name = name.trim().to_string();
+            }
+        }),
+        _ => return false,
+    }
+    ed.editor.reset();
+    true
+}
+
+/// Undo (or redo) one step: voxel edits in this edit session first, then
+/// whole-part changes.
+pub(crate) fn history_step(scene: &mut Scene, ed: &mut EditState, forward: bool) -> bool {
+    let e = &mut ed.editor;
+    if scene.editing().is_some() && (if forward { e.can_redo() } else { e.can_undo() }) {
+        return if forward { e.redo(&mut scene.volume) } else { e.undo(&mut scene.volume) };
+    }
+    let done = scene.undo_tree(forward);
+    if done {
+        ed.editor.reset();
+    }
+    done
+}
+
+/// Switch between editing a model and the World view.
+pub(crate) fn set_mode(scene: &mut Scene, ed: &mut EditState, edit: Option<usize>) -> bool {
+    let ok = match edit {
+        Some(id) => scene.edit(id),
+        None => {
+            scene.world_mode();
+            true
+        }
+    };
+    ed.editor.reset();
+    ed.world_drag = None;
+    ok
 }
 
 /// Save the path-traced view as it is to the export folder.
@@ -464,6 +660,28 @@ pub(crate) fn transform(kind: ui::TransformKind, text: &str, v: &crate::scene::V
 /// Run a button or hotkey command.
 pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     let dims = scene.volume.dims;
+    // In World mode the voxel commands act on whole parts, or not at all.
+    let cmd = match (scene.mode, cmd) {
+        (Mode::Edit(_), cmd) => cmd,
+        (_, Command::SelectAll) => Command::Tree(TreeOp::PickAll),
+        (_, Command::SelectNone) => Command::Tree(TreeOp::PickNone),
+        (_, Command::SelectInvert) => Command::Tree(TreeOp::PickInvert),
+        (_, Command::Op(Op::Clear)) => Command::Tree(TreeOp::Delete),
+        (_, Command::Copy) => {
+            ed.part_clipboard = scene.picked.clone();
+            return;
+        }
+        (_, Command::Paste) => {
+            scene.picked = ed.part_clipboard.iter().copied().filter(|&p| scene.world.node(p).is_some()).collect();
+            Command::Tree(TreeOp::Duplicate)
+        }
+        (_, Command::Op(_) | Command::Resize(_) | Command::Cut | Command::RunShader | Command::Transform(..) | Command::PaletteRandom | Command::PatternFromSelection) => {
+            eprintln!("voxel edits need edit mode: pick a model and press Tab");
+            return;
+        }
+        (_, cmd) => cmd,
+    };
+    let reshape = matches!(cmd, Command::Op(_) | Command::Resize(_) | Command::Transform(..));
     let changed = match cmd {
         Command::New => {
             let ibl = r.settings.ibl_path.clone();
@@ -510,8 +728,17 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             }
             false
         }
-        Command::Undo => ed.editor.undo(&mut scene.volume),
-        Command::Redo => ed.editor.redo(&mut scene.volume),
+        Command::Undo => history_step(scene, ed, false),
+        Command::Redo => history_step(scene, ed, true),
+        Command::ToggleWorld => match scene.mode {
+            Mode::Edit(_) => set_mode(scene, ed, None),
+            Mode::World => match scene.picked.first().copied().or_else(|| scene.world.models().first().copied()) {
+                Some(id) => set_mode(scene, ed, Some(id)),
+                None => false,
+            },
+        },
+        Command::EditPart(id) => set_mode(scene, ed, Some(id)),
+        Command::Tree(op) => tree_op(op, scene, ed),
         Command::Op(op) => match apply_op(op, scene, &ed.editor) {
             Some(new) => ed.editor.commit(&mut scene.volume, new),
             None => false,
@@ -543,7 +770,12 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::Focus => {
-            let (lo, hi) = solid_bounds(scene, ed.editor.selection()).unwrap_or((Vec3::ZERO, dims.as_vec3()));
+            let picked = scene.picked.iter().filter(|_| scene.mode == Mode::World).filter_map(|&p| scene.world.bounds(p)).reduce(|(a, s), (b, t)| {
+                let lo = a.min(b);
+                (lo, (a + s).max(b + t) - lo)
+            });
+            let picked = picked.map(|(lo, size)| ((lo - scene.origin).as_vec3(), (lo - scene.origin + size).as_vec3()));
+            let (lo, hi) = picked.or_else(|| solid_bounds(scene, ed.editor.selection())).unwrap_or((Vec3::ZERO, dims.as_vec3()));
             r.camera.target = (lo + hi) * 0.5;
             r.reset();
             false
@@ -609,8 +841,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             None => false,
         },
         Command::PaletteSort => {
-            let (palette, remap) = crate::palette_ops::sort(&scene.palette, &scene.volume);
-            let new = crate::palette_ops::apply_remap(&scene.volume, &remap);
+            let (palette, remap) = crate::palette_ops::sort(&scene.palette, &scene.flat());
             // Materials follow their colors to the new indices.
             let mut materials = scene.materials.clone();
             for (old, &to) in remap.iter().enumerate() {
@@ -627,7 +858,8 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             r.set_palette(&scene.palette);
             // Sorting isn't undoable as one step with the palette, so the
             // voxel remap is committed without history.
-            scene.volume = new;
+            scene.remap(&remap);
+            ed.editor.reset();
             true
         }
         Command::PaletteRandom => {
@@ -684,14 +916,13 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         sync_volume(r, scene, &mut ed.editor);
         // Keep the model in view when the canvas changes size.
         let new = scene.volume.dims;
-        if new != dims {
+        if reshape && new != dims {
             r.camera.target = new.as_vec3() * 0.5;
             r.camera.dist *= new.as_vec3().length() / dims.as_vec3().length();
         }
     }
     if ed.editor.sel_dirty {
-        r.upload_selection(&scene.volume, ed.editor.selection());
-        ed.editor.sel_dirty = false;
+        sync_selection(r, scene, &mut ed.editor);
     }
 }
 
@@ -719,6 +950,21 @@ fn draw_overlay(p: &egui::Painter, r: &Renderer, scene: &Scene, ed: &EditState, 
     // Brush previews show only in the modeler. (The bounding box is drawn
     // by the modeler itself, depth-tested.)
     if !r.modeling || !ed.enabled {
+        return;
+    }
+    for &id in &scene.picked {
+        draw_markers(p, r, scene, ppp, id);
+    }
+    if scene.mode == Mode::World {
+        let painter = p;
+        // Picked parts' boxes.
+        let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 160, 255));
+        for &id in &scene.picked {
+            if let Some((lo, size)) = scene.world.bounds(id) {
+                let lo = lo - scene.origin;
+                outline(painter, r, ppp, lo.as_vec3(), (lo + size).as_vec3(), stroke);
+            }
+        }
         return;
     }
     if let Some((a, b)) = ed.marquee {
@@ -755,6 +1001,30 @@ fn draw_overlay(p: &egui::Painter, r: &Renderer, scene: &Scene, ed: &EditState, 
         let lo = cells.iter().fold(IVec3::MAX, |a, c| a.min(*c));
         let hi = cells.iter().fold(IVec3::MIN, |a, c| a.max(*c));
         outline(p, r, ppp, lo.as_vec3(), (hi + IVec3::ONE).as_vec3(), stroke);
+    }
+}
+
+/// A node's pivot (orange cross) and sockets (green dots with names).
+fn draw_markers(p: &egui::Painter, r: &Renderer, scene: &Scene, ppp: f32, id: usize) {
+    let w = &scene.world;
+    let Some(n) = w.node(id) else { return };
+    // Into the volume's frame: the edited part's own coordinates, or world.
+    let at = |local: Vec3| {
+        let v = if scene.editing() == Some(id) { w.to_part(id, local) } else { w.affine(id).transform_point3(local) - scene.origin.as_vec3() };
+        r.project(v).map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+    };
+    let orange = egui::Color32::from_rgb(255, 160, 40);
+    if let Some(c) = at(w.pivot_local(id)) {
+        let s = egui::Stroke::new(2.0, orange);
+        p.line_segment([c - egui::vec2(6.0, 0.0), c + egui::vec2(6.0, 0.0)], s);
+        p.line_segment([c - egui::vec2(0.0, 6.0), c + egui::vec2(0.0, 6.0)], s);
+    }
+    let green = egui::Color32::from_rgb(90, 220, 120);
+    for sock in &n.sockets {
+        if let Some(c) = at(sock.pos) {
+            p.circle(c, 4.0, green, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            p.text(c + egui::vec2(7.0, -7.0), egui::Align2::LEFT_BOTTOM, &sock.name, egui::FontId::proportional(12.0), green);
+        }
     }
 }
 
@@ -814,7 +1084,9 @@ pub fn build_ui(
         egui::Panel::top("top").show(ui, |ui| {
             let was = r.modeling;
             let mut modeling = r.modeling;
-            ui::top_bar(ui, &mut modeling, &ed.name(), &ed.editor, cmds);
+            let editing = scene.editing().is_some();
+            let history = (editing && ed.editor.can_undo() || scene.can_undo_tree(), editing && ed.editor.can_redo() || scene.can_redo_tree());
+            ui::top_bar(ui, &mut modeling, &ed.name(), history, cmds);
             if r.modeler.is_some() && modeling != was {
                 r.modeling = modeling;
                 ed.enabled = modeling;
@@ -823,8 +1095,10 @@ pub fn build_ui(
         });
         egui::Panel::bottom("status").show(ui, |ui| {
             let hover = ed.hover.filter(|h| !h.on_ground()).map(|h| (h.cell, scene.volume.get(h.cell)));
+            let world = scene.mode == Mode::World;
             let hint = match (r.modeling, ed.editor.tool) {
                 (false, _) => "Rotate [RButton/LButton] : Move [MButton] : Zoom [Wheel]",
+                _ if world => "Pick [LButton] : Add [Shift] : Move [LButton drag, arrows] : Edit [Tab, double-click] : Rotate view [RButton]",
                 (_, Tool::Marquee) => "Select [LButton drag] : Add [Shift] : Remove [Shift+Alt] : Rotate [RButton]",
                 (_, Tool::Region) => "Select region [LButton] : Add [Shift] : Remove [Shift+Alt] : Rotate [RButton]",
                 (_, Tool::RegionRemove) => "Remove region [LButton] : Rotate [RButton] : Pan [MButton]",
@@ -853,11 +1127,20 @@ pub fn build_ui(
             ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &ed.samples, &current, pattern.as_deref(), &mut ed.shaders, ed.export_status.as_deref(), cmds);
         });
         if r.modeling {
-            egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
-            if let Some(m) = r.modeler.as_mut() {
+            let editing = scene.editing().is_some();
+            egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| {
+                ui.add_enabled_ui(editing, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
+            });
+            if !editing {
+                egui::Panel::right("world").exact_size(160.0).resizable(false).show(ui, |ui| crate::outline::panel(ui, scene, &mut ed.outline, cmds));
+            } else if let Some(m) = r.modeler.as_mut() {
                 egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut m.options, &mut ed.transform_text, cmds));
             }
-            egui::Panel::top("viewbar").show(ui, |ui| ui::view_bar(ui, dims, &mut ed.canvas, cmds));
+            let part = scene.editing().map(|id| {
+                let label = scene.world.label(id);
+                if scene.world.tilted(id) { format!("{label} (upright, alone)") } else { label }
+            });
+            egui::Panel::top("viewbar").show(ui, |ui| ui::view_bar(ui, dims, &mut ed.canvas, part.as_deref(), scene.world.models().len(), cmds));
         } else {
             // MagicaVoxel's render layout: Light / Sample / Display on the
             // left, Matter / Camera / Image on the right.
@@ -1138,6 +1421,55 @@ impl App {
             self.redraw_soon();
             return;
         }
+        let world = self.scene.mode == Mode::World;
+        if cmd && world {
+            // MagicaVoxel's World-editor hotkeys.
+            let op = match c.as_str() {
+                "n" => Some(TreeOp::New),
+                "r" if shift => Some(TreeOp::Ungroup),
+                "r" => Some(TreeOp::Group),
+                "h" => Some(TreeOp::Hide(!shift)),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.command(Command::Tree(op));
+                return;
+            }
+        }
+        if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Tab)) {
+            // Tab switches edit / World mode; Ctrl+Tab hides the panels.
+            if cmd {
+                self.show_panel ^= true;
+                self.redraw_soon();
+            } else if self.gfx.as_ref().is_some_and(|g| g.renderer.modeling) {
+                self.command(Command::ToggleWorld);
+            }
+            return;
+        }
+        if world && !cmd && self.gfx.as_ref().is_some_and(|g| g.renderer.modeling) {
+            let mv = |x, y, z| Some(TreeOp::Move(IVec3::new(x, y, z)));
+            let op = match event.logical_key.as_ref() {
+                Key::Named(NamedKey::ArrowLeft) => mv(-1, 0, 0),
+                Key::Named(NamedKey::ArrowRight) => mv(1, 0, 0),
+                Key::Named(NamedKey::ArrowDown) => mv(0, -1, 0),
+                Key::Named(NamedKey::ArrowUp) => mv(0, 1, 0),
+                Key::Named(NamedKey::PageDown) => mv(0, 0, -1),
+                Key::Named(NamedKey::PageUp) => mv(0, 0, 1),
+                _ => match c.as_str() {
+                    "=" | "+" => Some(TreeOp::Turn(2, -1)),
+                    "-" => Some(TreeOp::Turn(2, 1)),
+                    "9" => Some(TreeOp::Turn(0, -1)),
+                    "0" => Some(TreeOp::Turn(0, 1)),
+                    _ => None,
+                },
+            };
+            if let Some(op) = op {
+                if !self.scene.picked.is_empty() {
+                    self.command(Command::Tree(op));
+                }
+                return;
+            }
+        }
         if cmd {
             let command = match c.as_str() {
                 "z" if shift => Some(Command::Redo),
@@ -1195,7 +1527,6 @@ impl App {
                 r.reset();
             }
             Key::Named(NamedKey::F12) => command = Some(Command::ResetCamera),
-            Key::Named(NamedKey::Tab) => self.show_panel ^= true,
             Key::Named(NamedKey::Space) => self.mouse.space = true,
             Key::Named(NamedKey::ArrowLeft) => r.settings.sun_yaw -= 10.0,
             Key::Named(NamedKey::ArrowRight) => r.settings.sun_yaw += 10.0,
@@ -1324,6 +1655,21 @@ impl App {
             let k = cam.dist * 0.0015;
             cam.target += (-right * dx + up * dy) * k;
             g.renderer.reset();
+        } else if let Some(d) = self.edit.world_drag.as_mut().filter(|_| self.mouse.left) {
+            let (ro, rd) = g.renderer.camera_ray(x as f32, y as f32);
+            let origin = self.scene.origin;
+            if let Some(c) = edit::plane_cell(ro, rd, d.axis, d.anchor[d.axis] - origin[d.axis]) {
+                let delta = c + origin - d.anchor;
+                if delta != d.moved {
+                    if d.moved == IVec3::ZERO {
+                        self.scene.begin_change();
+                    }
+                    let (step, ids) = (delta - d.moved, d.ids.clone());
+                    d.moved = delta;
+                    self.scene.apply(|w| ids.iter().for_each(|&id| w.translate(id, step)));
+                    sync_volume(&mut g.renderer, &mut self.scene, &mut self.edit.editor);
+                }
+            }
         } else if self.mouse.left && self.edit.editor.active() {
             let (ro, rd) = g.renderer.camera_ray(x as f32, y as f32);
             let hit = edit::pick(&self.scene.volume, ro, rd);
@@ -1360,6 +1706,42 @@ impl App {
         self.edit.editor.select(&self.scene.volume, cells, mode);
     }
 
+    /// World mode click: pick the part under the cursor (its top-level
+    /// object; Alt picks the model itself) and start dragging it.
+    /// Double-click edits the model.
+    fn world_press(&mut self) {
+        let hit = self.edit.hover.filter(|h| !h.on_ground());
+        let owner = hit.and_then(|h| self.scene.owners.get(self.scene.volume.index(h.cell)).copied()).filter(|&o| o != 0);
+        let Some((hit, model)) = hit.zip(owner.map(|o| o as usize)) else {
+            if !self.modifiers.shift_key() {
+                self.command(Command::Tree(TreeOp::PickNone));
+            }
+            return;
+        };
+        let now = std::time::Instant::now();
+        if self.edit.last_click.is_some_and(|(t, m)| m == model && now.duration_since(t).as_millis() < 400) {
+            self.edit.last_click = None;
+            self.command(Command::EditPart(model));
+            return;
+        }
+        self.edit.last_click = Some((now, model));
+        let w = &self.scene.world;
+        let mut node = model;
+        if !self.modifiers.alt_key() {
+            while let Some(p) = w.node(node).and_then(|n| n.parent).filter(|&p| p != ROOT) {
+                node = p;
+            }
+        }
+        let shift = self.modifiers.shift_key();
+        if shift || !self.scene.picked.contains(&node) {
+            self.command(Command::Tree(TreeOp::Pick(node, shift)));
+        }
+        if self.scene.picked.contains(&node) {
+            let axis = hit.normal.abs().max_position();
+            self.edit.world_drag = Some(WorldDrag { ids: self.scene.picked.clone(), anchor: hit.cell + self.scene.origin, axis, moved: IVec3::ZERO });
+        }
+    }
+
     fn mouse_button(&mut self, button: MouseButton, down: bool) {
         match button {
             MouseButton::Left => {
@@ -1373,6 +1755,9 @@ impl App {
                         g.renderer.camera.target = h.cell.as_vec3() + 0.5 + h.normal.as_vec3() * 0.5;
                         g.renderer.reset();
                     }
+                } else if down && self.edit.enabled && !self.mouse.space && !self.mouse.zoom && self.scene.mode == Mode::World {
+                    self.update_hover();
+                    self.world_press();
                 } else if down && self.edit.enabled && !self.mouse.space && !self.mouse.zoom {
                     self.update_hover();
                     let hover = self.edit.hover;
@@ -1406,6 +1791,9 @@ impl App {
                         self.edit.editor.select_none();
                     }
                 } else if !down {
+                    if self.edit.world_drag.take().is_some() {
+                        self.edit.editor.reset();
+                    }
                     if let Some((a, b)) = self.edit.marquee.take() {
                         self.finish_marquee(a, b);
                     } else if self.edit.editor.active() && self.edit.editor.end(&mut self.scene.volume) {
@@ -1424,8 +1812,7 @@ impl App {
     fn redraw(&mut self) {
         let Some(g) = self.gfx.as_mut() else { return };
         if self.edit.editor.sel_dirty {
-            g.renderer.upload_selection(&self.scene.volume, self.edit.editor.selection());
-            self.edit.editor.sel_dirty = false;
+            sync_selection(&mut g.renderer, &self.scene, &mut self.edit.editor);
         }
         let frame = match g.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -1469,7 +1856,11 @@ impl App {
                 0 => String::new(),
                 n => format!(" — {n} selected"),
             };
-            format!("voxely — {name} — Model — {:?} {:?}{sel}", ed.tool, ed.brush)
+            match self.scene.editing() {
+                Some(id) if self.scene.world.models().len() > 1 => format!("voxely — {name} — {} — {:?} {:?}{sel}", self.scene.world.label(id), ed.tool, ed.brush),
+                Some(_) => format!("voxely — {name} — Model — {:?} {:?}{sel}", ed.tool, ed.brush),
+                None => format!("voxely — {name} — World — {} picked", self.scene.picked.len()),
+            }
         } else {
             format!("voxely — {name} — Render — {} spp", g.renderer.frame)
         };

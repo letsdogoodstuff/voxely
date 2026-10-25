@@ -84,6 +84,11 @@ pub enum Command {
     PaletteRandom,
     /// Export in one of MagicaVoxel's formats (asks where to save).
     Export(crate::export::Format),
+    /// Switch between editing a model and the World view [Tab].
+    ToggleWorld,
+    /// Edit this node's model (a group's first model).
+    EditPart(usize),
+    Tree(crate::outline::TreeOp),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -472,7 +477,8 @@ fn heading(ui: &mut Ui, text: &str) {
 }
 
 /// Top bar: mode tabs, project name, history and file commands.
-pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, e: &Editor, cmds: &mut Vec<Command>) {
+/// `history` is whether undo and redo are possible.
+pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, history: (bool, bool), cmds: &mut Vec<Command>) {
     ui.horizontal(|ui| {
         ui.selectable_value(modeling, true, egui::RichText::new("Model").size(16.0)).on_hover_text("F1");
         ui.selectable_value(modeling, false, egui::RichText::new("Render").size(16.0)).on_hover_text("F1");
@@ -484,10 +490,10 @@ pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, e: &Editor, cmds: &
             command(ui, cmds, "Open", "Open [Ctrl+O]", Command::Open);
             command(ui, cmds, "New", "New [Ctrl+P]", Command::New);
             ui.separator();
-            if ui.add_enabled(e.can_redo(), egui::Button::new("Redo")).on_hover_text("Redo [Ctrl+Y]").clicked() {
+            if ui.add_enabled(history.1, egui::Button::new("Redo")).on_hover_text("Redo [Ctrl+Y]").clicked() {
                 cmds.push(Command::Redo);
             }
-            if ui.add_enabled(e.can_undo(), egui::Button::new("Undo")).on_hover_text("Undo [Ctrl+Z]").clicked() {
+            if ui.add_enabled(history.0, egui::Button::new("Undo")).on_hover_text("Undo [Ctrl+Z]").clicked() {
                 cmds.push(Command::Undo);
             }
         });
@@ -1039,8 +1045,27 @@ pub fn project_panel(
 }
 
 /// Strip above the 3D view: canvas size and fit.
-pub fn view_bar(ui: &mut Ui, dims: IVec3, canvas: &mut IVec3, cmds: &mut Vec<Command>) {
+/// `part` names the model being edited (None in World mode).
+pub fn view_bar(ui: &mut Ui, dims: IVec3, canvas: &mut IVec3, part: Option<&str>, models: usize, cmds: &mut Vec<Command>) {
     ui.horizontal(|ui| {
+        // MagicaVoxel's model / world editor switch.
+        if ui.selectable_label(part.is_some(), "Edit").on_hover_text("Edit the picked model's voxels [Tab]").clicked() && part.is_none() {
+            cmds.push(Command::ToggleWorld);
+        }
+        if ui.selectable_label(part.is_none(), "World").on_hover_text("Arrange whole models and groups [Tab]").clicked() && part.is_some() {
+            cmds.push(Command::ToggleWorld);
+        }
+        let Some(part) = part else {
+            ui.weak(format!("{models} model{}", if models == 1 { "" } else { "s" }));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                command(ui, cmds, "Focus", "Center the view on the picked objects [5]", Command::Focus);
+            });
+            return;
+        };
+        if models > 1 {
+            ui.label(egui::RichText::new(part).strong()).on_hover_text("Parts with a free rotation are edited upright and on their own");
+        }
+        ui.separator();
         command(ui, cmds, "Fit", "Shrink the canvas to the model", Command::Op(Op::Fit));
         ui.separator();
         for axis in 0..3 {

@@ -16,13 +16,15 @@
 //!   material that degrades gracefully: alpha blending with opacity from the
 //!   density works everywhere, and KHR_materials_diffuse_transmission plus
 //!   KHR_materials_volume give a softer look where supported.
-//! - Structure: a root node named after the project with a child node for
-//!   the model and one per cloud.
+//! - Structure: the scene tree. A root node named after the project, then a
+//!   node per group and part with its transform; each node's origin is the
+//!   part's pivot so engines turn it the same way. Sockets are empty child
+//!   nodes (`extras.voxely_socket`), clouds are child nodes of their part.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use glam::Vec3;
+use glam::{Mat3, Quat, Vec3};
 use serde_json::{Value, json};
 
 use crate::export::{dir, greedy_quads};
@@ -160,81 +162,226 @@ fn bytes<T: bytemuck::Pod>(v: &[T]) -> &[u8] {
     bytemuck::cast_slice(v)
 }
 
+/// Faces of one part, grouped into primitives by material kind.
+struct PartMesh {
+    /// (index into `kinds`, vertex data)
+    prims: Vec<(usize, Prim)>,
+}
+
+/// Voxel space (z up, voxels) to glTF (y up, meters): (x, y, z) -> (x, z, -y).
+fn to_gltf(v: Vec3) -> [f32; 3] {
+    [v.x * SCALE, v.z * SCALE, -v.y * SCALE]
+}
+
+fn mat_to_gltf(m: Mat3) -> Mat3 {
+    let c = Mat3::from_cols(Vec3::X, -Vec3::Z, Vec3::Y);
+    c * m * c.transpose()
+}
+
+/// A node's transform as glTF TRS, or a matrix when it mirrors.
+fn node_transform(node: &mut Value, translation: Vec3, linear: Mat3) {
+    let t = to_gltf(translation);
+    let m = mat_to_gltf(linear);
+    if m.determinant() < 0.0 {
+        let a = glam::Affine3A::from_mat3_translation(m, Vec3::from(t));
+        node["matrix"] = json!(glam::Mat4::from(a).to_cols_array());
+        return;
+    }
+    if t != [0.0; 3] {
+        node["translation"] = json!(t);
+    }
+    let q = Quat::from_mat3(&m).normalize();
+    if q.angle_between(Quat::IDENTITY) > 1e-5 {
+        node["rotation"] = json!(q.to_array());
+    }
+}
+
+/// A primitive in voxel space (relative to its pivot) turned into glTF
+/// space through `flip` (identity or a mirror), with triangles rewound
+/// when mirrored so they still face out.
+fn mirror(p: &Prim, flip: Mat3) -> Prim {
+    let mirrored = flip.determinant() < 0.0;
+    let mut indices = p.indices.clone();
+    if mirrored {
+        indices.chunks_exact_mut(3).for_each(|t| t.swap(1, 2));
+    }
+    let dir = |v: Vec3| [v.x, v.z, -v.y];
+    Prim {
+        positions: p.positions.iter().map(|&v| to_gltf(flip * Vec3::from(v))).collect(),
+        normals: p.normals.iter().map(|&n| dir(flip * Vec3::from(n))).collect(),
+        uvs: p.uvs.clone(),
+        indices,
+    }
+}
+
+/// One primitive's buffers, using material `k`.
+fn prim_json(bin: &mut Bin, k: usize, p: &Prim) -> Value {
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for q in &p.positions {
+        for i in 0..3 {
+            lo[i] = lo[i].min(q[i]);
+            hi[i] = hi[i].max(q[i]);
+        }
+    }
+    let pos = bin.accessor(bytes(&p.positions), ARRAY_BUFFER, FLOAT, p.positions.len(), "VEC3", Some((json!(lo), json!(hi))));
+    let nrm = bin.accessor(bytes(&p.normals), ARRAY_BUFFER, FLOAT, p.normals.len(), "VEC3", None);
+    let uv = bin.accessor(bytes(&p.uvs), ARRAY_BUFFER, FLOAT, p.uvs.len(), "VEC2", None);
+    let idx = bin.accessor(bytes(&p.indices), ELEMENT_ARRAY_BUFFER, UNSIGNED_INT, p.indices.len(), "SCALAR", None);
+    json!({ "attributes": { "POSITION": pos, "NORMAL": nrm, "TEXCOORD_0": uv }, "indices": idx, "material": k })
+}
+
+/// What `add_node` writes into.
+struct Out<'a> {
+    nodes: Vec<Value>,
+    meshes: Vec<Value>,
+    bin: &'a mut Bin,
+    scene: &'a Scene,
+    world: &'a crate::world::World,
+    parts: &'a std::collections::HashMap<usize, PartMesh>,
+    kinds: &'a [Kind],
+    project: &'a str,
+    /// One visible model: an unnamed one takes the project's name.
+    only: bool,
+}
+
+/// Add node `id` (and its subtree), placed relative to its parent's
+/// pivot `offset`. Returns its index.
+///
+/// glTF engines don't all handle mirrored nodes well, so mirrors are baked
+/// into meshes instead: `pre` is the mirror the parent baked into its own
+/// mesh, which this node's transform is corrected by.
+fn add_node(id: usize, offset: Vec3, pre: Mat3, o: &mut Out) -> Option<usize> {
+    let (world, kinds) = (o.world, o.kinds);
+    let n = world.node(id)?;
+    if !world.visible(id) {
+        return None;
+    }
+    let pivot = world.pivot_local(id);
+    let linear = crate::world::rot_mat(n.rot) * Mat3::from_quat(n.tilt_quat());
+    // The node's local transform with its origin moved to the pivot.
+    let half = n.volume().map_or(Vec3::ZERO, |v| (v.dims / 2).as_vec3());
+    let translation = n.t.as_vec3() + crate::world::rot_mat(n.rot) * (pivot - half) - offset;
+    let label = if o.only && n.name.is_empty() && !n.is_group() { o.project.to_string() } else { world.label(id) };
+    let mut node = json!({ "name": label });
+    let linear = pre * linear;
+    // Mirrored: flip x in the mesh and children so the node is a rotation.
+    let flip = if linear.determinant() < 0.0 { Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat3::IDENTITY };
+    node_transform(&mut node, pre * translation, linear * flip);
+    let index = o.nodes.len();
+    o.nodes.push(node);
+    let mut children = Vec::new();
+    if let Some(pm) = o.parts.get(&id) {
+        let mut surface = Vec::new();
+        let clouds = pm.prims.iter().filter(|(k, _)| matches!(kinds[*k], Kind::Cloud(_))).count();
+        for (k, p) in &pm.prims {
+            let prim = prim_json(o.bin, *k, &mirror(p, flip));
+            match kinds[*k] {
+                Kind::Surface(_) => surface.push(prim),
+                Kind::Cloud(c) => {
+                    let cname = if clouds == 1 { format!("{label}_cloud") } else { format!("{label}_cloud_{}", c.color) };
+                    o.meshes.push(json!({ "name": format!("{cname}_mesh"), "primitives": [prim] }));
+                    o.nodes.push(json!({ "name": cname, "mesh": o.meshes.len() - 1, "extras": cloud_extras(o.scene, &c) }));
+                    children.push(o.nodes.len() - 1);
+                }
+            }
+        }
+        if !surface.is_empty() {
+            o.meshes.push(json!({ "name": format!("{label}_mesh"), "primitives": surface }));
+            o.nodes[index]["mesh"] = json!(o.meshes.len() - 1);
+        }
+    }
+    for s in &n.sockets {
+        let mut sock = json!({ "name": s.name, "extras": { "voxely_socket": true } });
+        node_transform(&mut sock, flip * (s.pos - pivot), Mat3::IDENTITY);
+        o.nodes.push(sock);
+        children.push(o.nodes.len() - 1);
+    }
+    for &c in n.children() {
+        // Children sit relative to the group's pivot.
+        if let Some(ci) = add_node(c, pivot, flip, o) {
+            children.push(ci);
+        }
+    }
+    if !children.is_empty() {
+        o.nodes[index]["children"] = json!(children);
+    }
+    Some(index)
+}
+
 /// Write `scene` to `path`: binary `.glb`, or `.gltf` JSON with the buffer
 /// embedded as a data URI when the extension is `gltf`.
 pub fn write(scene: &Scene, path: &Path) -> Result<()> {
     let embedded = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gltf"));
     let name = path.file_stem().map_or("model".into(), |s| s.to_string_lossy().into_owned());
-    let v = &scene.volume;
-    let center = v.dims.as_vec3() * 0.5;
-    // Voxel space (z up) to glTF (y up, meters).
-    let place = |p: Vec3| {
-        let q = (p - center) * SCALE;
-        [q.x, q.z, -q.y]
-    };
+    let world = scene.synced_world();
+    let world = &*world;
+    let models: Vec<usize> = world.models().into_iter().filter(|&m| world.visible(m)).collect();
 
-    // Group faces: surfaces by material, clouds by color.
-    let chord = chords(v);
+    // Group faces of each part: surfaces by material, clouds by color.
     let mut kinds: Vec<Kind> = Vec::new();
-    let mut prims: Vec<Prim> = Vec::new();
-    for q in greedy_quads(v) {
-        let m = &scene.materials[q.color as usize];
-        let kind = if m.kind == MaterialKind::Media as u32 {
-            Kind::Cloud(Cloud { color: q.color, density: m.density, phase: m.g, chord: chord[q.color as usize] })
-        } else {
-            Kind::Surface(look(m))
-        };
-        let same = |k: &Kind| match (k, &kind) {
-            (Kind::Surface(a), Kind::Surface(b)) => a == b,
-            (Kind::Cloud(a), Kind::Cloud(b)) => a.color == b.color,
-            _ => false,
-        };
-        let k = match kinds.iter().position(same) {
-            Some(k) => k,
-            None => {
+    let mut parts: std::collections::HashMap<usize, PartMesh> = Default::default();
+    for &id in &models {
+        let Some(v) = world.node(id).and_then(|n| n.volume()) else { continue };
+        let pivot = world.pivot_local(id);
+        let chord = chords(v);
+        let mut prims: Vec<(usize, Prim)> = Vec::new();
+        for q in greedy_quads(v) {
+            let m = &scene.materials[q.color as usize];
+            let kind = if m.kind == MaterialKind::Media as u32 {
+                Kind::Cloud(Cloud { color: q.color, density: m.density, phase: m.g, chord: chord[q.color as usize] })
+            } else {
+                Kind::Surface(look(m))
+            };
+            let same = |k: &Kind| match (k, &kind) {
+                (Kind::Surface(a), Kind::Surface(b)) => a == b,
+                (Kind::Cloud(a), Kind::Cloud(b)) => a.color == b.color,
+                _ => false,
+            };
+            let k = kinds.iter().position(same).unwrap_or_else(|| {
                 kinds.push(kind);
-                prims.push(Prim::default());
                 kinds.len() - 1
+            });
+            let slot = prims.iter().position(|(pk, _)| *pk == k).unwrap_or_else(|| {
+                prims.push((k, Prim::default()));
+                prims.len() - 1
+            });
+            let p = &mut prims[slot].1;
+            let base = p.positions.len() as u32;
+            let n = dir(q.normal).as_vec3().to_array();
+            let uv = [((q.color as f32 - 1.0) + 0.5) / 256.0, 0.5];
+            for c in q.corners {
+                // Voxel units relative to the pivot, the node's origin;
+                // converted to glTF space per node (see `add_node`).
+                p.positions.push((c.as_vec3() - pivot).to_array());
+                p.normals.push(n);
+                p.uvs.push(uv);
             }
-        };
-        let p = &mut prims[k];
-        let base = p.positions.len() as u32;
-        let d = dir(q.normal).as_vec3();
-        let n = [d.x, d.z, -d.y];
-        let uv = [((q.color as f32 - 1.0) + 0.5) / 256.0, 0.5];
-        for c in q.corners {
-            p.positions.push(place(c.as_vec3()));
-            p.normals.push(n);
-            p.uvs.push(uv);
+            p.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        p.indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        parts.insert(id, PartMesh { prims });
     }
 
     let mut bin = Bin::default();
-    // Surfaces share one mesh; each cloud gets its own.
-    let mut surface_prims = Vec::new();
-    let mut cloud_meshes: Vec<(Cloud, Value)> = Vec::new();
-    for (k, p) in prims.iter().enumerate() {
-        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-        for q in &p.positions {
-            for i in 0..3 {
-                lo[i] = lo[i].min(q[i]);
-                hi[i] = hi[i].max(q[i]);
-            }
+
+    // Nodes mirror the scene tree. Each node's origin is its pivot, so
+    // engines turn parts the way they turn here; sockets are empty child
+    // nodes to attach things to.
+    let mut nodes: Vec<Value> = vec![json!({ "name": name })];
+    // Center the scene like the other exports.
+    let center = world.bounds(crate::world::ROOT).map_or(Vec3::ZERO, |(lo, size)| lo.as_vec3() + size.as_vec3() * 0.5);
+    if center != Vec3::ZERO {
+        nodes[0]["translation"] = json!(to_gltf(-center));
+    }
+    let mut out = Out { nodes, meshes: Vec::new(), bin: &mut bin, scene, world, parts: &parts, kinds: &kinds, project: &name, only: models.len() == 1 };
+    let mut top = Vec::new();
+    for &c in world.node(crate::world::ROOT).map(|n| n.children()).unwrap_or_default() {
+        if let Some(i) = add_node(c, Vec3::ZERO, Mat3::IDENTITY, &mut out) {
+            top.push(i);
         }
-        let pos = bin.accessor(bytes(&p.positions), ARRAY_BUFFER, FLOAT, p.positions.len(), "VEC3", Some((json!(lo), json!(hi))));
-        let nrm = bin.accessor(bytes(&p.normals), ARRAY_BUFFER, FLOAT, p.normals.len(), "VEC3", None);
-        let uv = bin.accessor(bytes(&p.uvs), ARRAY_BUFFER, FLOAT, p.uvs.len(), "VEC2", None);
-        let idx = bin.accessor(bytes(&p.indices), ELEMENT_ARRAY_BUFFER, UNSIGNED_INT, p.indices.len(), "SCALAR", None);
-        let prim = json!({
-            "attributes": { "POSITION": pos, "NORMAL": nrm, "TEXCOORD_0": uv },
-            "indices": idx,
-            "material": k,
-        });
-        match kinds[k] {
-            Kind::Surface(_) => surface_prims.push(prim),
-            Kind::Cloud(c) => cloud_meshes.push((c, prim)),
-        }
+    }
+    let Out { mut nodes, meshes, .. } = out;
+    if !top.is_empty() {
+        nodes[0]["children"] = json!(top);
     }
 
     // Palette texture.
@@ -315,23 +462,6 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
             m
         })
         .collect();
-
-    // Nodes: the root, the surface model, then one node per cloud.
-    let mut meshes = Vec::new();
-    let mut nodes = vec![json!({ "name": name })];
-    if !surface_prims.is_empty() {
-        meshes.push(json!({ "name": format!("{name}_mesh"), "primitives": surface_prims }));
-        nodes.push(json!({ "name": format!("{name}_model"), "mesh": meshes.len() - 1 }));
-    }
-    let single = cloud_meshes.len() == 1;
-    for (c, prim) in cloud_meshes {
-        let node = if single { format!("{name}_cloud") } else { format!("{name}_cloud_{}", c.color) };
-        meshes.push(json!({ "name": format!("{node}_mesh"), "primitives": [prim] }));
-        nodes.push(json!({ "name": node, "mesh": meshes.len() - 1, "extras": cloud_extras(scene, &c) }));
-    }
-    if nodes.len() > 1 {
-        nodes[0]["children"] = json!((1..nodes.len()).collect::<Vec<_>>());
-    }
 
     let mut buffer = json!({ "byteLength": bin.data.len() });
     if embedded {
@@ -488,10 +618,11 @@ mod tests {
         let (doc, _) = read_glb(&path);
         std::fs::remove_file(&path).ok();
 
-        // Root, model, cloud.
+        // Root, model, and the cloud under the model.
         let nodes = doc["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 3);
-        assert_eq!(nodes[0]["children"], json!([1, 2]));
+        assert_eq!(nodes[0]["children"], json!([1]));
+        assert_eq!(nodes[1]["children"], json!([2]));
         let cloud = &nodes[2];
         assert_eq!(cloud["name"].as_str().unwrap(), "voxely-gltf-cloud_cloud");
         assert_eq!(cloud["extras"]["voxely_material"], json!("cloud"));
@@ -517,5 +648,110 @@ mod tests {
         let (doc, _) = read_glb(&path);
         assert!(doc.get("meshes").is_none());
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A node's local matrix.
+    fn local(n: &Value) -> glam::Mat4 {
+        if let Some(m) = n.get("matrix") {
+            let a: Vec<f32> = m.as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+            return glam::Mat4::from_cols_slice(&a);
+        }
+        let f = |k: &str, d: Vec<f32>| n.get(k).map_or(d, |v| v.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect());
+        let t = f("translation", vec![0.0; 3]);
+        let r = f("rotation", vec![0.0, 0.0, 0.0, 1.0]);
+        glam::Mat4::from_rotation_translation(Quat::from_array([r[0], r[1], r[2], r[3]]), Vec3::new(t[0], t[1], t[2]))
+    }
+
+    #[test]
+    fn tree_exports_nodes_pivots_and_sockets() {
+        use crate::world::{Rot, Socket, ROOT};
+        let mut s = Scene::empty(IVec3::new(4, 2, 6));
+        s.volume = crate::ops::full(&s.volume, 3);
+        let body = s.editing().unwrap();
+        s.world_mode();
+        let (arm, gem) = s.change(|w| {
+            w.node_mut(body).unwrap().name = "body".into();
+            w.node_mut(body).unwrap().sockets.push(Socket { name: "hand".into(), pos: Vec3::new(4.0, 1.0, 5.0) });
+            let mut v = crate::scene::Volume::new(IVec3::new(2, 2, 5));
+            v = crate::ops::full(&v, 9);
+            let arm = w.add_model(ROOT, "arm", v, IVec3::new(4, 0, 1));
+            w.node_mut(arm).unwrap().pivot = Some(Vec3::new(1.0, 1.0, 5.0));
+            w.reorient(arm, Rot::turn(1, 1));
+            w.reorient(arm, Rot::flip(1));
+            let g = w.group(&[body, arm]).unwrap();
+            w.node_mut(g).unwrap().name = "bot".into();
+            // Attached under the mirrored arm, and turned itself.
+            let gem = w.add_model(ROOT, "gem", crate::ops::full(&crate::scene::Volume::new(IVec3::new(3, 1, 2)), 5), IVec3::new(9, 0, 0));
+            w.reorient(gem, Rot::turn(2, 1));
+            w.attach_to(gem, arm, None, None);
+            (arm, gem)
+        });
+        let path = std::env::temp_dir().join(format!("voxely-gltf-tree-{}.glb", std::process::id()));
+        write(&s, &path).unwrap();
+        let (doc, bin) = read_glb(&path);
+        std::fs::remove_file(&path).ok();
+        let nodes = doc["nodes"].as_array().unwrap();
+        let find = |name: &str| nodes.iter().position(|n| n["name"] == json!(name)).unwrap();
+        let (bot, body_i, arm_i, hand, gem_i) = (find("bot"), find("body"), find("arm"), find("hand"), find("gem"));
+        assert!(nodes[arm_i]["children"].as_array().unwrap().contains(&json!(gem_i)));
+        assert_eq!(nodes[0]["children"], json!([bot]));
+        assert_eq!(nodes[bot]["children"], json!([body_i, arm_i]));
+        assert!(nodes[body_i]["children"].as_array().unwrap().contains(&json!(hand)));
+        assert_eq!(nodes[hand]["extras"]["voxely_socket"], json!(true));
+
+        // Rebuild world positions from the node chain; they must land on
+        // the scene's voxels (converted to glTF space).
+        let mut global = vec![glam::Mat4::IDENTITY; nodes.len()];
+        fn walk(i: usize, parent: glam::Mat4, nodes: &[Value], out: &mut Vec<glam::Mat4>) {
+            out[i] = parent * local(&nodes[i]);
+            for c in nodes[i]["children"].as_array().into_iter().flatten() {
+                walk(c.as_u64().unwrap() as usize, out[i], nodes, out);
+            }
+        }
+        walk(0, glam::Mat4::IDENTITY, nodes, &mut global);
+        let w = &s.world;
+        let (lo, size) = w.bounds(ROOT).unwrap();
+        let center = lo.as_vec3() + size.as_vec3() * 0.5;
+        for (id, ni) in [(body, body_i), (arm, arm_i), (gem, gem_i)] {
+            let mesh = &doc["meshes"][nodes[ni]["mesh"].as_u64().unwrap() as usize];
+            let acc = &doc["accessors"][mesh["primitives"][0]["attributes"]["POSITION"].as_u64().unwrap() as usize];
+            let view = &doc["bufferViews"][acc["bufferView"].as_u64().unwrap() as usize];
+            let off = view["byteOffset"].as_u64().unwrap() as usize;
+            let pts: &[[f32; 3]] = bytemuck::cast_slice(&bin[off..off + view["byteLength"].as_u64().unwrap() as usize]);
+            let (mut a, mut b) = (Vec3::MAX, Vec3::MIN);
+            for p in pts {
+                let q = global[ni].transform_point3(Vec3::from(*p));
+                (a, b) = (a.min(q), b.max(q));
+            }
+            let (plo, psize) = w.bounds(id).unwrap();
+            let x = Vec3::from(to_gltf(plo.as_vec3() - center));
+            let y = Vec3::from(to_gltf((plo + psize).as_vec3() - center));
+            let (ea, eb) = (x.min(y), x.max(y));
+            assert!((a - ea).abs().max_element() < 1e-4 && (b - eb).abs().max_element() < 1e-4, "{id}: {a} {b} vs {ea} {eb}");
+        }
+        // The socket sits where the scene says.
+        let sw = w.socket_world(body, "hand").unwrap();
+        let got = global[hand].transform_point3(Vec3::ZERO);
+        assert!((got - Vec3::from(to_gltf(sw - center))).length() < 1e-4);
+        // Mirrors are baked into meshes: every node is a plain rotation,
+        // and triangles still wind counter-clockwise seen from outside.
+        assert!(nodes.iter().all(|n| n.get("matrix").is_none()));
+        let read = |acc: u64| -> &[u8] {
+            let a = &doc["accessors"][acc as usize];
+            let v = &doc["bufferViews"][a["bufferView"].as_u64().unwrap() as usize];
+            let off = v["byteOffset"].as_u64().unwrap() as usize;
+            &bin[off..off + v["byteLength"].as_u64().unwrap() as usize]
+        };
+        for ni in [body_i, arm_i, gem_i] {
+            let prim = &doc["meshes"][nodes[ni]["mesh"].as_u64().unwrap() as usize]["primitives"][0];
+            let pos: &[[f32; 3]] = bytemuck::cast_slice(read(prim["attributes"]["POSITION"].as_u64().unwrap()));
+            let nrm: &[[f32; 3]] = bytemuck::cast_slice(read(prim["attributes"]["NORMAL"].as_u64().unwrap()));
+            let idx: &[u32] = bytemuck::cast_slice(read(prim["indices"].as_u64().unwrap()));
+            assert!(global[ni].determinant() > 0.0);
+            for t in idx.chunks_exact(3) {
+                let [a, b, c] = [0, 1, 2].map(|k| Vec3::from(pos[t[k] as usize]));
+                assert!((b - a).cross(c - a).dot(Vec3::from(nrm[t[0] as usize])) > 0.0, "inward triangle in node {ni}");
+            }
+        }
     }
 }
