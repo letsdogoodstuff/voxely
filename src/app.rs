@@ -125,6 +125,16 @@ pub fn workspace_dir() -> PathBuf {
     home.join("Documents").join("voxely")
 }
 
+/// MagicaVoxel's install folder (its models, palettes, shaders and
+/// environment images): `$VOXELY_ASSETS`, or the unzipped download.
+pub fn magicavoxel_dir() -> Option<PathBuf> {
+    std::env::var_os("VOXELY_ASSETS").map(PathBuf::from).or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let guess = PathBuf::from(home).join("Downloads/MagicaVoxel-0.99.6.2-macos-10.15");
+        guess.join("vox").is_dir().then_some(guess)
+    })
+}
+
 /// The workspace file for a project name.
 pub fn project_path(name: &str) -> PathBuf {
     workspace_dir().join(format!("{name}.vox"))
@@ -188,16 +198,23 @@ fn set_material(r: &mut Renderer, scene: &mut Scene, i: u8, mut m: crate::scene:
     r.set_lights(&scene.lights, scene.light_power);
 }
 
-/// Render the final image offscreen at the Image size and save it.
-fn render_final(r: &Renderer, scene: &Scene, image: ui::ImageSettings) {
+/// A new image path in the workspace's export folder, e.g.
+/// `export/castle-render-1761300000.png`.
+fn image_path(project: &str, kind: &str) -> PathBuf {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    workspace_dir().join("export").join(format!("{project}-{kind}-{secs}.png"))
+}
+
+/// Render the final image offscreen at the Image size and save it to the
+/// export folder.
+fn render_final(r: &Renderer, scene: &Scene, image: ui::ImageSettings, project: &str) -> String {
     let mut out = Renderer::new(r.device.clone(), r.queue.clone(), scene, None, image.width, image.height);
     out.settings = r.settings.clone();
     out.set_camera(r.camera);
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let name = format!("export/voxely-render-{secs}.png");
-    match out.render_image(image.spp).and_then(|px| crate::save_png(Path::new(&name), image.width, image.height, &px)) {
-        Ok(()) => eprintln!("rendered {name} ({} spp)", image.spp),
-        Err(e) => eprintln!("render failed: {e:#}"),
+    let path = image_path(project, "render");
+    match out.render_image(image.spp).and_then(|px| crate::save_png(&path, image.width, image.height, &px)) {
+        Ok(()) => format!("Rendered {} ({} spp)", path.display(), image.spp),
+        Err(e) => format!("Render failed: {e:#}"),
     }
 }
 
@@ -297,11 +314,13 @@ pub fn export_summary(files: &[PathBuf]) -> String {
     }
 }
 
-/// Save to `path` and make it the current project.
-pub fn save_project(scene: &Scene, ed: &mut EditState, path: PathBuf) -> Result<PathBuf> {
+/// Save to `path`, with the renderer's current settings, and make it the
+/// current project.
+pub fn save_project(r: &Renderer, scene: &mut Scene, ed: &mut EditState, path: PathBuf) -> Result<PathBuf> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
+    scene.settings = r.settings.clone();
     scene.save(&path)?;
     ed.save_path = path.clone();
     ed.source = Some(path.clone());
@@ -320,13 +339,13 @@ pub fn sync_volume(r: &mut Renderer, scene: &mut Scene, editor: &mut Editor) {
     }
 }
 
-pub fn snapshot(r: &Renderer) {
+/// Save the path-traced view as it is to the export folder.
+pub fn snapshot(r: &Renderer, project: &str) -> String {
     let (w, h) = r.size();
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let name = format!("export/voxely-{secs}.png");
-    match r.read_pixels().and_then(|px| crate::save_png(Path::new(&name), w, h, &px)) {
-        Ok(()) => eprintln!("saved {name}"),
-        Err(e) => eprintln!("snapshot failed: {e:#}"),
+    let path = image_path(project, "snapshot");
+    match r.read_pixels().and_then(|px| crate::save_png(&path, w, h, &px)) {
+        Ok(()) => format!("Saved {}", path.display()),
+        Err(e) => format!("Snapshot failed: {e:#}"),
     }
 }
 
@@ -474,7 +493,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         }
         Command::Save => {
             let path = ed.save_path.clone();
-            match save_project(scene, ed, path) {
+            match save_project(r, scene, ed, path) {
                 Ok(p) => eprintln!("saved {}", p.display()),
                 Err(e) => eprintln!("save failed: {e:#}"),
             }
@@ -484,7 +503,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             let dir = ed.save_path.parent().filter(|d| d.is_dir()).map_or_else(workspace_dir, Path::to_path_buf);
             let dialog = rfd::FileDialog::new().add_filter("MagicaVoxel", &["vox"]).set_directory(dir).set_file_name(format!("{}.vox", ed.name()));
             if let Some(p) = dialog.save_file() {
-                match save_project(scene, ed, p.with_extension("vox")) {
+                match save_project(r, scene, ed, p.with_extension("vox")) {
                     Ok(p) => eprintln!("saved {}", p.display()),
                     Err(e) => eprintln!("save failed: {e:#}"),
                 }
@@ -530,7 +549,8 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::Snapshot => {
-            snapshot(r);
+            ed.export_status = Some(snapshot(r, &ed.name()));
+            eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
             false
         }
         Command::LoadPattern(p) => {
@@ -623,6 +643,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
                 .set_directory(&dir)
                 .set_file_name(export_file_name(&ed.name(), format));
             if let Some(path) = dialog.save_file() {
+                scene.settings = r.settings.clone();
                 ed.export_status = Some(match crate::export::export(format, scene, &path) {
                     Ok(files) => export_summary(&files),
                     Err(e) => format!("{} export failed: {e:#}", format.name()),
@@ -632,7 +653,8 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::RenderImage => {
-            render_final(r, scene, ed.image);
+            ed.export_status = Some(render_final(r, scene, ed.image, &ed.name()));
+            eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
             false
         }
         Command::PatternFromSelection => {

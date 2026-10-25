@@ -449,7 +449,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "save_file" => {
             let path = string(a, "path").map_or_else(|| ctx.ed.save_path.clone(), |p| PathBuf::from(p).with_extension("vox"));
-            let path = app::save_project(ctx.scene, ctx.ed, path)?;
+            let path = app::save_project(ctx.r, ctx.scene, ctx.ed, path)?;
             let full = std::fs::canonicalize(&path).unwrap_or(path);
             Ok(vec![text(format!("Saved {}", full.display()))])
         }
@@ -474,7 +474,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 ctx.scene.volume = ops::full(&ctx.scene.volume, c);
             }
             app::loaded(ctx.r, ctx.scene, ctx.ed);
-            let path = app::save_project(ctx.scene, ctx.ed, path)?;
+            let path = app::save_project(ctx.r, ctx.scene, ctx.ed, path)?;
             Ok(edited(ctx, true, &format!("Created project {name:?} at {}", path.display())))
         }
         "list_projects" => {
@@ -1031,6 +1031,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
                 std::fs::create_dir_all(dir)?;
             }
+            ctx.scene.settings = ctx.r.settings.clone();
             let files = crate::export::export(format, ctx.scene, &path)?;
             ctx.ed.export_status = Some(app::export_summary(&files));
             let mut out = vec![text(app::export_summary(&files))];
