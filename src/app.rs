@@ -58,6 +58,11 @@ pub struct EditState {
     pub export_status: Option<String>,
     /// MCP agent control of this window.
     pub agent: crate::agents::AgentState,
+    pub prefs: crate::prefs::Prefs,
+    pub prefs_open: bool,
+    /// The interface scale in use (the chosen one, unless the window is
+    /// too narrow for it).
+    pub ui_scale: f32,
     pub transform_text: ui::TransformText,
     pub palette: ui::PaletteState,
     /// Canvas size being typed into the Canvas panel.
@@ -101,6 +106,9 @@ impl EditState {
             image: ui::ImageSettings::default(),
             export_status: None,
             agent: crate::agents::AgentState::default(),
+            prefs: crate::prefs::Prefs::default(),
+            prefs_open: false,
+            ui_scale: 1.0,
             transform_text: ui::TransformText::default(),
             palette: ui::PaletteState::default(),
             shaders: ui::ShaderState { files: list_shaders(source.as_deref()), current: None, values: Vec::new(), error: None },
@@ -149,6 +157,16 @@ pub fn workspace_dir() -> PathBuf {
     }
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join("Documents").join("voxely")
+}
+
+/// MagicaVoxel's install folder (its models, palettes, shaders and
+/// environment images): `$VOXELY_ASSETS`, or the unzipped download.
+pub fn magicavoxel_dir() -> Option<PathBuf> {
+    std::env::var_os("VOXELY_ASSETS").map(PathBuf::from).or_else(|| {
+        let home = std::env::var_os("HOME")?;
+        let guess = PathBuf::from(home).join("Downloads/MagicaVoxel-0.99.6.2-macos-10.15");
+        guess.join("vox").is_dir().then_some(guess)
+    })
 }
 
 /// The workspace file for a project name.
@@ -214,16 +232,23 @@ fn set_material(r: &mut Renderer, scene: &mut Scene, i: u8, mut m: crate::scene:
     r.set_lights(&scene.lights, scene.light_power);
 }
 
-/// Render the final image offscreen at the Image size and save it.
-fn render_final(r: &Renderer, scene: &Scene, image: ui::ImageSettings) {
+/// A new image path in the workspace's export folder, e.g.
+/// `export/castle-render-1761300000.png`.
+fn image_path(project: &str, kind: &str) -> PathBuf {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    workspace_dir().join("export").join(format!("{project}-{kind}-{secs}.png"))
+}
+
+/// Render the final image offscreen at the Image size and save it to the
+/// export folder.
+fn render_final(r: &Renderer, scene: &Scene, image: ui::ImageSettings, project: &str) -> String {
     let mut out = Renderer::new(r.device.clone(), r.queue.clone(), scene, None, image.width, image.height);
     out.settings = r.settings.clone();
     out.set_camera(r.camera);
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let name = format!("export/voxely-render-{secs}.png");
-    match out.render_image(image.spp).and_then(|px| crate::save_png(Path::new(&name), image.width, image.height, &px)) {
-        Ok(()) => eprintln!("rendered {name} ({} spp)", image.spp),
-        Err(e) => eprintln!("render failed: {e:#}"),
+    let path = image_path(project, "render");
+    match out.render_image(image.spp).and_then(|px| crate::save_png(&path, image.width, image.height, &px)) {
+        Ok(()) => format!("Rendered {} ({} spp)", path.display(), image.spp),
+        Err(e) => format!("Render failed: {e:#}"),
     }
 }
 
@@ -323,11 +348,13 @@ pub fn export_summary(files: &[PathBuf]) -> String {
     }
 }
 
-/// Save to `path` and make it the current project.
-pub fn save_project(scene: &Scene, ed: &mut EditState, path: PathBuf) -> Result<PathBuf> {
+/// Save to `path`, with the renderer's current settings, and make it the
+/// current project.
+pub fn save_project(r: &Renderer, scene: &mut Scene, ed: &mut EditState, path: PathBuf) -> Result<PathBuf> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
+    scene.settings = r.settings.clone();
     scene.save(&path)?;
     ed.save_path = path.clone();
     ed.source = Some(path.clone());
@@ -562,13 +589,13 @@ pub(crate) fn set_mode(scene: &mut Scene, ed: &mut EditState, edit: Option<usize
     ok
 }
 
-pub fn snapshot(r: &Renderer) {
+/// Save the path-traced view as it is to the export folder.
+pub fn snapshot(r: &Renderer, project: &str) -> String {
     let (w, h) = r.size();
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let name = format!("export/voxely-{secs}.png");
-    match r.read_pixels().and_then(|px| crate::save_png(Path::new(&name), w, h, &px)) {
-        Ok(()) => eprintln!("saved {name}"),
-        Err(e) => eprintln!("snapshot failed: {e:#}"),
+    let path = image_path(project, "snapshot");
+    match r.read_pixels().and_then(|px| crate::save_png(&path, w, h, &px)) {
+        Ok(()) => format!("Saved {}", path.display()),
+        Err(e) => format!("Snapshot failed: {e:#}"),
     }
 }
 
@@ -740,7 +767,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         }
         Command::Save => {
             let path = ed.save_path.clone();
-            match save_project(scene, ed, path) {
+            match save_project(r, scene, ed, path) {
                 Ok(p) => eprintln!("saved {}", p.display()),
                 Err(e) => eprintln!("save failed: {e:#}"),
             }
@@ -750,7 +777,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             let dir = ed.save_path.parent().filter(|d| d.is_dir()).map_or_else(workspace_dir, Path::to_path_buf);
             let dialog = rfd::FileDialog::new().add_filter("MagicaVoxel", &["vox"]).set_directory(dir).set_file_name(format!("{}.vox", ed.name()));
             if let Some(p) = dialog.save_file() {
-                match save_project(scene, ed, p.with_extension("vox")) {
+                match save_project(r, scene, ed, p.with_extension("vox")) {
                     Ok(p) => eprintln!("saved {}", p.display()),
                     Err(e) => eprintln!("save failed: {e:#}"),
                 }
@@ -759,6 +786,10 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         }
         Command::Undo => history_step(scene, ed, false),
         Command::Redo => history_step(scene, ed, true),
+        Command::Preferences => {
+            ed.prefs_open ^= true;
+            false
+        }
         Command::ToggleWorld => match scene.mode {
             Mode::Edit(_) => set_mode(scene, ed, None),
             Mode::World => match scene.picked.first().copied().or_else(|| scene.world.models().first().copied()) {
@@ -845,7 +876,8 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::Snapshot => {
-            snapshot(r);
+            ed.export_status = Some(snapshot(r, &ed.name()));
+            eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
             false
         }
         Command::LoadPattern(p) => {
@@ -938,6 +970,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
                 .set_directory(&dir)
                 .set_file_name(export_file_name(&ed.name(), format));
             if let Some(path) = dialog.save_file() {
+                scene.settings = r.settings.clone();
                 ed.export_status = Some(match crate::export::export(format, scene, &path) {
                     Ok(files) => export_summary(&files),
                     Err(e) => format!("{} export failed: {e:#}", format.name()),
@@ -947,7 +980,8 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::RenderImage => {
-            render_final(r, scene, ed.image);
+            ed.export_status = Some(render_final(r, scene, ed.image, &ed.name()));
+            eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
             false
         }
         Command::PatternFromSelection => {
@@ -1205,8 +1239,8 @@ pub fn build_ui(
         } else {
             // MagicaVoxel's render layout: Light / Sample / Display on the
             // left, Matter / Camera / Image on the right.
-            egui::Panel::left("light").default_size(250.0).show(ui, |ui| ui::light_panel(ui, &mut ed.light_tab, &mut r.settings, panel));
-            egui::Panel::right("matter").default_size(250.0).show(ui, |ui| {
+            egui::Panel::left("light").default_size(250.0).max_size(320.0).show(ui, |ui| ui::light_panel(ui, &mut ed.light_tab, &mut r.settings, panel));
+            egui::Panel::right("matter").default_size(250.0).max_size(320.0).show(ui, |ui| {
                 let state = ui::MatterState { tab: &mut ed.matter_tab, clipboard: &mut ed.material_clipboard, image: &mut ed.image, spp, size };
                 let a = ui::matter_panel(ui, &mut r.settings, &ed.editor, scene, state, cmds);
                 edit.materials_changed |= a.materials_changed;
@@ -1220,6 +1254,9 @@ pub fn build_ui(
         if ed.agent.open {
             egui::Panel::bottom("agents").resizable(true).default_size(190.0).show(ui, |ui| crate::agents::panel(ui, &mut ed.agent));
         }
+    }
+    if ui::preferences_window(ui.ctx(), &mut ed.prefs_open, &mut ed.prefs, ed.ui_scale) {
+        ed.prefs.save();
     }
     actions.viewport = Some(ui.available_rect_before_wrap());
     draw_overlay(&ui.ctx().layer_painter(egui::LayerId::background()), r, scene, ed, ppp);
@@ -1374,6 +1411,7 @@ impl App {
         let color = (1..256).max_by_key(|&i| counts[i]).filter(|&i| counts[i] > 0).unwrap_or(1) as u8;
         let mut edit = EditState::new(color, source, save_path);
         edit.timeline.open = scene.world.animated();
+        edit.prefs = crate::prefs::Prefs::load();
         App {
             scene,
             gfx: None,
@@ -1390,7 +1428,8 @@ impl App {
             el.create_window(
                 Window::default_attributes()
                     .with_title(format!("voxely — {}", self.edit.name()))
-                    .with_inner_size(winit::dpi::LogicalSize::new(1280, 800)),
+                    .with_inner_size(winit::dpi::LogicalSize::new(1280, 800))
+                    .with_min_inner_size(winit::dpi::LogicalSize::new(crate::prefs::MIN_WINDOW.0, crate::prefs::MIN_WINDOW.1)),
             )?,
         );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
@@ -1412,6 +1451,8 @@ impl App {
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, egui_wgpu::RendererOptions::default());
         let renderer = Renderer::new(device, queue, &self.scene, Some(config.format), config.width, config.height);
         let egui_ctx = egui::Context::default();
+        // Ctrl+= / Ctrl+- / Ctrl+0 step the saved interface scale instead.
+        egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -1555,6 +1596,17 @@ impl App {
                     self.face_camera();
                     None
                 }
+                // Interface scale, like a browser's zoom.
+                "=" | "+" | "-" | "0" => {
+                    self.edit.prefs.step_scale(match c.as_str() {
+                        "-" => -1,
+                        "0" => 0,
+                        _ => 1,
+                    });
+                    self.edit.prefs.save();
+                    None
+                }
+                "," => Some(Command::Preferences),
                 "g" | "f" | "b" | "e" => {
                     if let Some(m) = self.gfx.as_mut().and_then(|g| g.renderer.modeler.as_mut()) {
                         let o = &mut m.options;
@@ -1907,6 +1959,14 @@ impl App {
         let samples = if g.renderer.converging() { 1 } else { 0 };
         g.renderer.render_to_view(&view, (g.config.width, g.config.height), samples);
 
+        // The chosen interface scale, or less if the window is too narrow.
+        let width = g.window.inner_size().to_logical::<f32>(g.window.scale_factor()).width;
+        self.edit.ui_scale = crate::prefs::effective_scale(self.edit.prefs.ui_scale, width);
+        if (g.egui_ctx.zoom_factor() - self.edit.ui_scale).abs() > 1e-4 {
+            g.egui_ctx.set_zoom_factor(self.edit.ui_scale);
+            // Applies from the next frame on; draw that one too.
+            g.window.request_redraw();
+        }
         let raw = g.egui_state.take_egui_input(&g.window);
         let (scene, ed, panel, show) = (&mut self.scene, &mut self.edit, &self.panel, self.show_panel);
         let renderer = &mut g.renderer;
