@@ -1524,7 +1524,31 @@ fn outline(p: &egui::Painter, r: &Renderer, ppp: f32, lo: Vec3, hi: Vec3, stroke
     }
 }
 
-/// Model bounds, the marquee, and the cells the current brush would touch.
+/// World mode: each shown model's box in its layer's color and the picked
+/// ones' in white, like MagicaVoxel's wireframes [WR]. None while editing.
+pub fn model_boxes(scene: &Scene) -> Option<Vec<(IVec3, IVec3, [u8; 3])>> {
+    if scene.mode != Mode::World {
+        return None;
+    }
+    let w = &scene.world;
+    let mut boxes = Vec::new();
+    let mut add = |id: usize, color: [u8; 3]| {
+        if let Some((lo, size)) = w.bounds(id).filter(|_| w.visible(id)) {
+            let lo = lo - scene.origin;
+            boxes.push((lo, lo + size, color));
+        }
+    };
+    for id in w.models() {
+        let layer = w.node(id).map_or(0, |n| n.layer.rem_euclid(8) as usize);
+        add(id, crate::modeler::LAYER_COLORS[layer].map(|c| (c as u32 * 4 / 5) as u8));
+    }
+    for &id in &scene.picked {
+        add(id, [229, 229, 229]);
+    }
+    Some(boxes)
+}
+
+/// The marquee, and the cells the current brush would touch.
 fn draw_overlay(p: &egui::Painter, r: &Renderer, scene: &Scene, ed: &EditState, ppp: f32) {
     // Only draw over the 3D view, not the panels.
     let (x, y, w, h) = r.viewport();
@@ -1538,16 +1562,8 @@ fn draw_overlay(p: &egui::Painter, r: &Renderer, scene: &Scene, ed: &EditState, 
     for &id in &scene.picked {
         draw_markers(p, r, scene, ppp, id);
     }
+    // (World mode's model boxes are drawn by the modeler, see `model_boxes`.)
     if scene.mode == Mode::World {
-        let painter = p;
-        // Picked parts' boxes.
-        let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 160, 255));
-        for &id in &scene.picked {
-            if let Some((lo, size)) = scene.world.bounds(id) {
-                let lo = lo - scene.origin;
-                outline(painter, r, ppp, lo.as_vec3(), (lo + size).as_vec3(), stroke);
-            }
-        }
         return;
     }
     if let Some((a, b)) = ed.marquee {
@@ -1770,6 +1786,7 @@ pub fn build_ui(
     crate::backdrop::window(ui.ctx(), &mut ed.backdrop, scene.volume.dims, scene.origin, cmds);
     if let Some(m) = r.modeler.as_mut() {
         m.reference_plane = ed.backdrop.plane(scene.volume.dims, scene.origin);
+        m.boxes = model_boxes(scene);
     }
     confirm_delete(ui.ctx(), ed, cmds);
     confirm_unsaved(ui.ctx(), ed, cmds);
@@ -2169,14 +2186,17 @@ impl App {
                     None
                 }
                 "," => Some(Command::Preferences),
-                "g" | "f" | "b" | "e" => {
+                // MagicaVoxel's display toggles.
+                "g" | "f" | "b" | "e" | "w" | "m" => {
                     if let Some(m) = self.gfx.as_mut().and_then(|g| g.renderer.modeler.as_mut()) {
                         let o = &mut m.options;
                         match c.as_str() {
                             "g" => o.grid ^= true,
                             "f" => o.frame ^= true,
                             "e" => o.edge ^= true,
-                            _ => o.bounds ^= true,
+                            "w" => o.shadow ^= true,
+                            "m" => o.wire ^= true,
+                            _ => o.others ^= true,
                         }
                     }
                     None

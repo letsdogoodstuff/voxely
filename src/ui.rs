@@ -654,13 +654,13 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
     let mut iso = false;
     ui.horizontal(|ui| {
         if let Some(o) = s.options {
-            ui.toggle_value(&mut o.bounds, "BO").on_hover_text("Bounding box [Ctrl+B]");
-            ui.toggle_value(&mut o.edge, "Edge").on_hover_text("Voxel outlines [Ctrl+E]");
-            ui.toggle_value(&mut o.grid, "Grid").on_hover_text("Grid lines [Ctrl+G]");
-            ui.toggle_value(&mut o.frame, "Frame").on_hover_text("Ground frame lines [Ctrl+F]");
-            ui.toggle_value(&mut o.ao, "AO").on_hover_text("Ambient occlusion");
-            ui.toggle_value(&mut o.shadow, "SW").on_hover_text("Shadow");
-            ui.toggle_value(&mut o.wire, "WR").on_hover_text("Wireframe");
+            ui.toggle_value(&mut o.others, "BO").on_hover_text("Display Background Objects [Ctrl+B]");
+            ui.toggle_value(&mut o.edge, "Edge").on_hover_text("Display Edges [Ctrl+E]");
+            ui.toggle_value(&mut o.grid, "Grid").on_hover_text("Display Grids [Ctrl+G]");
+            ui.toggle_value(&mut o.frame, "Frame").on_hover_text("Display Frame [Ctrl+F]");
+            ui.toggle_value(&mut o.ao, "AO").on_hover_text("Show Ambient Occlusion");
+            ui.toggle_value(&mut o.shadow, "SW").on_hover_text("Display Shadow [Ctrl+W]");
+            ui.toggle_value(&mut o.wire, "WR").on_hover_text("Display Wireframes [Ctrl+M]");
             ui.separator();
         }
         let field = |v: Option<i32>| v.map_or("-".to_string(), |v| v.to_string());
@@ -1215,6 +1215,7 @@ pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, text: &mut Tr
         });
         CollapsingHeader::new("View").show(ui, |ui| {
             ui.checkbox(&mut o.constant, "Constant shading");
+            ui.checkbox(&mut o.fade, "Fade").on_hover_text("Fade Background Objects");
             let mut bg = o.background.to_array();
             ui.horizontal(|ui| {
                 ui.color_edit_button_rgb(&mut bg);

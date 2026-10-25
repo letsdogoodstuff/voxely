@@ -87,8 +87,9 @@ editor controls (MagicaVoxel layout; Cmd works for Ctrl on macOS):
   Ctrl+C/X/V copy/cut/paste        U full  I fill  Delete clear
   F5/F6/F7 mirror x/y/z            1 / 2  previous/next color
   Ctrl+Z undo  Ctrl+Y redo         Ctrl+S save  Ctrl+Shift+S save as
-  Ctrl+O open  Ctrl+P new          Ctrl+G grid  Ctrl+F frame  Ctrl+B bounds
+  Ctrl+O open  Ctrl+P new          Ctrl+G grid  Ctrl+F frame  Ctrl+E edges
   F1 model/render                  Ctrl+Tab  hide panels
+  Ctrl+B other models  Ctrl+W shadow  Ctrl+M model boxes (World)
   Ctrl+, preferences               Ctrl+= / Ctrl+- / Ctrl+0  interface scale
   arrows sun angle                 6  save a PNG snapshot to export/
 
@@ -123,6 +124,11 @@ struct Args {
     prefs_shot: bool,
     /// Show the Palettes window in `--ui-shot`.
     palettes_shot: bool,
+    /// The modeler's display toggles that are on in `--ui-shot`, e.g.
+    /// "bo,wr,edge" (bo edge grid frame ao sw wr).
+    view: Option<String>,
+    /// The part to edit in `--ui-shot` (World mode if not found).
+    edit: Option<String>,
     proj: Option<scene::Projection>,
     dof: Option<f32>,
     blades: Option<u32>,
@@ -219,6 +225,8 @@ fn parse_args() -> Result<Args> {
             "--prefs" => args.prefs_shot = true,
             "--palettes" => args.palettes_shot = true,
             "--ui-shot" => args.ui_shot = Some(PathBuf::from(val()?)),
+            "--view" => args.view = Some(val()?),
+            "--edit" => args.edit = Some(val()?),
             "--proj" => {
                 use scene::Projection::*;
                 args.proj = Some(match val()?.as_str() {
@@ -454,8 +462,18 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
     check_image_size(&device, (w, h))?;
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let mut egui_renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+    match args.edit.as_deref().map(|e| scene.world.find(e)) {
+        Some(Some(id)) => _ = scene.edit(id),
+        Some(None) => scene.world_mode(),
+        None => {}
+    }
     let mut r = Renderer::new(device, queue, scene, Some(format), w, h);
     apply_cam(&mut r, args);
+    if let (Some(view), Some(m)) = (&args.view, r.modeler.as_mut()) {
+        let o = &mut m.options;
+        let on = |k: &str| view.split(',').any(|v| v.trim() == k);
+        (o.others, o.edge, o.grid, o.frame, o.ao, o.shadow, o.wire) = (on("bo"), on("edge"), on("grid"), on("frame"), on("ao"), on("sw"), on("wr"));
+    }
     r.modeling = !args.pathtrace;
     let tex = r.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("ui_snapshot"),

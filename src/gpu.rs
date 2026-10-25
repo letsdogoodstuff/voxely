@@ -990,10 +990,15 @@ impl Renderer {
             view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
-        // Agents' views show the model alone, without the window's reference.
+        // Agents' views show the model alone, without the window's reference
+        // or World mode's model boxes.
         let plane = m.reference_plane.take();
+        let boxes = m.boxes.as_mut().map(std::mem::take);
         m.draw(&self.device, &self.queue, &view, (width, height), (0, 0, width, height), camera, self.settings.fov, projection);
         m.reference_plane = plane;
+        if let Some(b) = boxes {
+            m.boxes = Some(b);
+        }
         let bgra = matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
         read_texture(&self.device, &self.queue, &tex, width, height, bgra)
     }
