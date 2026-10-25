@@ -1,24 +1,882 @@
-//! Building: symmetry, more primitives, stamps.
+//! Building: symmetry, more primitives, tubes, extruded polygons, stamps.
 
-use anyhow::Result;
-use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-use super::Ctx;
+use anyhow::{Context, Result, anyhow, bail};
+use glam::{IVec3, Mat3, Vec2, Vec3};
+use serde_json::{Value, json};
+
+use super::{Ctx, NEIGHBORS, apply, arr, boolean, color, color_arg, color_schema, count, edited, get, ivec3, num, opt_ivec3, string, text, tool, xyz};
+use crate::scene::Volume;
 
 #[derive(Default)]
-pub struct State {}
+pub struct State {
+    /// Twice the symmetry plane's coordinate per axis (so half cells are
+    /// whole numbers), by part id. Missing: the part's center.
+    centers: HashMap<usize, [Option<i32>; 3]>,
+    /// The tool being run, so whole-model ops aren't mirrored.
+    tool: Option<String>,
+}
 
-pub const PART_TOOLS: &[&str] = &[];
+pub const PART_TOOLS: &[&str] = &["draw_tube", "extrude_polygon", "place_stamp"];
+
+/// Edits that move or regenerate the whole model; mirroring their changes
+/// would garble them.
+const UNMIRRORED: &[&str] = &["edit_model", "transform_model", "resize_canvas", "run_shader", "move_selection"];
+
+pub const SHAPES: &[&str] =
+    &["box", "ellipsoid", "sphere", "cylinder", "cone", "pyramid", "frustum", "torus", "capsule", "rounded_box", "wedge"];
 
 pub fn tools() -> Vec<Value> {
-    Vec::new()
+    let axis = json!({ "type": "string", "enum": ["x", "y", "z"] });
+    let uv = json!({ "type": "array", "items": { "type": "array", "items": { "type": "number" } } });
+    vec![
+        tool("set_symmetry", "Mirror every voxel edit across the part's center plane(s), like a symmetric sculpting mode, and report the current state. While on, set_voxels, fill_box, draw_shape, draw_line, draw_tube, extrude_polygon, place_stamp and run_script edits are mirrored (each still one undo step); edit_model, transform_model, run_shader and move_selection aren't. The axes are one setting shared with the window's Mirror X/Y/Z brush toggles: they stay on when you switch parts, and each part mirrors about its own center unless `center` moved its plane. Call with no arguments to see the state.", json!({
+            "x": { "type": "boolean" }, "y": { "type": "boolean" }, "z": { "type": "boolean" },
+            "axes": { "type": "array", "items": axis.clone(), "description": "The axes to mirror across, replacing x/y/z; [] turns symmetry off" },
+            "center": { "type": ["array", "string"], "items": { "type": ["number", "null"] }, "description": "[x, y, z] plane coordinates in the edited part's cells (whole or .5; null keeps that axis centered), or \"reset\". Default: the part's center ((size-1)/2)" },
+        }), &[]),
+        tool("draw_tube", "Draw a round tube along a smooth curve through points: tails, tentacles, horns, cables, branches, handles. The radius can taper from start to end.", json!({
+            "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "[[x, y, z], ...] cells the curve goes through (or its control points for bezier), at least 2" },
+            "radius": { "type": "number", "description": "Radius in voxels at the start (default 1; 0.5 is one voxel thick)" },
+            "end_radius": { "type": "number", "description": "Radius at the end (default: radius), e.g. 0.5 for a pointed tail or horn" },
+            "curve": { "type": "string", "enum": ["smooth", "bezier", "straight"], "description": "smooth (default): Catmull-Rom through every point; bezier: points are control points (passes through the first and last); straight: a polyline" },
+            "closed": { "type": "boolean", "description": "Join the last point back to the first (a ring)" },
+            "color": color_schema(),
+        }), &["points", "color"]),
+        tool("extrude_polygon", "Fill a 2D polygon and extrude it through a range of layers: signs, letters, gear and cog outlines, roof and arch profiles, floor plans. Points are cells on the outline (outline cells are included); the polygon may be concave.", json!({
+            "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "[[u, v], ...] outline cells. axis z: u = x, v = y; axis y: u = x, v = z; axis x: u = y, v = z (as in get_slice)" },
+            "axis": { "type": "string", "enum": ["x", "y", "z"], "description": "The direction it's extruded along (default z: the polygon lies flat and extrudes upward)" },
+            "depth": { "type": ["array", "integer"], "items": { "type": "integer" }, "description": "[from, to] layers along axis, inclusive, or one layer" },
+            "holes": { "type": "array", "items": uv, "description": "Polygons to leave empty, each [[u, v], ...] (their outline cells are empty too)" },
+            "hollow": { "type": "boolean", "description": "Only the outer shell" },
+            "color": color_schema(),
+        }), &["points", "depth", "color"]),
+        tool("save_stamp", "Save voxels as a named reusable stamp (kept in the workspace's stamps folder across sessions): a box of the part being edited, or a whole part cropped to its voxels. Place copies with place_stamp.", json!({
+            "name": { "type": "string", "description": "Letters, digits, spaces, - and _; an existing stamp of that name is replaced" },
+            "from": xyz("Box corner (default: the part's whole voxel bounds)"), "to": xyz("Opposite corner, inclusive"),
+            "part": { "type": ["string", "integer"], "description": "Part to copy from without switching to it (default: the part being edited)" },
+        }), &["name"]),
+        tool("list_stamps", "Saved stamps with their sizes and voxel counts.", json!({}), &[]),
+        tool("delete_stamp", "Delete a saved stamp.", json!({ "name": { "type": "string" } }), &["name"]),
+        tool("place_stamp", "Place a saved stamp into the part being edited. Only its solid cells are written; empty cells leave what's there. Colors map by RGB to the current palette.", json!({
+            "name": { "type": "string" },
+            "at": xyz("Where the stamp's anchor goes"),
+            "anchor": { "type": "string", "enum": ["min", "center", "bottom"], "description": "min (default): its minimum corner; center; bottom: the middle of its bottom (low z) face" },
+            "rotate": { "type": ["integer", "array"], "items": { "type": "integer" }, "description": "Counter-clockwise quarter turns: n about z, or [x, y, z] turns applied x then y then z" },
+            "flip": { "type": ["string", "array"], "items": axis.clone(), "description": "Axis or axes to mirror the stamp along (before rotating)" },
+            "replace": { "type": "object", "description": "Recolor: {\"<stamp color index>\": color, ...}" },
+            "color": color_schema(),
+        }), &["name", "at"]),
+    ]
 }
 
-pub fn dispatch(_ctx: &mut Ctx, _name: &str, _args: &Value) -> Option<Result<Vec<Value>>> {
-    None
+pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Value>>> {
+    ctx.ed.tools.build.tool = Some(name.to_string());
+    let a = args;
+    Some(match name {
+        "set_symmetry" => set_symmetry(ctx, a),
+        "draw_tube" => (|| {
+            let pts = points3(a)?;
+            let c = color_arg(ctx.scene, a, "color")?;
+            let r0 = num(a, "radius").unwrap_or(1.0);
+            let r1 = num(a, "end_radius").unwrap_or(r0);
+            let curve = string(a, "curve").unwrap_or("smooth");
+            let path = sample_curve(&pts, curve, boolean(a, "closed").unwrap_or(false))?;
+            let len = path.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>();
+            let new = tube_volume(&ctx.scene.volume, &path, r0, r1, c);
+            let what = format!("Drew tube through {} points, {len:.0} voxels long{}", pts.len(), mirrored_note(ctx));
+            let changed = apply(ctx, new);
+            Ok(edited(ctx, changed, &what))
+        })(),
+        "extrude_polygon" => (|| {
+            let ax = super::axis(a)?;
+            let outline = points2(get(a, "points").context("missing `points`")?)?;
+            if outline.len() < 2 {
+                bail!("`points` needs at least 2 [u, v] points");
+            }
+            let holes = match get(a, "holes").and_then(Value::as_array) {
+                Some(h) => h.iter().map(points2).collect::<Result<Vec<_>>>()?,
+                None => Vec::new(),
+            };
+            let (d0, d1) = match get(a, "depth").context("missing `depth`")? {
+                Value::Array(d) if d.len() == 2 => {
+                    let n = |v: &Value| v.as_f64().map(|f| f.round() as i32).context("`depth` holds integers");
+                    (n(&d[0])?, n(&d[1])?)
+                }
+                v => v.as_f64().map(|f| (f.round() as i32, f.round() as i32)).context("`depth` is [from, to] or one layer")?,
+            };
+            let c = color_arg(ctx.scene, a, "color")?;
+            let new = extrude_volume(&ctx.scene.volume, ax, &outline, &holes, d0.min(d1), d0.max(d1), c, boolean(a, "hollow").unwrap_or(false));
+            let what = format!("Extruded polygon of {} points{}", outline.len(), mirrored_note(ctx));
+            let changed = apply(ctx, new);
+            Ok(edited(ctx, changed, &what))
+        })(),
+        "save_stamp" => save_stamp(ctx, a),
+        "list_stamps" => list_stamps(),
+        "delete_stamp" => (|| {
+            let name = stamp_name(a)?;
+            std::fs::remove_file(stamp_path(&name)).map_err(|_| anyhow!("no stamp named {name:?}; see list_stamps"))?;
+            Ok(vec![text(format!("Deleted stamp {name:?}"))])
+        })(),
+        "place_stamp" => place_stamp(ctx, a),
+        _ => return None,
+    })
 }
 
-/// Called on every edit before it's committed (e.g. to mirror it).
-pub fn before_commit(_ctx: &mut Ctx, new: crate::scene::Volume) -> crate::scene::Volume {
-    new
+// ---------------------------------------------------------------- symmetry
+
+/// Called on every edit before it's committed: mirrors the edit's changed
+/// cells while symmetry is on.
+pub fn before_commit(ctx: &mut Ctx, new: Volume) -> Volume {
+    let tool = ctx.ed.tools.build.tool.take();
+    let axes = ctx.ed.editor.mirror;
+    let Some(id) = ctx.scene.editing() else { return new };
+    if !axes.iter().any(|&on| on) || tool.as_deref().is_some_and(|t| UNMIRRORED.contains(&t)) {
+        return new;
+    }
+    let planes = planes(ctx, id);
+    mirror_edit(&ctx.scene.volume, new, axes, planes)
+}
+
+/// Twice each axis's mirror plane coordinate for part `id`.
+fn planes(ctx: &Ctx, id: usize) -> IVec3 {
+    let dims = ctx.scene.volume.dims;
+    let set = ctx.ed.tools.build.centers.get(&id).copied().unwrap_or_default();
+    IVec3::from_array(std::array::from_fn(|k| set[k].unwrap_or(dims[k] - 1)))
+}
+
+/// Copy every changed cell of `new` (vs `old`) to its mirror images across
+/// the planes (given doubled: cell p mirrors to `planes - p`) on `axes`.
+/// When several cells of one mirror set changed differently, the highest
+/// color wins, so adding beats erasing.
+pub fn mirror_edit(old: &Volume, new: Volume, axes: [bool; 3], planes: IVec3) -> Volume {
+    if old.dims != new.dims {
+        return new;
+    }
+    let mut out = new.clone();
+    let mut done = vec![false; new.cells.len()];
+    let mut orbit = Vec::with_capacity(8);
+    for i in 0..new.cells.len() {
+        if old.cells[i] == new.cells[i] || done[i] {
+            continue;
+        }
+        orbit.clear();
+        orbit.push(new.position(i));
+        for k in 0..3 {
+            if axes[k] {
+                for j in 0..orbit.len() {
+                    let mut m = orbit[j];
+                    m[k] = planes[k] - m[k];
+                    orbit.push(m);
+                }
+            }
+        }
+        orbit.retain(|&p| new.contains(p));
+        let idx: Vec<usize> = orbit.iter().map(|&p| new.index(p)).collect();
+        let c = idx.iter().filter(|&&j| old.cells[j] != new.cells[j]).map(|&j| new.cells[j]).max().unwrap_or(0);
+        for j in idx {
+            done[j] = true;
+            out.set_index(j, c);
+        }
+    }
+    out
+}
+
+fn mirrored_note(ctx: &Ctx) -> String {
+    let m = ctx.ed.editor.mirror;
+    if ctx.ed.tools.build.tool.as_deref().is_some_and(|t| UNMIRRORED.contains(&t)) || !m.iter().any(|&on| on) {
+        return String::new();
+    }
+    let axes: String = ["x", "y", "z"].iter().zip(m).filter(|(_, on)| *on).map(|(n, _)| *n).collect();
+    format!(" (mirrored {axes})")
+}
+
+fn set_symmetry(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
+    let names = ["x", "y", "z"];
+    if let Some(list) = get(a, "axes") {
+        let list = list.as_array().context("`axes` is a list like [\"x\"]")?;
+        let mut m = [false; 3];
+        for v in list {
+            let k = v.as_str().and_then(|s| names.iter().position(|n| n.eq_ignore_ascii_case(s))).with_context(|| format!("unknown axis {v}"))?;
+            m[k] = true;
+        }
+        ctx.ed.editor.mirror = m;
+    }
+    for (k, n) in names.iter().enumerate() {
+        if let Some(on) = boolean(a, n) {
+            ctx.ed.editor.mirror[k] = on;
+        }
+    }
+    let id = ctx.scene.editing();
+    match get(a, "center") {
+        Some(Value::String(s)) if s == "reset" || s == "center" => {
+            if let Some(id) = id {
+                ctx.ed.tools.build.centers.remove(&id);
+            }
+        }
+        Some(Value::Array(c)) if c.len() == 3 => {
+            let id = id.context("`center` applies to the part being edited; call edit_part first")?;
+            let mut set = [None; 3];
+            for k in 0..3 {
+                if let Some(f) = c[k].as_f64() {
+                    set[k] = Some((f * 2.0).round() as i32);
+                } else if !c[k].is_null() {
+                    bail!("`center` is [x, y, z] numbers (null keeps an axis centered)");
+                }
+            }
+            ctx.ed.tools.build.centers.insert(id, set);
+        }
+        Some(_) => bail!("`center` is [x, y, z] or \"reset\""),
+        None => {}
+    }
+    let m = ctx.ed.editor.mirror;
+    if !m.iter().any(|&on| on) {
+        return Ok(vec![text("Symmetry off.")]);
+    }
+    let planes: Vec<String> = match id {
+        Some(id) => {
+            let p = planes(ctx, id);
+            (0..3).filter(|&k| m[k]).map(|k| format!("{} = {}", names[k], p[k] as f32 / 2.0)).collect()
+        }
+        None => (0..3).filter(|&k| m[k]).map(|k| names[k].to_string()).collect(),
+    };
+    let part = id.map_or_else(|| "each part (World mode now)".to_string(), |id| format!("part `{}`", ctx.scene.world.label(id)));
+    Ok(vec![text(format!(
+        "Symmetry on: edits are mirrored across {} in {part}. It stays on for other parts (about their own centers) until turned off; the window's Mirror toggles show it too.",
+        planes.join(" and ")
+    ))])
+}
+
+// ---------------------------------------------------------------- solids
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Box,
+    Ellipsoid,
+    /// Round cross-section whose radius scales to `top` at the +axis end:
+    /// cylinder, cone, frustum.
+    Round,
+    /// Square cross-section, likewise: pyramid, truncated pyramid.
+    Square,
+    Torus,
+    Capsule,
+    RoundedBox,
+    Wedge,
+}
+
+/// A primitive inscribed in a box of cells, optionally rotated about the
+/// box center.
+pub struct Solid {
+    kind: Kind,
+    axis: usize,
+    /// Wedge: the axis it's tall along.
+    up: usize,
+    center: Vec3,
+    half: Vec3,
+    /// Torus tube radius or rounded box corner radius, in voxels.
+    radius: f32,
+    /// Cross-section scale at the +axis end (1 = straight).
+    top: f32,
+    /// World to box rotation.
+    inv: Option<Mat3>,
+    /// Cells that can be inside, inclusive.
+    lo: IVec3,
+    hi: IVec3,
+}
+
+impl Solid {
+    /// One of `SHAPES` in the box between corners `a` and `b`, with no
+    /// options.
+    pub fn new(shape: &str, axis: usize, a: IVec3, b: IVec3) -> Self {
+        Self::build(shape, axis, a, b, &Value::Null).expect("a known shape")
+    }
+
+    /// A shape from draw_shape's arguments (`top_scale`, `radius`, `up`,
+    /// `rotation`; `axis` defaults per shape).
+    pub fn build(shape: &str, axis: usize, a: IVec3, b: IVec3, args: &Value) -> Result<Self> {
+        let (kind, top) = match shape {
+            "box" => (Kind::Box, 1.0),
+            "ellipsoid" | "sphere" => (Kind::Ellipsoid, 1.0),
+            "cylinder" => (Kind::Round, 1.0),
+            "cone" => (Kind::Round, 0.0),
+            "frustum" => (Kind::Round, 0.5),
+            "pyramid" => (Kind::Square, 0.0),
+            "torus" => (Kind::Torus, 1.0),
+            "capsule" => (Kind::Capsule, 1.0),
+            "rounded_box" => (Kind::RoundedBox, 1.0),
+            "wedge" => (Kind::Wedge, 1.0),
+            _ => bail!("unknown shape {shape:?}; one of {}", SHAPES.join(", ")),
+        };
+        let top = num(args, "top_scale").unwrap_or(top).max(0.0);
+        let up = super::axis_named(args, "up")?;
+        // A wedge rises toward +axis; with no axis given, along x (or y if up is x).
+        let axis = if kind == Kind::Wedge && get(args, "axis").is_none() { if up == 0 { 1 } else { 0 } } else { axis };
+        if kind == Kind::Wedge && axis == up {
+            bail!("a wedge's `axis` (the way it rises) must differ from `up`");
+        }
+        let (lo, hi) = (a.min(b), a.max(b));
+        let center = (lo.as_vec3() + hi.as_vec3() + 1.0) * 0.5;
+        let half = (hi - lo + IVec3::ONE).as_vec3() * 0.5;
+        let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+        let radius = match kind {
+            Kind::Torus => num(args, "radius").unwrap_or(half[axis]).clamp(0.5, (half[u] + half[w]) * 0.5),
+            Kind::RoundedBox => num(args, "radius").unwrap_or((half.min_element() * 0.5).max(1.0)).clamp(0.0, half.min_element()),
+            _ => 0.0,
+        };
+        let mut s = Solid { kind, axis, up, center, half, radius, top, inv: None, lo, hi };
+        if let Some(r) = get(args, "rotation") {
+            let d = super::vec3_value(r).context("`rotation` is [x, y, z] degrees")?;
+            if d != Vec3::ZERO {
+                let m = Mat3::from_rotation_z(d.z.to_radians()) * Mat3::from_rotation_y(d.y.to_radians()) * Mat3::from_rotation_x(d.x.to_radians());
+                s.inv = Some(m.transpose());
+                let ext = m.abs() * half;
+                s.lo = (center - ext).floor().as_ivec3();
+                s.hi = (center + ext).ceil().as_ivec3() - 1;
+            }
+        }
+        Ok(s)
+    }
+
+    /// Whether the cell `p` (its center) is inside.
+    pub fn has_cell(&self, p: IVec3) -> bool {
+        if p.cmplt(self.lo).any() || p.cmpgt(self.hi).any() {
+            return false;
+        }
+        let mut d = p.as_vec3() + 0.5 - self.center;
+        if let Some(m) = self.inv {
+            d = m * d;
+        }
+        let h = self.half;
+        if d.abs().cmpgt(h + 1e-4).any() {
+            return false;
+        }
+        let q = d / h;
+        let (a, u, w) = (self.axis, (self.axis + 1) % 3, (self.axis + 2) % 3);
+        // 0 at the base (low end of the axis), 1 at the tip.
+        let t = (q[a] + 1.0) * 0.5;
+        let scale = 1.0 + (self.top - 1.0) * t;
+        match self.kind {
+            Kind::Box => true,
+            Kind::Ellipsoid => q.length_squared() <= 1.0,
+            Kind::Round => (q[u] * q[u] + q[w] * q[w]).sqrt() <= scale,
+            Kind::Square => q[u].abs().max(q[w].abs()) <= scale,
+            Kind::Torus => {
+                let ring = (h[u] + h[w]) * 0.5;
+                let rho = (q[u] * q[u] + q[w] * q[w]).sqrt() * ring;
+                let r = self.radius;
+                let (e, f) = ((rho - (ring - r)) / r, q[a]);
+                e * e + f * f <= 1.0
+            }
+            Kind::Capsule => {
+                let cap = ((h[u] + h[w]) * 0.5).min(h[a]);
+                let s = h[a] - cap;
+                let e = (d[a] - d[a].clamp(-s, s)) / cap;
+                q[u] * q[u] + q[w] * q[w] + e * e <= 1.0
+            }
+            Kind::RoundedBox => {
+                let r = self.radius;
+                let k = d.abs() - (h - r);
+                k.max(Vec3::ZERO).length() + k.max_element().min(0.0) <= r + 1e-4
+            }
+            Kind::Wedge => t >= (q[self.up] + 1.0) * 0.5 - 1e-4,
+        }
+    }
+}
+
+/// `v` with every cell between `lo` and `hi` where `inside` holds set to
+/// `c` (only the shell if `hollow`).
+fn fill_where(v: &Volume, lo: IVec3, hi: IVec3, c: u8, hollow: bool, inside: impl Fn(IVec3) -> bool) -> Volume {
+    let mut out = v.clone();
+    let (lo, hi) = (lo.max(IVec3::ZERO), hi.min(v.dims - 1));
+    for z in lo.z..=hi.z {
+        for y in lo.y..=hi.y {
+            for x in lo.x..=hi.x {
+                let p = IVec3::new(x, y, z);
+                if inside(p) && (!hollow || NEIGHBORS.iter().any(|&n| !inside(p + n))) {
+                    out.set(p, c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fill `s` with `c`.
+pub fn fill_solid(v: &Volume, s: &Solid, c: u8, hollow: bool) -> Volume {
+    fill_where(v, s.lo, s.hi, c, hollow, |p| s.has_cell(p))
+}
+
+// ---------------------------------------------------------------- tubes
+
+fn points3(a: &Value) -> Result<Vec<Vec3>> {
+    let list = get(a, "points").and_then(Value::as_array).context("`points` must be [[x, y, z], ...]")?;
+    let pts = list.iter().map(|p| super::vec3_value(p).context("each point is [x, y, z]")).collect::<Result<Vec<_>>>()?;
+    if pts.len() < 2 {
+        bail!("`points` needs at least 2 points");
+    }
+    Ok(pts)
+}
+
+/// A dense polyline (in cell coordinates) along the curve through `pts`.
+fn sample_curve(pts: &[Vec3], curve: &str, closed: bool) -> Result<Vec<Vec3>> {
+    let mut pts = pts.to_vec();
+    if closed && pts.first() != pts.last() {
+        pts.push(pts[0]);
+    }
+    let per = |len: f32| ((len * 3.0).ceil() as usize).clamp(1, 4096);
+    let mut out = vec![pts[0]];
+    match curve {
+        "straight" => out = pts,
+        "smooth" => {
+            let n = pts.len();
+            let at = |i: isize| {
+                if closed {
+                    pts[(i.rem_euclid(n as isize - 1)) as usize]
+                } else {
+                    pts[i.clamp(0, n as isize - 1) as usize]
+                }
+            };
+            for i in 0..n - 1 {
+                let (p0, p1, p2, p3) = (at(i as isize - 1), at(i as isize), at(i as isize + 1), at(i as isize + 2));
+                let steps = per(p1.distance(p2));
+                for s in 1..=steps {
+                    let t = s as f32 / steps as f32;
+                    let (t2, t3) = (t * t, t * t * t);
+                    out.push(0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3));
+                }
+            }
+        }
+        "bezier" => {
+            let steps = per(pts.windows(2).map(|w| w[0].distance(w[1])).sum());
+            for s in 1..=steps {
+                let t = s as f32 / steps as f32;
+                let mut q = pts.clone();
+                while q.len() > 1 {
+                    q = q.windows(2).map(|w| w[0].lerp(w[1], t)).collect();
+                }
+                out.push(q[0]);
+            }
+        }
+        c => bail!("unknown curve {c:?}; smooth, bezier or straight"),
+    }
+    Ok(out)
+}
+
+/// A tube along `path` whose radius goes from `r0` to `r1` by length.
+fn tube_volume(v: &Volume, path: &[Vec3], r0: f32, r1: f32, c: u8) -> Volume {
+    let (r0, r1) = (r0.clamp(0.5, 256.0), r1.clamp(0.5, 256.0));
+    let total = path.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>().max(1e-6);
+    let mut out = v.clone();
+    let mut along = 0.0;
+    let path: Vec<Vec3> = path.iter().map(|p| *p + 0.5).collect();
+    let single = [path[0], path[0]];
+    let segs: Vec<&[Vec3]> = if path.len() == 1 { vec![&single[..]] } else { path.windows(2).collect() };
+    for w in segs {
+        let (a, b) = (w[0], w[1]);
+        let len = a.distance(b);
+        let (ra, rb) = (r0 + (r1 - r0) * along / total, r0 + (r1 - r0) * (along + len) / total);
+        along += len;
+        let r = ra.max(rb);
+        let lo = (a.min(b) - r).floor().as_ivec3().max(IVec3::ZERO);
+        let hi = (a.max(b) + r).ceil().as_ivec3().min(v.dims - 1);
+        let ab = b - a;
+        let l2 = ab.length_squared();
+        for z in lo.z..=hi.z {
+            for y in lo.y..=hi.y {
+                for x in lo.x..=hi.x {
+                    let p = IVec3::new(x, y, z);
+                    let q = p.as_vec3() + 0.5;
+                    let t = if l2 > 0.0 { ((q - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                    if q.distance(a + ab * t) <= ra + (rb - ra) * t + 1e-3 {
+                        out.set(p, c);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- polygons
+
+fn points2(v: &Value) -> Result<Vec<Vec2>> {
+    let list = v.as_array().context("a polygon is [[u, v], ...]")?;
+    list.iter()
+        .map(|p| {
+            let a = p.as_array().filter(|a| a.len() == 2).context("each polygon point is [u, v]")?;
+            let n = |i: usize| a[i].as_f64().map(|f| f as f32).context("polygon points hold numbers");
+            Ok(Vec2::new(n(0)?, n(1)?))
+        })
+        .collect()
+}
+
+/// Whether `p` is inside polygon `poly` (even-odd) or within half a cell of
+/// its outline.
+fn in_polygon(poly: &[Vec2], p: Vec2) -> bool {
+    let n = poly.len();
+    let mut inside = false;
+    for i in 0..n {
+        let (a, b) = (poly[i], poly[(i + 1) % n]);
+        let ab = b - a;
+        let t = if ab.length_squared() > 0.0 { ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+        if p.distance(a + ab * t) <= 0.5 + 1e-4 {
+            return true;
+        }
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+/// The in-plane axes (u, v) for polygons extruded along `axis`.
+fn plane_axes(axis: usize) -> (usize, usize) {
+    match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extrude_volume(v: &Volume, axis: usize, outline: &[Vec2], holes: &[Vec<Vec2>], d0: i32, d1: i32, c: u8, hollow: bool) -> Volume {
+    let (u, w) = plane_axes(axis);
+    let (mut lo, mut hi) = (IVec3::ZERO, v.dims - 1);
+    let min = outline.iter().fold(Vec2::splat(f32::MAX), |m, p| m.min(*p)).floor().as_ivec2();
+    let max = outline.iter().fold(Vec2::splat(f32::MIN), |m, p| m.max(*p)).ceil().as_ivec2();
+    (lo[u], lo[w], lo[axis]) = (min.x.max(0), min.y.max(0), d0.max(0));
+    (hi[u], hi[w], hi[axis]) = (max.x.min(v.dims[u] - 1), max.y.min(v.dims[w] - 1), d1.min(v.dims[axis] - 1));
+    // The 2D mask once, then extrude.
+    let (mw, mh) = ((hi[u] - lo[u] + 1).max(0), (hi[w] - lo[w] + 1).max(0));
+    let mut mask = vec![false; (mw * mh) as usize];
+    for j in 0..mh {
+        for i in 0..mw {
+            let p = Vec2::new((lo[u] + i) as f32, (lo[w] + j) as f32);
+            mask[(i + j * mw) as usize] = in_polygon(outline, p) && !holes.iter().any(|h| h.len() >= 2 && in_polygon(h, p));
+        }
+    }
+    let inside = |p: IVec3| {
+        let (i, j) = (p[u] - lo[u], p[w] - lo[w]);
+        (d0..=d1).contains(&p[axis]) && (0..mw).contains(&i) && (0..mh).contains(&j) && mask[(i + j * mw) as usize]
+    };
+    fill_where(v, lo, hi, c, hollow, inside)
+}
+
+// ---------------------------------------------------------------- stamps
+
+fn stamp_dir() -> PathBuf {
+    crate::app::workspace_dir().join("stamps")
+}
+
+fn stamp_path(name: &str) -> PathBuf {
+    stamp_dir().join(format!("{name}.vox"))
+}
+
+fn stamp_name(a: &Value) -> Result<String> {
+    let name = string(a, "name").context("missing `name`")?.trim();
+    if name.is_empty() || name.len() > 80 || !name.chars().all(|c| c.is_alphanumeric() || " -_".contains(c)) {
+        bail!("stamp names use letters, digits, spaces, - and _");
+    }
+    Ok(name.to_string())
+}
+
+/// Write `v` with its palette as a single-model .vox.
+pub fn write_stamp(path: &std::path::Path, v: &Volume, palette: &[[u8; 4]]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    crate::vox::write(path, &crate::world::World::single(v.clone()), palette, &[], &[])
+}
+
+/// A stamp's voxels and the palette they were saved with.
+pub fn read_stamp(path: &std::path::Path) -> Result<(Volume, Vec<[u8; 4]>)> {
+    let f = crate::vox::VoxFile::load(path)?;
+    let w = crate::world::World::from_vox(&f);
+    let id = *w.models().first().context("the stamp file has no model")?;
+    let (v, _) = w.checkout(id).context("the stamp file has no model")?;
+    Ok((v, f.palette))
+}
+
+/// The cells of `v` between `lo` and `hi` (clamped), as their own volume.
+fn crop(v: &Volume, lo: IVec3, hi: IVec3) -> Volume {
+    let (lo, hi) = (lo.max(IVec3::ZERO), hi.min(v.dims - 1));
+    let mut out = Volume::new((hi - lo + 1).max(IVec3::ONE));
+    for (i, &c) in v.cells.iter().enumerate() {
+        let p = v.position(i);
+        if c != 0 && p.cmpge(lo).all() && p.cmple(hi).all() {
+            out.set(p - lo, c);
+        }
+    }
+    out
+}
+
+fn save_stamp(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
+    let name = stamp_name(a)?;
+    let (src, label) = match get(a, "part") {
+        Some(p) => {
+            let id = super::find_part(ctx.scene, Some(p))?;
+            let w = ctx.scene.synced_world();
+            let (v, _) = w.checkout(id).with_context(|| format!("`{}` is a group; pass one of its parts", w.label(id)))?;
+            (v, w.label(id))
+        }
+        None => (ctx.scene.volume.clone(), ctx.scene.editing().map_or_else(|| "the world".into(), |id| ctx.scene.world.label(id))),
+    };
+    let (lo, hi) = match (opt_ivec3(a, "from")?, opt_ivec3(a, "to")?) {
+        (Some(f), Some(t)) => (f.min(t), f.max(t)),
+        (None, None) => super::bounds(&src).with_context(|| format!("`{label}` has no voxels"))?,
+        _ => bail!("give both `from` and `to`, or neither"),
+    };
+    let v = crop(&src, lo, hi);
+    let n = count(&v);
+    if n == 0 {
+        bail!("no voxels between {:?} and {:?}", arr(lo), arr(hi));
+    }
+    let path = stamp_path(&name);
+    let existed = path.exists();
+    write_stamp(&path, &v, &ctx.scene.palette)?;
+    let d = v.dims;
+    Ok(vec![text(format!(
+        "{} stamp {name:?}: {n} voxels, {}x{}x{}, from {:?} of `{label}`. Saved at {}",
+        if existed { "Replaced" } else { "Saved" },
+        d.x, d.y, d.z, arr(lo), path.display()
+    ))])
+}
+
+fn list_stamps() -> Result<Vec<Value>> {
+    let list: Vec<Value> = crate::app::list_vox(&stamp_dir())
+        .iter()
+        .map(|p| {
+            let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            match read_stamp(p) {
+                Ok((v, _)) => json!({ "name": name, "size": arr(v.dims), "voxels": count(&v) }),
+                Err(e) => json!({ "name": name, "error": format!("{e:#}") }),
+            }
+        })
+        .collect();
+    Ok(vec![text(serde_json::to_string_pretty(&json!({ "folder": stamp_dir().display().to_string(), "stamps": list }))?)])
+}
+
+/// A list of axes: "x" or ["x", "z"].
+fn axes_arg(v: Option<&Value>) -> Result<Vec<usize>> {
+    let one = |v: &Value| match v.as_str() {
+        Some("x" | "X") => Ok(0),
+        Some("y" | "Y") => Ok(1),
+        Some("z" | "Z") => Ok(2),
+        _ => bail!("unknown axis {v}"),
+    };
+    match v {
+        None => Ok(Vec::new()),
+        Some(Value::Array(a)) => a.iter().map(one).collect(),
+        Some(v) => Ok(vec![one(v)?]),
+    }
+}
+
+/// The stamp's turns as one rotation: n about z, or [x, y, z] turns.
+fn turns_arg(v: Option<&Value>) -> Result<crate::world::Rot> {
+    use crate::world::Rot;
+    let q = match v {
+        None => [0, 0, 0],
+        Some(Value::Array(a)) if a.len() == 3 => {
+            let n = |i: usize| a[i].as_i64().map(|n| n as i32).context("`rotate` holds integers");
+            [n(0)?, n(1)?, n(2)?]
+        }
+        Some(v) => [0, 0, v.as_i64().context("`rotate` is quarter turns: n or [x, y, z]")? as i32],
+    };
+    Ok(Rot::turn(2, q[2]).mul(&Rot::turn(1, q[1])).mul(&Rot::turn(0, q[0])))
+}
+
+/// Stamp cells after flips and turns, from the transformed box's minimum
+/// corner, with that box's size.
+pub fn orient(v: &Volume, flips: &[usize], rot: crate::world::Rot) -> (Vec<(IVec3, u8)>, IVec3) {
+    let d = v.dims;
+    let size = rot.extent(d);
+    let corners = [rot.apply(IVec3::ZERO), rot.apply(d - 1)];
+    let lo = corners[0].min(corners[1]);
+    let cells = v
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c != 0)
+        .map(|(i, &c)| {
+            let mut p = v.position(i);
+            for &k in flips {
+                p[k] = d[k] - 1 - p[k];
+            }
+            (rot.apply(p) - lo, c)
+        })
+        .collect();
+    (cells, size)
+}
+
+fn place_stamp(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
+    let name = stamp_name(a)?;
+    let path = stamp_path(&name);
+    if !path.exists() {
+        bail!("no stamp named {name:?}; see list_stamps");
+    }
+    let (v, pal) = read_stamp(&path)?;
+    let at = ivec3(a, "at")?;
+    let flips = axes_arg(get(a, "flip"))?;
+    let rot = turns_arg(get(a, "rotate"))?;
+    // Saved colors to current palette indices: the same index if it still
+    // holds the same color, else the nearest by RGB.
+    let mut map: [u8; 256] = std::array::from_fn(|i| i as u8);
+    for i in 1..256 {
+        if pal.get(i).is_some_and(|c| c[..3] != ctx.scene.palette[i][..3]) {
+            map[i] = color(ctx.scene, &json!(super::hex(pal[i])))?;
+        }
+    }
+    if let Some(r) = get(a, "replace") {
+        let r = r.as_object().context("`replace` is {\"<stamp color index>\": color}")?;
+        for (k, c) in r {
+            let i: u8 = k.parse().map_err(|_| anyhow!("`replace` keys are stamp color indices 1-255, not {k:?}"))?;
+            map[i as usize] = color(ctx.scene, c)?;
+        }
+    }
+    if let Some(c) = get(a, "color") {
+        let c = color(ctx.scene, c)?;
+        map[1..].fill(c);
+    }
+    let (cells, size) = orient(&v, &flips, rot);
+    let lo = at
+        - match string(a, "anchor").unwrap_or("min") {
+            "min" => IVec3::ZERO,
+            "center" => size / 2,
+            "bottom" => IVec3::new(size.x / 2, size.y / 2, 0),
+            other => bail!("unknown anchor {other:?}; min, center or bottom"),
+        };
+    let mut new = ctx.scene.volume.clone();
+    let mut skipped = 0;
+    for (p, c) in &cells {
+        let q = lo + *p;
+        if new.contains(q) {
+            new.set(q, map[*c as usize]);
+        } else {
+            skipped += 1;
+        }
+    }
+    let mut what = format!("Placed stamp {name:?} ({}x{}x{}) at {:?}{}", size.x, size.y, size.z, arr(lo), mirrored_note(ctx));
+    if skipped > 0 {
+        what.push_str(&format!("; {skipped} of its voxels fell outside the canvas"));
+    }
+    let changed = apply(ctx, new);
+    Ok(edited(ctx, changed, &what))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(v: &Volume) -> usize {
+        count(v)
+    }
+
+    fn shape(name: &str, axis: usize, a: IVec3, b: IVec3, args: Value) -> Volume {
+        let v = Volume::new(IVec3::splat(24));
+        fill_solid(&v, &Solid::build(name, axis, a, b, &args).unwrap(), 1, false)
+    }
+
+    #[test]
+    fn primitives_fill_expected_cells() {
+        let (o, e) = (IVec3::ZERO, IVec3::splat(9));
+        // A frustum sits between a cone and a cylinder.
+        let cyl = n(&shape("cylinder", 2, o, e, json!({})));
+        let fr = n(&shape("frustum", 2, o, e, json!({})));
+        let cone = n(&shape("cone", 2, o, e, json!({})));
+        assert!(cone < fr && fr < cyl, "{cone} {fr} {cyl}");
+        // A torus has a hole in the middle and fills its ring.
+        let t = shape("torus", 2, o, IVec3::new(15, 15, 3), json!({}));
+        assert_eq!(t.get(IVec3::new(8, 8, 2)), 0);
+        assert_eq!(t.get(IVec3::new(2, 8, 2)), 1);
+        // Rounded box: corners cut, faces full.
+        let rb = shape("rounded_box", 2, o, e, json!({ "radius": 3 }));
+        assert_eq!(rb.get(o), 0);
+        assert_eq!(rb.get(IVec3::new(5, 5, 0)), 1);
+        assert!(n(&rb) < 1000 && n(&rb) > 800);
+        // Capsule: round ends, full middle.
+        let c = shape("capsule", 2, o, IVec3::new(5, 5, 15), json!({}));
+        assert_eq!(c.get(IVec3::new(0, 0, 8)), 0);
+        assert_eq!(c.get(IVec3::new(2, 2, 15)), 1);
+        assert_eq!(c.get(IVec3::new(2, 0, 8)), 1);
+        assert_eq!(c.get(IVec3::new(0, 2, 15)), 0);
+        // Wedge: half a box, tall at +x.
+        let w = shape("wedge", 2, o, e, json!({}));
+        assert_eq!(n(&w), 550);
+        assert_eq!(w.get(IVec3::new(9, 0, 9)), 1);
+        assert_eq!(w.get(IVec3::new(0, 0, 9)), 0);
+    }
+
+    #[test]
+    fn rotation_tilts_a_cylinder() {
+        let (a, b) = (IVec3::new(9, 9, 2), IVec3::new(13, 13, 21));
+        let up = shape("cylinder", 2, a, b, json!({}));
+        let tilted = shape("cylinder", 2, a, b, json!({ "rotation": [0, 90, 0] }));
+        // Lying along x through the same center, about the same size.
+        assert_eq!(tilted.get(IVec3::new(2, 11, 11)), 1);
+        assert_eq!(tilted.get(IVec3::new(11, 11, 21)), 0);
+        assert!(n(&up).abs_diff(n(&tilted)) * 10 < n(&up), "{} {}", n(&up), n(&tilted));
+    }
+
+    #[test]
+    fn symmetry_mirrors_changed_cells() {
+        let old = Volume::new(IVec3::new(10, 6, 4));
+        let mut new = old.clone();
+        new.set(IVec3::new(1, 2, 3), 5);
+        let m = mirror_edit(&old, new, [true, false, false], IVec3::new(9, 5, 3));
+        assert_eq!(m.get(IVec3::new(8, 2, 3)), 5);
+        assert_eq!(n(&m), 2);
+        // Two axes: four copies; an off-center plane at x = 3.
+        let mut new = old.clone();
+        new.set(IVec3::new(1, 0, 0), 7);
+        let m = mirror_edit(&old, new, [true, true, false], IVec3::new(6, 5, 3));
+        assert_eq!(n(&m), 4);
+        assert_eq!(m.get(IVec3::new(5, 5, 0)), 7);
+        // Erasing mirrors too.
+        let erased = mirror_edit(&m, Volume::from_cells(m.dims, { let mut c = m.cells.clone(); c[m.index(IVec3::new(1, 0, 0))] = 0; c }), [true, true, false], IVec3::new(6, 5, 3));
+        assert_eq!(n(&erased), 0);
+    }
+
+    #[test]
+    fn tube_and_polygon() {
+        let v = Volume::new(IVec3::splat(32));
+        let path = sample_curve(&[Vec3::new(2.0, 2.0, 2.0), Vec3::new(16.0, 28.0, 10.0), Vec3::new(29.0, 4.0, 20.0)], "smooth", false).unwrap();
+        let t = tube_volume(&v, &path, 3.0, 0.5, 1);
+        assert_eq!(t.get(IVec3::new(2, 2, 2)), 1);
+        assert_eq!(t.get(IVec3::new(29, 4, 20)), 1);
+        assert_eq!(t.get(IVec3::new(16, 28, 10)), 1);
+        // A thick start, a thin end.
+        assert_eq!(t.get(IVec3::new(4, 2, 2)), 1);
+        assert_eq!(t.get(IVec3::new(29, 4, 22)), 0);
+        // An L-shaped floor plan, 3 layers, with a square hole.
+        let l = [Vec2::new(0.0, 0.0), Vec2::new(9.0, 0.0), Vec2::new(9.0, 4.0), Vec2::new(4.0, 4.0), Vec2::new(4.0, 9.0), Vec2::new(0.0, 9.0)];
+        let p = extrude_volume(&v, 2, &l, &[], 0, 2, 1, false);
+        assert_eq!(n(&p), (10 * 5 + 5 * 5) * 3);
+        let hole = vec![Vec2::new(1.0, 1.0), Vec2::new(2.0, 1.0), Vec2::new(2.0, 2.0), Vec2::new(1.0, 2.0)];
+        let h = extrude_volume(&v, 2, &l, &[hole], 0, 0, 1, false);
+        assert_eq!(n(&h), 75 - 4);
+    }
+
+    #[test]
+    fn stamps_round_trip_and_turn() {
+        let dir = std::env::temp_dir().join(format!("voxely-stamp-{}", std::process::id()));
+        let path = dir.join("s.vox");
+        let mut v = Volume::new(IVec3::new(3, 2, 1));
+        v.set(IVec3::new(0, 0, 0), 4);
+        v.set(IVec3::new(2, 1, 0), 9);
+        let pal = crate::vox::default_palette();
+        write_stamp(&path, &v, &pal).unwrap();
+        let (back, p2) = read_stamp(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(back.dims, v.dims);
+        assert_eq!(back.cells, v.cells);
+        assert_eq!(p2[..256], pal[..256]);
+        // A quarter turn about z: 3x2 becomes 2x3.
+        let (cells, size) = orient(&v, &[], crate::world::Rot::turn(2, 1));
+        assert_eq!(size, IVec3::new(2, 3, 1));
+        assert!(cells.iter().all(|(p, _)| p.cmpge(IVec3::ZERO).all() && p.cmplt(size).all()));
+        let (flipped, _) = orient(&v, &[0], crate::world::Rot::IDENTITY);
+        assert!(flipped.contains(&(IVec3::new(2, 0, 0), 4)));
+    }
 }
