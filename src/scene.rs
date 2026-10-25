@@ -340,6 +340,9 @@ pub struct Scene {
     steps: u64,
     /// sRGB palette as stored in the file, indexed by color index.
     pub palette: Vec<[u8; 4]>,
+    /// Palette row names (ramps), as in MagicaVoxel's `NOTE` chunk: entry
+    /// k names colors 8k + 1 ..= 8k + 8.
+    pub notes: Vec<String>,
     /// Render chunks from the file, written back unchanged on save.
     pub render_dicts: Vec<Dict>,
     pub materials: Vec<GpuMaterial>,
@@ -828,7 +831,7 @@ impl Scene {
             (1..256u32).filter_map(|i| material_dict(&self.materials[i as usize]).map(|d| (i, d))).collect();
         let mut render = self.render_dicts.clone();
         self.settings.write_vox(&mut render);
-        crate::vox::write(path, &self.synced_world(), &self.palette, &mats, &render)
+        crate::vox::write(path, &self.synced_world(), &self.palette, &mats, &self.notes, &render)
     }
 
     pub fn from_vox(f: &VoxFile) -> Result<Self> {
@@ -844,7 +847,9 @@ impl Scene {
             bail!("scene too large: voxels in {bricks} 8x8x8 bricks (the limit is {MAX_BRICKS})");
         }
         let render_dicts = f.render_order.iter().filter(|k| *k != crate::vox::ANIM_TYPE).filter_map(|k| f.render.get(k).cloned()).collect();
-        Ok(Self::assemble(world, f.palette.clone(), &f.materials, render_dicts, RenderSettings::from_vox(f)))
+        let mut s = Self::assemble(world, f.palette.clone(), &f.materials, render_dicts, RenderSettings::from_vox(f));
+        s.notes = f.notes.clone();
+        Ok(s)
     }
 
     /// An empty canvas with the default palette, like MagicaVoxel's new model.
@@ -874,6 +879,7 @@ impl Scene {
             future: Vec::new(),
             steps: 0,
             palette,
+            notes: Vec::new(),
             render_dicts,
             materials,
             lights: Vec::new(),
@@ -1100,18 +1106,38 @@ impl Scene {
         self.view(self.mode);
     }
 
-    /// Recolor every model through `remap` (palette sorting).
+    /// Recolor every model through `remap` (palette sorting, swapping,
+    /// packing), including flipbook drawings and the tree's undo steps, so
+    /// undoing later brings back the same colors.
     pub fn remap(&mut self, remap: &[u8]) {
         let fix = |v: &mut Volume| v.cells.update_filled(|c| *c = remap[*c as usize]);
         fix(&mut self.volume);
         if let Some((ctx, _)) = &mut self.context {
             fix(ctx);
         }
-        for n in self.world.nodes.iter_mut().flatten() {
-            if let crate::world::Kind::Model(v) = &mut n.kind {
-                fix(v);
+        for w in std::iter::once(&mut self.world).chain(&mut self.history).chain(&mut self.future) {
+            for n in w.nodes.iter_mut().flatten() {
+                if let crate::world::Kind::Model(v) = &mut n.kind {
+                    fix(v);
+                }
+                n.flip.iter_mut().filter_map(|s| s.volume.as_mut()).for_each(fix);
             }
         }
+    }
+
+    /// Which palette entries any model, drawing or the edited part uses.
+    pub fn used_colors(&self) -> Vec<bool> {
+        let mut used = vec![false; 256];
+        let mut mark = |v: &Volume| v.cells.filled().for_each(|(_, c)| used[c as usize] = true);
+        mark(&self.volume);
+        for n in self.world.nodes.iter().flatten() {
+            if let crate::world::Kind::Model(v) = &n.kind {
+                mark(v);
+            }
+            n.flip.iter().filter_map(|s| s.volume.as_ref()).for_each(&mut mark);
+        }
+        used[0] = false;
+        used
     }
 
     /// Every visible model flattened (for exports and rendering).
@@ -1181,6 +1207,39 @@ mod tests {
         assert!((back.materials[20].emit - 31.6).abs() < 0.05, "{}", back.materials[20].emit);
         assert_eq!(back.materials[30].kind, MaterialKind::Glass as u32);
         assert!((back.materials[30].trans - 0.8).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ramp_names_round_trip() {
+        let mut s = Scene::empty(IVec3::splat(4));
+        s.volume.set_index(0, 3);
+        s.notes = vec![String::new(); 32];
+        s.notes[0] = "skin".into();
+        s.notes[31] = "glow".into();
+        let back = save_and_load(&s);
+        assert_eq!(back.notes, s.notes);
+        // No names, no NOTE chunk.
+        s.notes.clear();
+        assert!(save_and_load(&s).notes.is_empty());
+    }
+
+    #[test]
+    fn remap_reaches_tree_history() {
+        let mut s = Scene::empty(IVec3::splat(4));
+        s.volume.set_index(0, 3);
+        s.store();
+        s.volume.set_index(1, 4);
+        // The undo step holds the model before this edit: just color 3.
+        s.store();
+        let mut remap: [u8; 256] = std::array::from_fn(|i| i as u8);
+        remap[3] = 9;
+        remap[4] = 10;
+        s.remap(&remap);
+        assert_eq!(s.volume.cells.to_vec()[..2], [9, 10]);
+        assert!(s.used_colors()[9] && !s.used_colors()[3]);
+        let old = s.history.last().unwrap();
+        let cells: Vec<u8> = old.nodes.iter().flatten().filter_map(|n| n.volume()).flat_map(|v| v.cells.iter().copied()).filter(|&c| c != 0).collect();
+        assert_eq!(cells, vec![9], "the undo step was recolored too");
     }
 
     fn save_and_load(s: &Scene) -> Scene {

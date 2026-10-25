@@ -61,8 +61,8 @@ pub enum Command {
     /// Center the camera on the selection, or the model [5].
     Focus,
     Snapshot,
-    /// Replace the palette with a 256x1 palette image.
-    LoadPalette(PathBuf),
+    /// A palette-wide edit: load, save, sort, swap, blend, ...
+    Palette(crate::palette_lib::Cmd),
     /// Use a model file as the Pattern brush's pattern.
     LoadPattern(PathBuf),
     /// Make the selection the pattern.
@@ -79,7 +79,6 @@ pub enum Command {
     /// Scale / Shear / Rotate / Repeat with MagicaVoxel's "axes values"
     /// text, e.g. "xyz 2".
     Transform(TransformKind, String),
-    PaletteSort,
     /// Recolor voxels randomly with the selected palette colors.
     PaletteRandom,
     /// Export in one of MagicaVoxel's formats (asks where to save).
@@ -131,11 +130,77 @@ pub struct PaletteState {
     pub rgb: bool,
     /// Color code being typed.
     pub code: String,
+    /// The swatch being dragged onto another.
+    pub drag: Option<usize>,
+    /// Colors drawn with lately, newest first.
+    pub recent: Vec<u8>,
+    /// Palette states to go back to (see `palette_lib::Cmd::Undo`).
+    pub history: Vec<crate::palette_lib::Snap>,
+    /// The swatch whose color is being edited, so one slider drag is one
+    /// palette undo step.
+    pub editing: Option<usize>,
+    /// Hue / saturation / value shift being dragged, and the colors it
+    /// started from.
+    pub shift: [f32; 3],
+    pub shift_base: Option<Vec<(usize, [u8; 4])>>,
+    /// Loading a palette recolors the model's colors to the nearest new
+    /// ones instead of replacing them by index.
+    pub match_colors: bool,
+    /// For each slot such a load recolored, the color it had before the
+    /// first of them, so later loads match against the model's real colors
+    /// and loading the original palette back restores them exactly. Editing
+    /// a slot's color forgets it.
+    pub look: Vec<Option<[u8; 4]>>,
+    pub library_open: bool,
+    /// The palette hovered this frame, shown on the model.
+    pub preview: Option<crate::palette_lib::Source>,
+    /// What the renderer is showing instead of the real palette.
+    pub previewing: Option<(String, bool)>,
+    /// Colors of library palettes by key (`None` if unreadable).
+    pub cache: std::collections::HashMap<String, Option<Vec<[u8; 4]>>>,
+    /// Palettes saved in the workspace, and when they were listed.
+    pub saved: Vec<PathBuf>,
+    pub saved_scanned: Option<std::time::Instant>,
+    pub save_name: String,
+    /// The last palette edit's result, and when.
+    pub status: Option<(String, std::time::Instant)>,
 }
 
 impl Default for PaletteState {
     fn default() -> Self {
-        PaletteState { selected: vec![false; 256], mask_unused: false, rgb: false, code: String::new() }
+        PaletteState {
+            selected: vec![false; 256],
+            mask_unused: false,
+            rgb: false,
+            code: String::new(),
+            drag: None,
+            recent: Vec::new(),
+            history: Vec::new(),
+            editing: None,
+            shift: [0.0; 3],
+            shift_base: None,
+            match_colors: true,
+            look: vec![None; 256],
+            library_open: false,
+            preview: None,
+            previewing: None,
+            cache: Default::default(),
+            saved: Vec::new(),
+            saved_scanned: None,
+            save_name: String::new(),
+            status: None,
+        }
+    }
+}
+
+impl PaletteState {
+    /// A library palette's colors, read once.
+    pub fn cache_colors(&mut self, key: &str, src: &crate::palette_lib::Source) -> Option<Vec<[u8; 4]>> {
+        self.cache.entry(key.to_string()).or_insert_with(|| src.colors().ok()).clone()
+    }
+
+    pub fn say(&mut self, msg: String) {
+        self.status = Some((msg, std::time::Instant::now()));
     }
 }
 
@@ -595,21 +660,41 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
     iso
 }
 
-/// Left column: palette pages, swatches, the color editor, and in the
-/// renderer the material of the selected color.
-pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut PaletteState, pages: &[PathBuf], cmds: &mut Vec<Command>) -> EditActions {
+/// Left column: quick palettes, recent colors, the swatches (drag one onto
+/// another to swap, move, copy or blend; right-click for more), the color
+/// editor and the ramp tools.
+pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut PaletteState, quick: &[crate::palette_lib::Source], cmds: &mut Vec<Command>) -> EditActions {
+    use crate::palette_lib::{self as lib, Cmd};
     let mut a = EditActions::default();
     heading(ui, "Palette");
     ui.horizontal(|ui| {
-        for (k, p) in pages.iter().enumerate() {
-            let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            if ui.small_button(k.to_string()).on_hover_text(format!("Load palette {name}")).clicked() {
-                cmds.push(Command::LoadPalette(p.clone()));
+        // Four quick buttons, Lib and the menu share the column's width.
+        ui.spacing_mut().item_spacing.x = 3.0;
+        ui.spacing_mut().button_padding.x = 4.0;
+        for (k, src) in quick.iter().enumerate() {
+            let look = if pal.match_colors { ", keeping the model's look" } else { "" };
+            let r = ui.small_button(k.to_string()).on_hover_text(format!("Load {}{look}", src.name()));
+            if r.hovered() {
+                pal.preview = Some(src.clone());
+            }
+            if r.clicked() {
+                cmds.push(Command::Palette(Cmd::Load(src.clone(), pal.match_colors)));
             }
         }
+        if ui.selectable_label(pal.library_open, "Lib").on_hover_text("Palette library: favorites, saved palettes, MagicaVoxel's and presets").clicked() {
+            pal.library_open ^= true;
+        }
         ui.menu_button("...", |ui| {
-            if ui.button("Sort").on_hover_text("Sort palette").clicked() {
-                cmds.push(Command::PaletteSort);
+            ui.menu_button("Sort", |ui| {
+                for k in crate::palette_ops::SortKey::ALL {
+                    if ui.button(format!("By {}", k.name())).clicked() {
+                        cmds.push(Command::Palette(Cmd::Sort(k)));
+                        ui.close();
+                    }
+                }
+            });
+            if ui.button("Pack").on_hover_text("Used colors first from slot 1, duplicates merged; the model looks the same").clicked() {
+                cmds.push(Command::Palette(Cmd::Pack));
                 ui.close();
             }
             ui.checkbox(&mut pal.mask_unused, "Mask").on_hover_text("Mask unused voxel colors");
@@ -627,12 +712,37 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
                 pal.selected.fill(false);
                 ui.close();
             }
+            ui.separator();
+            if ui.add_enabled(!pal.history.is_empty(), egui::Button::new("Undo palette")).on_hover_text("Undo the last palette change").clicked() {
+                cmds.push(Command::Palette(Cmd::Undo));
+                ui.close();
+            }
         });
+    });
+    let swatch = 14.0;
+    let paint = |ui: &Ui, rect: egui::Rect, c: [u8; 4]| ui.painter().rect_filled(rect, 1.0, egui::Color32::from_rgb(c[0], c[1], c[2]));
+    // Recent colors, newest first.
+    if pal.recent.first() != Some(&e.color) {
+        let c = e.color;
+        pal.recent.retain(|&x| x != c);
+        pal.recent.insert(0, c);
+        pal.recent.truncate(8);
+    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        for c in pal.recent.clone() {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(swatch, swatch), egui::Sense::click());
+            paint(ui, rect, scene.palette[c as usize]);
+            if resp.clicked() {
+                e.color = c;
+            }
+            resp.on_hover_text(format!("#{c} · recent"));
+        }
     });
     let used = if pal.mask_unused { crate::palette_ops::mask_unused(&scene.palette, &scene.volume) } else { Vec::new() };
     // 8 columns like MagicaVoxel, which lists colors bottom-up: index 1 at
-    // the bottom left, 255 near the top right.
-    let swatch = 14.0;
+    // the bottom left, 255 near the top right. Each row is a ramp.
+    let mut rects = [egui::Rect::NOTHING; 256];
     egui::Grid::new("palette").spacing([1.0, 1.0]).min_col_width(swatch).show(ui, |ui| {
         for k in 0..256usize {
             let (row, col) = (31 - k / 8, k % 8);
@@ -647,13 +757,17 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
             if used.get(i) == Some(&false) {
                 fill = fill.gamma_multiply(0.15);
             }
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(swatch, swatch), egui::Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(swatch, swatch), egui::Sense::click_and_drag());
+            rects[i] = rect;
             ui.painter().rect_filled(rect, 1.0, fill);
             if pal.selected[i] {
                 ui.painter().rect_stroke(rect.shrink(1.0), 1.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 160, 255)), egui::StrokeKind::Inside);
             }
             if e.color as usize == i {
                 ui.painter().rect_stroke(rect.expand(1.0), 1.0, egui::Stroke::new(2.0, egui::Color32::WHITE), egui::StrokeKind::Outside);
+            }
+            if resp.drag_started() {
+                pal.drag = Some(i);
             }
             if resp.clicked() {
                 // Shift/Ctrl+click toggles the color selection.
@@ -664,14 +778,44 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
                     e.color = i as u8;
                 }
             }
-            resp.on_hover_text(format!("#{i} · Shift+click to select"));
+            resp.context_menu(|ui| swatch_menu(ui, i, e, scene, pal, cmds));
+            let ramp = scene.notes.get((i - 1) / 8).filter(|n| !n.is_empty()).map(|n| format!(" · {n}")).unwrap_or_default();
+            resp.on_hover_text(format!("#{i}{ramp}\nShift+click: select · Right-click: more\nDrag onto another: swap · Ctrl: move · Ctrl+Shift: copy · Shift: blend"));
             if col == 7 {
                 ui.end_row();
             }
         }
     });
+    if let Some(from) = pal.drag {
+        let pos = ui.ctx().pointer_interact_pos();
+        let target = pos.and_then(|p| (1..256).find(|&i| rects[i].contains(p))).filter(|&t| t != from);
+        let (cmd, verb) = drag_command(ui.input(|i| i.modifiers), from, target.unwrap_or(from));
+        if ui.input(|i| i.pointer.primary_down()) {
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("palette_drag")));
+            if let Some(p) = pos {
+                painter.line_segment([rects[from].center(), p], egui::Stroke::new(2.0, egui::Color32::WHITE));
+                let label = match target {
+                    Some(t) => format!("{verb} {from} to {t}"),
+                    None => verb.to_string(),
+                };
+                painter.text(p + egui::vec2(12.0, -12.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(13.0), egui::Color32::WHITE);
+            }
+            if let Some(t) = target {
+                painter.rect_stroke(rects[t].expand(1.5), 1.0, egui::Stroke::new(2.0, egui::Color32::YELLOW), egui::StrokeKind::Outside);
+            }
+        } else {
+            if target.is_some() {
+                cmds.push(Command::Palette(cmd));
+            }
+            pal.drag = None;
+        }
+    }
     ui.separator();
     let i = e.color as usize;
+    // One slider drag (or one typed code) is one palette undo step.
+    if !ui.input(|i| i.pointer.any_down()) {
+        pal.editing = None;
+    }
     let mut rgb = [scene.palette[i][0], scene.palette[i][1], scene.palette[i][2]];
     let before = rgb;
     ui.spacing_mut().slider_width = 60.0;
@@ -707,11 +851,143 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
         }
     });
     if rgb != before {
+        if pal.editing != Some(i) {
+            lib::push(&mut pal.history, lib::snapshot(scene, &pal.look));
+            pal.editing = Some(i);
+        }
+        pal.look[i] = None;
         scene.palette[i] = [rgb[0], rgb[1], rgb[2], scene.palette[i][3]];
         scene.sync_color(i);
         a.materials_changed = true;
     }
+    a.materials_changed |= ramp_tools(ui, i, scene, pal, cmds);
+    if let Some((msg, t)) = &pal.status {
+        if t.elapsed().as_secs() < 6 {
+            ui.add(egui::Label::new(egui::RichText::new(msg).weak().small()).wrap());
+        }
+    }
     a
+}
+
+/// What dropping swatch `from` on `to` does with these modifiers, and its
+/// name: swap (plain or Alt, MagicaVoxel's Alt+drag), move (Ctrl), copy
+/// (Ctrl+Shift) or blend the slots between (Shift, or MagicaVoxel's
+/// Ctrl+Alt+Shift).
+fn drag_command(m: egui::Modifiers, from: usize, to: usize) -> (crate::palette_lib::Cmd, &'static str) {
+    use crate::palette_lib::Cmd;
+    if m.shift && (m.alt || !m.command) {
+        (Cmd::Gradient(from, to), "Blend")
+    } else if m.command && m.shift {
+        (Cmd::Copy(from, to), "Copy")
+    } else if m.command {
+        (Cmd::Move(from, to), "Move")
+    } else {
+        (Cmd::Swap(from, to), "Swap")
+    }
+}
+
+/// The first and last color of the row (ramp) holding color `i`.
+fn ramp_of(i: usize) -> (usize, usize) {
+    let lo = (i - 1) / 8 * 8 + 1;
+    (lo, (lo + 7).min(255))
+}
+
+/// Edit the name of the ramp holding color `i`.
+fn ramp_name(ui: &mut Ui, i: usize, scene: &mut Scene) {
+    let row = (i - 1) / 8;
+    let (lo, hi) = ramp_of(i);
+    let mut name = scene.notes.get(row).cloned().unwrap_or_default();
+    let r = ui.add(egui::TextEdit::singleline(&mut name).hint_text(format!("ramp {lo}-{hi}")).desired_width(100.0));
+    if r.on_hover_text("Name this row of colors (saved in the .vox like MagicaVoxel's palette notes)").changed() {
+        if scene.notes.len() < 32 {
+            scene.notes.resize(32, String::new());
+        }
+        scene.notes[row] = name;
+    }
+}
+
+/// The ramp row under the color editor: its name, Blend, and a hue /
+/// saturation / value shift for the selected colors (or the ramp).
+/// Returns whether colors changed.
+fn ramp_tools(ui: &mut Ui, i: usize, scene: &mut Scene, pal: &mut PaletteState, cmds: &mut Vec<Command>) -> bool {
+    use crate::palette_lib::{self as lib, Cmd};
+    let (lo, hi) = ramp_of(i);
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Ramp");
+        ramp_name(ui, i, scene);
+    });
+    let picked: Vec<usize> = (1..256).filter(|&k| pal.selected[k]).collect();
+    let (targets, what) = if picked.is_empty() { ((lo..=hi).collect::<Vec<_>>(), format!("ramp {lo}-{hi}")) } else { (picked.clone(), format!("{} selected", picked.len())) };
+    ui.horizontal(|ui| {
+        if ui.small_button("Blend").on_hover_text(format!("Blend {lo}-{hi} evenly from the first color to the last")).clicked() {
+            cmds.push(Command::Palette(Cmd::Gradient(lo, hi)));
+        }
+        ui.label(egui::RichText::new(format!("Shift {what}")).weak().small());
+    });
+    let mut changed = false;
+    let mut done = false;
+    for (k, n) in ["H", "S", "V"].into_iter().enumerate() {
+        let range = if k == 0 { -0.5..=0.5 } else { -1.0..=1.0 };
+        let r = ui.add(Slider::new(&mut pal.shift[k], range).text(n).show_value(false)).on_hover_text(match k {
+            0 => "Turn the hue",
+            1 => "More or less saturated",
+            _ => "Lighter or darker",
+        });
+        changed |= r.changed();
+        done |= r.drag_stopped() || (r.changed() && !r.dragged());
+    }
+    if changed {
+        if pal.shift_base.as_ref().is_none_or(|b| !b.iter().map(|x| x.0).eq(targets.iter().copied())) {
+            lib::push(&mut pal.history, lib::snapshot(scene, &pal.look));
+            lib::forget(&mut pal.look, targets.iter().copied());
+            pal.shift_base = Some(targets.iter().map(|&t| (t, scene.palette[t])).collect());
+        }
+        let [dh, ds, dv] = pal.shift;
+        for &(t, c) in pal.shift_base.iter().flatten() {
+            scene.palette[t] = crate::palette_ops::adjust(c, dh, ds, dv);
+            scene.sync_color(t);
+        }
+    }
+    if done {
+        pal.shift = [0.0; 3];
+        pal.shift_base = None;
+    }
+    changed
+}
+
+/// Right-click menu of swatch `i`.
+fn swatch_menu(ui: &mut Ui, i: usize, e: &mut Editor, scene: &mut Scene, pal: &mut PaletteState, cmds: &mut Vec<Command>) {
+    use crate::palette_lib::Cmd;
+    let code = crate::palette_ops::color_code(scene.palette[i]);
+    ui.label(egui::RichText::new(format!("#{i}  {code}")).strong());
+    let mut item = |ui: &mut Ui, label: &str, cmd: Cmd| {
+        if ui.button(label).clicked() {
+            cmds.push(Command::Palette(cmd));
+            ui.close();
+        }
+    };
+    item(ui, "Select its voxels", Cmd::SelectVoxels(i, crate::edit::SelMode::Replace));
+    item(ui, "Add its voxels to the selection", Cmd::SelectVoxels(i, crate::edit::SelMode::Add));
+    item(ui, "Deselect its voxels", Cmd::SelectVoxels(i, crate::edit::SelMode::Remove));
+    item(ui, "Delete its voxels", Cmd::RemoveVoxels(i));
+    ui.separator();
+    if ui.button("Draw with it").clicked() {
+        e.color = i as u8;
+        ui.close();
+    }
+    if ui.button(if pal.selected[i] { "Unselect swatch" } else { "Select swatch" }).clicked() {
+        pal.selected[i] ^= true;
+        ui.close();
+    }
+    if ui.button("Copy color code").clicked() {
+        ui.ctx().copy_text(code);
+        ui.close();
+    }
+    ui.separator();
+    ramp_name(ui, i, scene);
+    let (lo, hi) = ramp_of(i);
+    item(ui, &format!("Blend ramp {lo}-{hi}"), Cmd::Gradient(lo, hi));
 }
 
 /// Second left column in the modeler: brush, tool, selection tools and

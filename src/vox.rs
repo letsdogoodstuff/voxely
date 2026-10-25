@@ -52,6 +52,9 @@ pub struct VoxFile {
     pub palette: Vec<[u8; 4]>,
     /// Material dictionaries, indexed by voxel color index.
     pub materials: HashMap<u32, Dict>,
+    /// Palette notes (`NOTE`): a name per palette row, row k holding color
+    /// indices 8k + 1 ..= 8k + 8.
+    pub notes: Vec<String>,
     pub nodes: HashMap<i32, Node>,
     pub layers: HashMap<i32, Dict>,
     /// Render settings keyed by their `_type` (e.g. `_inf`, `_uni`, `_lens`).
@@ -162,6 +165,10 @@ impl VoxFile {
                 b"MATL" => {
                     let id = r.i32()? as u32;
                     f.materials.insert(id, r.dict()?);
+                }
+                b"NOTE" => {
+                    let n = r.i32()?.clamp(0, 256);
+                    f.notes = (0..n).map(|_| r.string()).collect::<Result<_>>()?;
                 }
                 b"nTRN" => {
                     let node = r.i32()?;
@@ -454,6 +461,7 @@ pub fn write(
     world: &World,
     palette: &[[u8; 4]],
     materials: &[(u32, Dict)],
+    notes: &[String],
     render: &[Dict],
 ) -> Result<()> {
     let mut g = Graph { next: 0, nodes: Vec::new(), models: Vec::new() };
@@ -509,6 +517,14 @@ pub fn write(
         put_i32(&mut c, *id as i32);
         put_dict(&mut c, d);
         put_chunk(&mut body, b"MATL", &c, &[]);
+    }
+    if notes.iter().any(|n| !n.is_empty()) {
+        let mut c = Vec::new();
+        put_i32(&mut c, notes.len() as i32);
+        for n in notes {
+            put_string(&mut c, n);
+        }
+        put_chunk(&mut body, b"NOTE", &c, &[]);
     }
     for d in render.iter().filter(|d| d.get("_type").is_none_or(|t| t != ANIM_TYPE)) {
         let mut c = Vec::new();

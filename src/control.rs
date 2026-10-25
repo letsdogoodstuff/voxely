@@ -24,7 +24,7 @@ mod build;
 pub mod guide;
 mod inspect;
 mod reference;
-mod surface;
+pub(crate) mod surface;
 mod view;
 
 /// Per-session state for the tool families, plus a record of the last edit.
@@ -213,9 +213,17 @@ fn base_tools() -> Value {
         tool("set_palette_colors", "Set exact palette colors.", json!({
             "colors": { "type": "array", "items": { "type": "object", "properties": { "index": { "type": "integer" }, "color": { "type": "string" } } }, "description": "[{\"index\": 1, \"color\": \"#ff8800\"}, ...]" },
         }), &["colors"]),
-        tool("load_palette", "Load a palette image (256x1 PNG), by path or by MagicaVoxel palette page number 0-3.", json!({
+        tool("load_palette", "Load a whole palette into colors 1.. : a palette file by path (MagicaVoxel 256x1 PNG, Lospec PNG, .act, .gpl or .hex), a MagicaVoxel palette page 0-3, or a preset name. With match: true the model's colors are recolored to the closest new colors (each keeps its own slot, so loading the old palette again restores them exactly); otherwise voxels keep their indices and take the new colors.", json!({
             "path": { "type": "string" }, "page": { "type": "integer" },
+            "preset": { "type": "string", "description": "A name from list_palette_presets" },
+            "match": { "type": "boolean", "description": "Recolor the model to the nearest new colors, reversibly (default false)" },
         }), &[]),
+        tool("edit_palette", "Rearrange or tidy the palette. swap / move (from, to): colors change places and voxels follow, so the model looks the same; copy (from, to): copy a color and its material onto another slot; gradient (from, to): blend the slots between two colors evenly; sort (by: hue | saturation | value): used colors first; pack: used colors into 1.. with duplicates merged; save (name): save the palette to the workspace's palettes folder; name_ramp (row, name): name a row of 8 colors (row k holds 8k+1..8k+8; saved in the .vox); undo: undo the last palette edit.", json!({
+            "action": { "type": "string", "enum": ["swap", "move", "copy", "gradient", "sort", "pack", "save", "name_ramp", "undo"] },
+            "from": { "type": "integer" }, "to": { "type": "integer" },
+            "by": { "type": "string", "enum": ["hue", "saturation", "value"] },
+            "name": { "type": "string" }, "row": { "type": "integer" },
+        }), &["action"]),
         tool("set_material", "Set the render material of a palette color.", json!({
             "color": color_schema(),
             "type": { "type": "string", "enum": ["diffuse", "metal", "glass", "emit", "blend", "cloud"] },
@@ -571,6 +579,15 @@ fn refresh_selection(ctx: &mut Ctx) {
         ctx.r.upload_selection(&ctx.scene.volume, ctx.ed.editor.selection());
         ctx.ed.editor.sel_dirty = false;
     }
+}
+
+/// Run a palette-wide edit and redraw what it changed.
+fn palette_edit(ctx: &mut Ctx, cmd: crate::palette_lib::Cmd) -> Result<Vec<Value>> {
+    let (msg, voxels) = crate::palette_lib::apply(cmd, ctx.r, ctx.scene, ctx.ed)?;
+    if voxels {
+        app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+    }
+    Ok(vec![text(msg)])
 }
 
 fn materials_changed(ctx: &mut Ctx) {
@@ -1562,7 +1579,11 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 .filter(|&i| all || used[i])
                 .map(|i| {
                     let m = &ctx.scene.materials[i];
-                    json!({ "index": i, "color": hex(ctx.scene.palette[i]), "material": kinds.get(m.kind as usize).copied().unwrap_or("?"), "in_use": used[i] })
+                    let mut e = json!({ "index": i, "color": hex(ctx.scene.palette[i]), "material": kinds.get(m.kind as usize).copied().unwrap_or("?"), "in_use": used[i] });
+                    if let Some(n) = ctx.scene.notes.get((i - 1) / 8).filter(|n| !n.is_empty()) {
+                        e["ramp"] = json!(n);
+                    }
+                    e
                 })
                 .collect();
             Ok(vec![text(serde_json::to_string(&list)?)])
@@ -1573,24 +1594,48 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 let i = item.get("index").and_then(Value::as_u64).filter(|&i| (1..=255).contains(&i)).context("index must be 1..=255")? as usize;
                 let c = parse_hex(item.get("color").and_then(Value::as_str).context("color must be \"#rrggbb\"")?)?;
                 ctx.scene.palette[i] = [c[0], c[1], c[2], 255];
+                ctx.ed.palette.look[i] = None;
                 ctx.scene.sync_color(i);
             }
             materials_changed(ctx);
             Ok(vec![text(format!("Set {} palette colors", list.len()))])
         }
         "load_palette" => {
-            let path = match (string(a, "path"), int(a, "page")) {
-                (Some(p), _) => PathBuf::from(p),
-                (None, Some(k)) => ctx.ed.palettes.get(k as usize).cloned().ok_or_else(|| anyhow!("no palette page {k}; {} available", ctx.ed.palettes.len()))?,
-                _ => bail!("give `path` or `page`"),
+            use crate::palette_lib::Source;
+            let src = match (string(a, "path"), int(a, "page"), string(a, "preset")) {
+                (Some(p), ..) => Source::File(PathBuf::from(p)),
+                (None, Some(k), _) => Source::File(ctx.ed.palettes.get(k as usize).cloned().ok_or_else(|| anyhow!("no palette page {k}; {} available", ctx.ed.palettes.len()))?),
+                (None, None, Some(n)) => Source::from_key(&format!("preset:{n}")).ok_or_else(|| anyhow!("no preset {n:?}; see list_palette_presets"))?,
+                _ => bail!("give `path`, `page` or `preset`"),
             };
-            let colors = app::load_palette(&path)?;
-            for (k, c) in colors.into_iter().enumerate() {
-                ctx.scene.palette[k + 1] = c;
-                ctx.scene.sync_color(k + 1);
-            }
-            materials_changed(ctx);
-            Ok(vec![text(format!("Loaded palette {}", path.display()))])
+            palette_edit(ctx, crate::palette_lib::Cmd::Load(src, boolean(a, "match").unwrap_or(false)))
+        }
+        "edit_palette" => {
+            use crate::palette_lib::Cmd;
+            let action = string(a, "action").context("give an `action`")?;
+            let idx = |k: &str| int(a, k).map(|v| v as usize).with_context(|| format!("{action} needs `{k}`"));
+            let cmd = match action {
+                "swap" => Cmd::Swap(idx("from")?, idx("to")?),
+                "move" => Cmd::Move(idx("from")?, idx("to")?),
+                "copy" => Cmd::Copy(idx("from")?, idx("to")?),
+                "gradient" => Cmd::Gradient(idx("from")?, idx("to")?),
+                "sort" => Cmd::Sort(string(a, "by").map_or(Some(crate::palette_ops::SortKey::Hue), crate::palette_ops::SortKey::parse).context("`by` is hue, saturation or value")?),
+                "pack" => Cmd::Pack,
+                "undo" => Cmd::Undo,
+                "save" => Cmd::Save(string(a, "name").context("save needs `name`")?.to_string()),
+                "name_ramp" => {
+                    let row = int(a, "row").filter(|r| (0..32).contains(r)).context("name_ramp needs `row` 0-31 (colors 8*row+1 ..= 8*row+8)")? as usize;
+                    let name = string(a, "name").unwrap_or_default().to_string();
+                    crate::palette_lib::push(&mut ctx.ed.palette.history, crate::palette_lib::snapshot(ctx.scene, &ctx.ed.palette.look));
+                    if ctx.scene.notes.len() < 32 {
+                        ctx.scene.notes.resize(32, String::new());
+                    }
+                    ctx.scene.notes[row] = name.clone();
+                    return Ok(vec![text(format!("Ramp {row} (colors {}-{}) is now {name:?}", row * 8 + 1, (row * 8 + 8).min(255)))]);
+                }
+                other => bail!("unknown action {other:?}"),
+            };
+            palette_edit(ctx, cmd)
         }
         "set_material" => {
             let i = color_arg(ctx.scene, a, "color")? as usize;

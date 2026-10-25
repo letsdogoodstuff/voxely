@@ -603,7 +603,7 @@ pub fn write_stamp(path: &std::path::Path, v: &Volume, palette: &[[u8; 4]]) -> R
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    crate::vox::write(path, &crate::world::World::single(v.clone()), palette, &[], &[])
+    crate::vox::write(path, &crate::world::World::single(v.clone()), palette, &[], &[], &[])
 }
 
 /// A stamp's voxels and the palette they were saved with.
