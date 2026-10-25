@@ -795,8 +795,9 @@ pub fn material(idx: u32, rgba: [u8; 4], d: Option<&Dict>) -> GpuMaterial {
     m
 }
 
-/// `rCAM` key holding voxely's own orbit camera.
-const VX_CAM: &str = "_vx_cam";
+/// The `rOBJ` holding voxely's own orbit camera, under `_cam`. MagicaVoxel
+/// skips render objects it doesn't know, and keeps its own `rCAM` cameras.
+const VX_CAM: &str = "_vx_camera";
 
 fn fmt(v: f32) -> String {
     // Short, round-trippable decimals.
@@ -878,41 +879,28 @@ impl Scene {
         Some(d)
     }
 
-    /// Camera 0 of the file as an orbit camera around a target in
-    /// `volume`'s coordinates, if the file has one voxely wrote.
+    /// The camera voxely saved in the file, as an orbit camera around a
+    /// target in `volume`'s coordinates.
     pub fn file_camera(&self) -> Option<crate::gpu::Camera> {
-        let d = &self.vox_extra.cameras.iter().find(|(id, _)| *id == 0)?.1;
-        let v: Vec<f32> = d.get(VX_CAM)?.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        let d = self.render_dicts.iter().find(|d| d.get("_type").is_some_and(|t| t == VX_CAM))?;
+        let v: Vec<f32> = d.get("_cam")?.split_whitespace().filter_map(|s| s.parse().ok()).collect();
         let [yaw, pitch, dist, x, y, z] = v[..] else { return None };
         let target = Vec3::new(x, y, z) - self.origin.as_vec3();
         [yaw, pitch, dist].iter().chain(&target.to_array()).all(|v| v.is_finite()).then_some(crate::gpu::Camera { target, yaw, pitch, dist: dist.max(0.1) })
     }
 
-    /// Store `cam` (target in `volume`'s coordinates) as camera 0, unless
-    /// it is still the camera read from the file, which is kept as it was.
+    /// Store `cam` (target in `volume`'s coordinates) for the next save,
+    /// unless it is still the camera read from the file.
     pub fn store_camera(&mut self, cam: &crate::gpu::Camera) {
         if self.vox_camera.as_ref() == Some(cam) {
             return;
         }
         let at = cam.target + self.origin.as_vec3();
-        let mut d = self.vox_extra.cameras.iter().find(|(id, _)| *id == 0).map_or_else(Dict::new, |(_, d)| d.clone());
-        let ortho = self.settings.projection == Projection::Orthographic;
-        let deg = |r: f32| fmt(r.to_degrees());
-        for (k, v) in [
-            ("_mode", if ortho { "orth".to_string() } else { "pers".to_string() }),
-            ("_focus", format!("{} {} {}", fmt(at.x), fmt(at.y), fmt(at.z))),
-            // Pitch then yaw, as in the sun's `_angle`.
-            ("_angle", format!("{} {} 0", deg(cam.pitch), deg(cam.yaw))),
-            ("_radius", fmt(cam.dist)),
-            ("_fov", fmt(self.settings.fov)),
-            // voxely's exact orbit, in world coordinates.
-            (VX_CAM, format!("{} {} {} {} {} {}", cam.yaw, cam.pitch, cam.dist, at.x, at.y, at.z)),
-        ] {
-            d.insert(k.to_string(), v);
-        }
-        d.entry("_frustum".into()).or_insert_with(|| "0.4".into());
-        self.vox_extra.cameras.retain(|(id, _)| *id != 0);
-        self.vox_extra.cameras.insert(0, (0, d));
+        let mut d = Dict::new();
+        d.insert("_type".into(), VX_CAM.into());
+        d.insert("_cam".into(), format!("{} {} {} {} {} {}", cam.yaw, cam.pitch, cam.dist, at.x, at.y, at.z));
+        self.render_dicts.retain(|d| d.get("_type").is_none_or(|t| t != VX_CAM));
+        self.render_dicts.push(d);
     }
 
     pub fn from_vox(f: &VoxFile) -> Result<Self> {
@@ -1453,11 +1441,12 @@ mod tests {
         let mut back = save_and_load(&s);
         assert_eq!(back.file_camera(), Some(cam));
         // An unmoved camera keeps the file's own dictionary.
+        // MagicaVoxel's own cameras are left alone.
+        assert!(back.vox_extra.cameras.is_empty());
         back.vox_camera = back.file_camera();
-        back.vox_extra.cameras[0].1.insert("_custom".into(), "1".into());
-        let before = back.vox_extra.cameras.clone();
+        let before = back.render_dicts.clone();
         back.store_camera(&cam);
-        assert_eq!(back.vox_extra.cameras, before);
+        assert_eq!(back.render_dicts, before);
     }
 
     #[test]
