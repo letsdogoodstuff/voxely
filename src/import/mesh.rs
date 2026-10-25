@@ -62,9 +62,17 @@ struct Mesh {
     tris: Vec<Tri>,
     mats: Vec<Material>,
     textures: Vec<Image>,
+    /// Problems worth telling the user (e.g. a missing material file).
+    warnings: Vec<String>,
 }
 
+#[cfg(test)]
 pub fn voxelize(path: &Path, opts: &MeshOptions) -> Result<Model> {
+    Ok(voxelize_noted(path, opts)?.0)
+}
+
+/// Voxelize the mesh at `path`, with warnings about what couldn't be read.
+pub fn voxelize_noted(path: &Path, opts: &MeshOptions) -> Result<(Model, Vec<String>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let mut mesh = match ext.as_str() {
         "obj" => load_obj(path),
@@ -81,7 +89,8 @@ pub fn voxelize(path: &Path, opts: &MeshOptions) -> Result<Model> {
         }
     }
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("mesh").to_string();
-    voxelize_mesh(&mesh, opts, name).with_context(|| format!("voxelizing {}", path.display()))
+    let model = voxelize_mesh(&mesh, opts, name).with_context(|| format!("voxelizing {}", path.display()))?;
+    Ok((model, std::mem::take(&mut mesh.warnings)))
 }
 
 // ---------------------------------------------------------------- voxelizing
@@ -124,10 +133,17 @@ fn voxelize_mesh(mesh: &Mesh, opts: &MeshOptions, name: String) -> Result<Model>
 
     let mut hits: HashMap<u32, Hit> = HashMap::new();
     const EPS: f32 = 1e-4;
-    let h = 0.5 + EPS;
+    // Voxels must overlap a triangle by a hair, and triangles are tested a
+    // little behind their front: a face on a voxel boundary (a voxel mesh's
+    // faces all are) then fills the voxel behind it, not the one in front
+    // too, and its edges don't reach the voxels beside it.
+    const INSET: f32 = 0.02;
+    let h = 0.5 - INSET;
     let top = dims - IVec3::ONE;
     for (ti, t) in tris.iter().enumerate() {
         let v = t.p.map(|p| (p - lo) * scale + shift);
+        let back = -(v[1] - v[0]).cross(v[2] - v[0]).normalize_or_zero() * (2.0 * INSET);
+        let v = v.map(|p| p + back);
         let tmin = v[0].min(v[1]).min(v[2]);
         let tmax = v[0].max(v[1]).max(v[2]);
         let a = (tmin - Vec3::splat(EPS)).floor().as_ivec3().clamp(IVec3::ZERO, top);
@@ -433,6 +449,20 @@ fn file_arg(dir: &Path, rest: &str) -> PathBuf {
     dir.join(name.replace('\\', "/"))
 }
 
+/// The files an `mtllib` line names: quoted names (which may hold
+/// spaces), else the whole line if it is one file, else each word.
+fn mtl_files(dir: &Path, rest: &str) -> Vec<PathBuf> {
+    let rest = rest.trim();
+    if rest.contains('"') {
+        return rest.split('"').skip(1).step_by(2).filter(|n| !n.trim().is_empty()).map(|n| dir.join(n.replace('\\', "/"))).collect();
+    }
+    let whole = dir.join(rest.replace('\\', "/"));
+    if whole.is_file() {
+        return vec![whole];
+    }
+    rest.split_whitespace().map(|n| dir.join(n.replace('\\', "/"))).collect()
+}
+
 fn load_mtl(path: &Path, into: &mut HashMap<String, ObjMaterial>) -> Result<()> {
     let text = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let text = String::from_utf8_lossy(&text);
@@ -530,9 +560,12 @@ fn load_obj(path: &Path) -> Result<Mesh> {
                 }
             }
             "mtllib" => {
-                let p = file_arg(dir, rest);
-                if let Err(e) = load_mtl(&p, &mut library) {
-                    log::warn!("{e:#}");
+                for p in mtl_files(dir, rest) {
+                    if let Err(e) = load_mtl(&p, &mut library) {
+                        log::warn!("{e:#}");
+                        let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+                        mesh.warnings.push(format!("material file {name:?} (line {ln}) couldn't be read, so its colors are missing"));
+                    }
                 }
             }
             "usemtl" => {
@@ -756,6 +789,36 @@ mod tests {
     }
 
     #[test]
+    fn voxel_meshes_come_back_voxel_for_voxel() {
+        // An L of voxels, exported as voxely meshes: re-imported at its own
+        // size, it has the same voxels (faces on voxel boundaries don't
+        // fill the voxels in front of them).
+        let mut s = crate::scene::Scene::empty(IVec3::new(3, 2, 3));
+        for p in [[0, 0, 0], [1, 0, 0], [2, 0, 0], [0, 0, 1], [0, 0, 2], [0, 1, 0]] {
+            s.volume.set(IVec3::from(p), 1);
+        }
+        let dir = std::env::temp_dir().join(format!("voxely-mesh-rt-{}", std::process::id()));
+        for f in [crate::export::Format::Obj, crate::export::Format::Gltf] {
+            let files = crate::export::export(f, &s, &dir.join("l.x")).unwrap();
+            for solid in [true, false] {
+                let m = voxelize(&files[0], &opts(3, solid)).unwrap();
+                assert_eq!((m.dims, m.voxels.len()), (IVec3::new(3, 2, 3), 6), "{f:?} solid {solid}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mtllib_names_quoted_several_and_missing() {
+        let dir = Path::new("/d");
+        assert_eq!(mtl_files(dir, r#""my colors.mtl" other.mtl"#), vec![dir.join("my colors.mtl")]);
+        assert_eq!(mtl_files(dir, "a.mtl b.mtl"), vec![dir.join("a.mtl"), dir.join("b.mtl")]);
+        let f = Temp::new("nomtl.obj", format!("mtllib missing.mtl\n{CUBE_V}{CUBE_F}").as_bytes());
+        let (_, warnings) = voxelize_noted(&f.0, &opts(2, true)).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("missing.mtl")), "{warnings:?}");
+    }
+
+    #[test]
     fn unit_cube_solid_and_hollow() {
         let f = Temp::new("cube.obj", format!("{CUBE_V}{CUBE_F}").as_bytes());
         let m = voxelize(&f.0, &opts(8, true)).unwrap();
@@ -919,7 +982,7 @@ mod tests {
                 tris.push(Tri { p: [a, c, d], uv: None, col: None, mat: 0 });
             }
         }
-        let mesh = Mesh { tris, mats: vec![WHITE], textures: vec![] };
+        let mesh = Mesh { tris, mats: vec![WHITE], ..Default::default() };
         let t = std::time::Instant::now();
         let m = voxelize_mesh(&mesh, &opts(256, true), "s".into()).unwrap();
         println!("{} tris -> {} voxels in {:?}", mesh.tris.len(), m.voxels.len(), t.elapsed());

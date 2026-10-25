@@ -1268,6 +1268,8 @@ pub fn project_panel(
     tab: &mut ProjectTab,
     projects: &[PathBuf],
     samples: &[PathBuf],
+    // The opened file's own folder (name, files), when it is elsewhere.
+    folder: Option<(&str, &[PathBuf])>,
     current: &Path,
     pattern: Option<&str>,
     shaders: &mut ShaderState,
@@ -1312,8 +1314,10 @@ pub fn project_panel(
         match *tab {
             ProjectTab::Project | ProjectTab::Pattern => {
                 let pattern_tab = *tab == ProjectTab::Pattern;
-                for (title, list) in [("My projects", projects), ("Samples", samples)] {
-                    if list.is_empty() && title == "Samples" {
+                let mut sections = vec![("My projects", projects), ("Samples", samples)];
+                sections.extend(folder);
+                for (title, list) in sections {
+                    if list.is_empty() && title != "My projects" {
                         continue;
                     }
                     // Fold-out sections like the Edit column's.

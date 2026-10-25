@@ -134,10 +134,11 @@ pub fn export(format: Format, scene: &Scene, path: &Path) -> Result<Vec<PathBuf>
     // glTF keeps a `.gltf` name (JSON) and otherwise writes `.glb`.
     let keep = format == Format::Gltf && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gltf"));
     let path = if keep { path.to_path_buf() } else { path.with_extension(format.extension()) };
+    let flat = scene.flat();
+    anyhow::ensure!(flat.count() > 0, "nothing to export: the scene has no visible voxels");
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let flat = scene.flat();
     let v = &*flat;
     let pal = &scene.palette;
     let mut files = vec![path.clone()];
@@ -900,6 +901,17 @@ mod tests {
             head.lines().find_map(|l| l.strip_prefix(k)).map(|n| n.trim().parse().unwrap()).unwrap_or(0)
         };
         (get("element vertex"), get("element face"), body.lines().count())
+    }
+
+    #[test]
+    fn empty_scenes_are_not_exported() {
+        let s = Scene::empty(IVec3::splat(4));
+        let dir = std::env::temp_dir().join(format!("voxely-export-empty-{}", std::process::id()));
+        for f in Format::ALL.into_iter().chain([Format::Gltf]) {
+            let err = export(f, &s, &dir.join("e.x")).unwrap_err();
+            assert!(err.to_string().contains("nothing to export"), "{f:?}");
+        }
+        assert!(!dir.exists());
     }
 
     #[test]

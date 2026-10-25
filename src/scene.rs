@@ -338,6 +338,11 @@ pub struct Scene {
     /// Tree undo steps pushed so far (`history` is capped, so its length
     /// doesn't say).
     steps: u64,
+    /// Tree steps that also changed the palette (an import): the step's
+    /// position, and the palette and materials before and after it.
+    palette_steps: Vec<(u64, PaletteState, PaletteState)>,
+    /// The palette or materials changed by undo/redo, for the GPU.
+    pub palette_dirty: bool,
     /// sRGB palette as stored in the file, indexed by color index.
     pub palette: Vec<[u8; 4]>,
     /// Palette row names (ramps), as in MagicaVoxel's `NOTE` chunk: entry
@@ -345,12 +350,23 @@ pub struct Scene {
     pub notes: Vec<String>,
     /// Render chunks from the file, written back unchanged on save.
     pub render_dicts: Vec<Dict>,
+    /// `MATL` dictionaries from the file: written back as they were while
+    /// the material is unchanged, else with voxely's keys updated and the
+    /// rest kept.
+    pub vox_materials: std::collections::HashMap<u32, Dict>,
+    /// Cameras and palette order from the file (camera 0 is the view).
+    pub vox_extra: crate::vox::Extra,
+    /// The view as read from camera 0, to tell whether it has moved.
+    pub vox_camera: Option<crate::gpu::Camera>,
     pub materials: Vec<GpuMaterial>,
     pub lights: Vec<GpuLight>,
     /// Sum of the power of all light faces.
     pub light_power: f32,
     pub settings: RenderSettings,
 }
+
+/// A palette and its materials.
+pub type PaletteState = (Vec<[u8; 4]>, Vec<GpuMaterial>);
 
 fn luminance(c: [f32; 4]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
@@ -779,6 +795,9 @@ pub fn material(idx: u32, rgba: [u8; 4], d: Option<&Dict>) -> GpuMaterial {
     m
 }
 
+/// `rCAM` key holding voxely's own orbit camera.
+const VX_CAM: &str = "_vx_cam";
+
 fn fmt(v: f32) -> String {
     // Short, round-trippable decimals.
     let s = format!("{v:.4}");
@@ -811,10 +830,11 @@ pub fn material_dict(m: &GpuMaterial) -> Option<Dict> {
             set("_trans", fmt(m.trans));
         }
         "_emit" => {
-            // Inverse of `material`: emission above 1 moves into power.
-            let (e, flux) = if m.emit > 1.0 { (1.0, 2.0 * m.emit.log10()) } else { (m.emit, 0.0) };
-            set("_emit", fmt(e));
-            set("_flux", fmt(flux));
+            // Inverse of `material`: MagicaVoxel's power is a whole number
+            // 0..=4, so take the least that keeps emission within 1.
+            let flux = (0..=4).find(|&f| m.emit <= 10f32.powf(f as f32 * 0.5) * 1.0001).unwrap_or(4);
+            set("_emit", fmt(m.emit / 10f32.powf(flux as f32 * 0.5)));
+            set("_flux", flux.to_string());
         }
         "_media" => {
             set("_d", fmt(m.density / 10.0));
@@ -827,11 +847,72 @@ pub fn material_dict(m: &GpuMaterial) -> Option<Dict> {
 
 impl Scene {
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        let mats: Vec<(u32, Dict)> =
-            (1..256u32).filter_map(|i| material_dict(&self.materials[i as usize]).map(|d| (i, d))).collect();
+        let mut ids: Vec<u32> = (1..256).chain(self.vox_materials.keys().copied()).collect();
+        ids.sort();
+        ids.dedup();
+        let mats: Vec<(u32, Dict)> = ids.into_iter().filter_map(|i| self.material_out(i).map(|d| (i, d))).collect();
         let mut render = self.render_dicts.clone();
         self.settings.write_vox(&mut render);
-        crate::vox::write(path, &self.synced_world(), &self.palette, &mats, &self.notes, &render)
+        crate::vox::write_with(path, &self.synced_world(), &self.palette, &mats, &self.notes, &render, &self.vox_extra)
+    }
+
+    /// The `MATL` dictionary saved for color `i`.
+    fn material_out(&self, i: u32) -> Option<Dict> {
+        let orig = self.vox_materials.get(&i);
+        let Some(m) = self.materials.get(i as usize).filter(|_| (1..256).contains(&i)) else { return orig.cloned() };
+        let Some(orig) = orig else { return material_dict(m) };
+        // Unchanged: exactly as read.
+        let mut was = material(i, self.palette[i as usize], Some(orig));
+        was.color = m.color;
+        if bytemuck::bytes_of(&was) == bytemuck::bytes_of(m) {
+            return Some(orig.clone());
+        }
+        let mut d = orig.clone();
+        match material_dict(m) {
+            Some(new) => d.extend(new),
+            None => {
+                d.insert("_type".into(), "_diffuse".into());
+                d.insert("_rough".into(), fmt(m.rough));
+            }
+        }
+        Some(d)
+    }
+
+    /// Camera 0 of the file as an orbit camera around a target in
+    /// `volume`'s coordinates, if the file has one voxely wrote.
+    pub fn file_camera(&self) -> Option<crate::gpu::Camera> {
+        let d = &self.vox_extra.cameras.iter().find(|(id, _)| *id == 0)?.1;
+        let v: Vec<f32> = d.get(VX_CAM)?.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        let [yaw, pitch, dist, x, y, z] = v[..] else { return None };
+        let target = Vec3::new(x, y, z) - self.origin.as_vec3();
+        [yaw, pitch, dist].iter().chain(&target.to_array()).all(|v| v.is_finite()).then_some(crate::gpu::Camera { target, yaw, pitch, dist: dist.max(0.1) })
+    }
+
+    /// Store `cam` (target in `volume`'s coordinates) as camera 0, unless
+    /// it is still the camera read from the file, which is kept as it was.
+    pub fn store_camera(&mut self, cam: &crate::gpu::Camera) {
+        if self.vox_camera.as_ref() == Some(cam) {
+            return;
+        }
+        let at = cam.target + self.origin.as_vec3();
+        let mut d = self.vox_extra.cameras.iter().find(|(id, _)| *id == 0).map_or_else(Dict::new, |(_, d)| d.clone());
+        let ortho = self.settings.projection == Projection::Orthographic;
+        let deg = |r: f32| fmt(r.to_degrees());
+        for (k, v) in [
+            ("_mode", if ortho { "orth".to_string() } else { "pers".to_string() }),
+            ("_focus", format!("{} {} {}", fmt(at.x), fmt(at.y), fmt(at.z))),
+            // Pitch then yaw, as in the sun's `_angle`.
+            ("_angle", format!("{} {} 0", deg(cam.pitch), deg(cam.yaw))),
+            ("_radius", fmt(cam.dist)),
+            ("_fov", fmt(self.settings.fov)),
+            // voxely's exact orbit, in world coordinates.
+            (VX_CAM, format!("{} {} {} {} {} {}", cam.yaw, cam.pitch, cam.dist, at.x, at.y, at.z)),
+        ] {
+            d.insert(k.to_string(), v);
+        }
+        d.entry("_frustum".into()).or_insert_with(|| "0.4".into());
+        self.vox_extra.cameras.retain(|(id, _)| *id != 0);
+        self.vox_extra.cameras.insert(0, (0, d));
     }
 
     pub fn from_vox(f: &VoxFile) -> Result<Self> {
@@ -849,6 +930,7 @@ impl Scene {
         let render_dicts = f.render_order.iter().filter(|k| *k != crate::vox::ANIM_TYPE).filter_map(|k| f.render.get(k).cloned()).collect();
         let mut s = Self::assemble(world, f.palette.clone(), &f.materials, render_dicts, RenderSettings::from_vox(f));
         s.notes = f.notes.clone();
+        s.vox_extra = f.extra.clone();
         Ok(s)
     }
 
@@ -883,9 +965,14 @@ impl Scene {
             history: Vec::new(),
             future: Vec::new(),
             steps: 0,
+            palette_steps: Vec::new(),
+            palette_dirty: false,
             palette,
             notes: Vec::new(),
             render_dicts,
+            vox_materials: mats.clone(),
+            vox_extra: Default::default(),
+            vox_camera: None,
             materials,
             lights: Vec::new(),
             light_power: 0.0,
@@ -964,12 +1051,33 @@ impl Scene {
     }
 
     fn remember(&mut self) {
+        // Steps being dropped from the redo list take their palettes along.
+        let at = self.position();
+        self.palette_steps.retain(|s| s.0 <= at);
         self.history.push(self.world.clone());
         if self.history.len() > HISTORY {
             self.history.remove(0);
         }
         self.future.clear();
         self.steps += 1;
+    }
+
+    /// Where undo is in the tree's steps: steps pushed minus steps undone.
+    fn position(&self) -> u64 {
+        self.steps - self.future.len() as u64
+    }
+
+    /// The palette and materials, to restore with an undo step.
+    pub fn palette_state(&self) -> PaletteState {
+        (self.palette.clone(), self.materials.clone())
+    }
+
+    /// The last tree step also changed the palette from `before`: undoing
+    /// it puts `before` back, redoing it the palette as it is now.
+    pub fn palette_step(&mut self, before: PaletteState) {
+        let at = self.position();
+        self.palette_steps.retain(|s| s.0 != at);
+        self.palette_steps.push((at, before, self.palette_state()));
     }
 
     /// Tree undo steps pushed so far, for `squash_tree`.
@@ -1050,9 +1158,16 @@ impl Scene {
     /// reset the voxel editor.
     pub fn undo_tree(&mut self, forward: bool) -> bool {
         self.store();
+        let at = self.position();
         let (from, to) = if forward { (&mut self.future, &mut self.history) } else { (&mut self.history, &mut self.future) };
         let Some(w) = from.pop() else { return false };
         to.push(std::mem::replace(&mut self.world, w));
+        // The step's palette change, if it made one.
+        let step = if forward { at + 1 } else { at };
+        if let Some((_, before, after)) = self.palette_steps.iter().find(|s| s.0 == step) {
+            (self.palette, self.materials) = if forward { after.clone() } else { before.clone() };
+            self.palette_dirty = true;
+        }
         self.view(self.mode);
         true
     }
@@ -1207,11 +1322,88 @@ mod tests {
 
         assert_eq!(back.volume.dims, s.volume.dims);
         assert_eq!(back.volume.cells, s.volume.cells);
+        // The 256-wide tiles come back as the one part they were.
+        assert_eq!(back.world.models().len(), 1);
+        assert_eq!(back.editing(), back.world.models().first().copied());
         assert_eq!(back.palette[10], [1, 2, 3, 255]);
         assert_eq!(back.materials[20].kind, MaterialKind::Emit as u32);
         assert!((back.materials[20].emit - 31.6).abs() < 0.05, "{}", back.materials[20].emit);
         assert_eq!(back.materials[30].kind, MaterialKind::Glass as u32);
         assert!((back.materials[30].trans - 0.8).abs() < 1e-4);
+    }
+
+    /// Every chunk of type `id` in a `.vox` file, raw.
+    fn chunks(path: &std::path::Path, id: &[u8; 4]) -> Vec<Vec<u8>> {
+        let b = std::fs::read(path).unwrap();
+        let (mut o, mut out) = (20, Vec::new());
+        while o + 12 <= b.len() {
+            let n = i32::from_le_bytes(b[o + 4..o + 8].try_into().unwrap()) as usize;
+            if &b[o..o + 4] == id {
+                out.push(b[o + 12..o + 12 + n].to_vec());
+            }
+            o += 12 + n;
+        }
+        out
+    }
+
+    #[test]
+    fn magicavoxel_chunks_save_back_unchanged() {
+        let dir = std::env::temp_dir();
+        let (a, b) = (dir.join(format!("voxely-chunks-a-{}.vox", std::process::id())), dir.join(format!("voxely-chunks-b-{}.vox", std::process::id())));
+        let mut v = Volume::new(IVec3::splat(4));
+        v.set(IVec3::ONE, 3);
+        let mut palette = crate::vox::default_palette();
+        palette[0] = [4, 62, 76, 255];
+        let d = |kv: &[(&str, &str)]| -> Dict { kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() };
+        // Keys voxely doesn't use, in MagicaVoxel's order, and its emission.
+        let mats = vec![
+            (1, d(&[("_type", "_diffuse"), ("_weight", "1"), ("_rough", "0.1"), ("_spec", "0.5"), ("_ior", "0.3"), ("_att", "0"), ("_g0", "-0.5"), ("_flux", "0"), ("_ldr", "0")])),
+            (2, d(&[("_type", "_metal"), ("_rough", "0.2"), ("_metal", "0.8"), ("_sp", "0.6"), ("_ior", "0.3")])),
+            (3, d(&[("_type", "_emit"), ("_emit", "0.4"), ("_flux", "3"), ("_ldr", "0.5")])),
+            (4, d(&[("_type", "_media"), ("_d", "0.03"), ("_g", "0.2"), ("_media_type", "_scatter")])),
+        ];
+        let extra = crate::vox::Extra {
+            cameras: vec![(0, d(&[("_mode", "pers"), ("_focus", "1 2 3"), ("_angle", "30 40 0"), ("_radius", "90"), ("_frustum", "0.4"), ("_fov", "45")])), (1, d(&[("_mode", "orth"), ("_radius", "50")]))],
+            imap: Some((0..=255u8).rev().collect()),
+        };
+        crate::vox::write_with(&a, &World::single(v), &palette, &mats, &[], &[], &extra).unwrap();
+        let s = Scene::from_vox(&crate::vox::VoxFile::load(&a).unwrap()).unwrap();
+        s.save(&b).unwrap();
+        for id in [b"MATL", b"rCAM", b"IMAP", b"RGBA"] {
+            assert_eq!(chunks(&a, id), chunks(&b, id), "{}", String::from_utf8_lossy(id));
+        }
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[test]
+    fn edited_emission_saves_magicavoxel_power() {
+        let mut s = Scene::empty(IVec3::splat(4));
+        s.volume.set(IVec3::ZERO, 5);
+        s.materials[5].kind = MaterialKind::Emit as u32;
+        s.materials[5].emit = 30.0;
+        let d = material_dict(&s.materials[5]).unwrap();
+        // A whole-number power, emission within 1, as MagicaVoxel's sliders.
+        assert_eq!(d["_flux"], "3");
+        assert!(d["_emit"].parse::<f32>().unwrap() <= 1.0);
+        let back = save_and_load(&s);
+        assert!((back.materials[5].emit - 30.0).abs() < 0.01, "{}", back.materials[5].emit);
+    }
+
+    #[test]
+    fn camera_is_saved_and_restored() {
+        let mut s = Scene::empty(IVec3::splat(4));
+        s.volume.set(IVec3::ZERO, 5);
+        let cam = crate::gpu::Camera { target: Vec3::new(1.5, 2.0, -3.0), yaw: 0.3, pitch: 0.7, dist: 42.0 };
+        s.store_camera(&cam);
+        let mut back = save_and_load(&s);
+        assert_eq!(back.file_camera(), Some(cam));
+        // An unmoved camera keeps the file's own dictionary.
+        back.vox_camera = back.file_camera();
+        back.vox_extra.cameras[0].1.insert("_custom".into(), "1".into());
+        let before = back.vox_extra.cameras.clone();
+        back.store_camera(&cam);
+        assert_eq!(back.vox_extra.cameras, before);
     }
 
     #[test]

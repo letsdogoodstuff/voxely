@@ -83,11 +83,17 @@ pub fn is_importable(path: &Path) -> bool {
 }
 
 /// Read `path` (a file, or for slices also a folder of images) into
-/// models no larger than a part may be.
-pub fn read(path: &Path, how: &How) -> Result<Vec<Model>> {
+/// models no larger than a part may be, plus warnings about what couldn't
+/// be read.
+pub fn read(path: &Path, how: &How) -> Result<(Vec<Model>, Vec<String>)> {
+    let mut warnings = Vec::new();
     let models = match how {
         How::Voxels => formats::load(path)?,
-        How::Mesh(o) => vec![mesh::voxelize(path, o)?],
+        How::Mesh(o) => {
+            let (m, w) = mesh::voxelize_noted(path, o)?;
+            warnings = w;
+            vec![m]
+        }
         How::Image(o) => vec![picture::image(path, o)?],
         How::Heightmap(o) => vec![picture::heightmap(path, o)?],
         How::Slices(o) => vec![picture::slices(path, o)?],
@@ -96,7 +102,7 @@ pub fn read(path: &Path, how: &How) -> Result<Vec<Model>> {
     ensure!(!models.is_empty(), "{} has no voxels", path.display());
     let total: usize = models.iter().map(|m| m.voxels.len()).sum();
     ensure!(total <= MAX_VOXELS, "{} has {total} voxels; the importer takes up to {MAX_VOXELS}", path.display());
-    Ok(models.into_iter().flat_map(split).collect())
+    Ok((models.into_iter().flat_map(split).collect(), warnings))
 }
 
 /// Voxels one import may bring in.
@@ -217,6 +223,9 @@ fn assign(palette: &mut [[u8; 4]], models: &[Model], free: &[u8]) -> (HashMap<[u
     let counts = color_counts(models);
     let exact: HashMap<[u8; 3], u8> = (1..256).rev().map(|i| ([palette[i][0], palette[i][1], palette[i][2]], i as u8)).collect();
     let missing: Vec<([u8; 3], usize)> = counts.iter().filter(|c| !exact.contains_key(&c.0)).copied().collect();
+    // Slots already holding one of the colors stay as they are.
+    let kept: std::collections::HashSet<u8> = counts.iter().filter_map(|c| exact.get(&c.0).copied()).collect();
+    let free: Vec<u8> = free.iter().copied().filter(|s| !kept.contains(s)).collect();
     let mut written = Vec::new();
     for (&slot, c) in free.iter().zip(reduce(&missing, free.len())) {
         palette[slot as usize] = [c[0], c[1], c[2], 255];
@@ -275,6 +284,7 @@ pub fn new_scene(models: &[Model]) -> Result<Scene> {
 /// the palette slots written.
 pub fn add_to_scene(scene: &mut Scene, models: &[Model], name: &str, add_colors: bool) -> Result<(usize, Vec<u8>)> {
     ensure!(!models.is_empty(), "nothing to import");
+    let before = scene.palette_state();
     let used = scene.used_colors();
     let free: Vec<u8> = if add_colors { (1..256).rev().filter(|&i| !used[i]).map(|i| i as u8).collect() } else { Vec::new() };
     let (map, written) = assign(&mut scene.palette, models, &free);
@@ -300,6 +310,9 @@ pub fn add_to_scene(scene: &mut Scene, models: &[Model], name: &str, add_colors:
         }
     });
     scene.picked = vec![top];
+    if !written.is_empty() {
+        scene.palette_step(before);
+    }
     Ok((top, written))
 }
 
@@ -361,6 +374,32 @@ mod tests {
         assert_eq!(s.world.label(top), "file");
         assert_eq!(s.world.models().len(), 3);
         assert!(s.can_undo_tree());
+    }
+
+    #[test]
+    fn colors_already_in_the_palette_keep_their_slots() {
+        // More colors than slots, white among them: white keeps slot 1 (the
+        // default palette's white) and nothing else is written over it.
+        let mut voxels: Vec<([i32; 3], [u8; 4])> = (0..300).map(|i| ([i % 20, 0, i / 20], [(i * 7 % 256) as u8, (i * 13 % 256) as u8, 77, 255])).collect();
+        voxels.push(([0, 1, 0], [255, 255, 255, 255]));
+        let s = new_scene(&[model(&voxels)]).unwrap();
+        assert_eq!(s.volume.get(IVec3::new(0, 1, 0)), 1);
+        assert_eq!(s.palette[1], [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn undoing_an_import_restores_the_palette() {
+        let mut s = Scene::empty(IVec3::splat(4));
+        s.volume.set(IVec3::ZERO, 1);
+        let (before, mats) = s.palette_state();
+        add_to_scene(&mut s, &[model(&[([0, 0, 0], [1, 2, 3, 255])])], "file", true).unwrap();
+        let after = s.palette.clone();
+        assert_ne!(after, before);
+        assert!(s.undo_tree(false));
+        assert_eq!(s.palette, before);
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&s.materials), bytemuck::cast_slice::<_, u8>(&mats));
+        assert!(s.undo_tree(true));
+        assert_eq!(s.palette, after);
     }
 
     #[test]

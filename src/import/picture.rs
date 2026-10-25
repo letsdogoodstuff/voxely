@@ -117,7 +117,7 @@ fn luma(c: [u8; 3]) -> f32 {
 
 /// A picture as voxels.
 pub fn image(path: &Path, o: &ImageOptions) -> Result<Model> {
-    let img = load_image(path)?;
+    let img = load_image(path).with_context(|| format!("reading {}", path.display()))?;
     image_from(&img, o, name_of(path))
 }
 
@@ -179,7 +179,7 @@ const WATER: [u8; 3] = [52, 108, 176];
 /// A heightmap picture as terrain: x right, y away (the picture's top is
 /// the far side), z up.
 pub fn heightmap(path: &Path, o: &HeightOptions) -> Result<Model> {
-    let img = load_image(path)?;
+    let img = load_image(path).with_context(|| format!("reading {}", path.display()))?;
     heightmap_from(&img, o, name_of(path))
 }
 
@@ -242,12 +242,12 @@ pub fn slices(path: &Path, o: &SliceOptions) -> Result<Model> {
             .collect();
         ensure!(!files.is_empty(), "{} has no PNG or JPEG slices", path.display());
         files.sort_by(|a, b| natural(a).cmp(&natural(b)));
-        let imgs = files.iter().map(|f| load_image(f)).collect::<Result<Vec<_>>>()?;
+        let imgs = files.iter().map(|f| load_image(f).with_context(|| format!("reading slice {}", f.display()))).collect::<Result<Vec<_>>>()?;
         let (w, h) = (imgs[0].w, imgs[0].h);
         ensure!(imgs.iter().all(|i| i.w == w && i.h == h), "the slices in {} differ in size", path.display());
         imgs
     } else {
-        cut(&load_image(path)?, o)?
+        cut(&load_image(path).with_context(|| format!("reading {}", path.display()))?, o)?
     };
     slices_from(layers, o, name_of(path))
 }
