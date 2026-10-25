@@ -339,6 +339,11 @@ impl Solid {
         Ok(s)
     }
 
+    /// The cells that can be inside, inclusive.
+    pub fn bounds(&self) -> (IVec3, IVec3) {
+        (self.lo, self.hi)
+    }
+
     /// Whether the cell `p` (its center) is inside.
     pub fn has_cell(&self, p: IVec3) -> bool {
         if p.cmplt(self.lo).any() || p.cmpgt(self.hi).any() {

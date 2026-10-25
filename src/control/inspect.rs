@@ -330,11 +330,11 @@ fn spill(dims: IVec3, shape: &str, a: &Value) -> Option<Spill> {
         }
         return Some(sp);
     }
-    let axis = super::axis(a).ok()?;
+    let solid = super::build::Solid::build(shape, super::axis(a).ok()?, from, to, a).ok()?;
     let hollow = boolean(a, "hollow").unwrap_or(false);
-    let (lo, hi) = (from.min(to), from.max(to));
+    let (lo, hi) = solid.bounds();
     sp.touches = hi.cmpge(IVec3::ZERO).all() && lo.cmplt(dims).all();
-    let inside = |p: IVec3| super::in_shape(shape, axis, lo, hi, p);
+    let inside = |p: IVec3| solid.has_cell(p);
     let drawn = |p: IVec3| inside(p) && (!hollow || super::NEIGHBORS.iter().any(|&n| !inside(p + n)));
     let mut work = 0u64;
     'rows: for z in lo.z..=hi.z {
