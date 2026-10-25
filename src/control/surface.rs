@@ -728,7 +728,7 @@ pub struct Image {
     pub px: Vec<[u8; 4]>,
 }
 
-fn load_image(path: &Path) -> Result<Image> {
+pub fn load_image(path: &Path) -> Result<Image> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.starts_with(b"\x89PNG") {
         let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));

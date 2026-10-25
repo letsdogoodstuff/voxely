@@ -8,7 +8,7 @@ use super::{Ctx, boolean, get, int, string, text, tool};
 use crate::gpu::{Camera, project_point};
 use crate::scene::Projection;
 
-mod draw;
+pub(super) mod draw;
 use draw::{BLUE, Canvas, GREEN, RED, Rgb, WHITE, text_size};
 
 pub const PART_TOOLS: &[&str] = &[];
