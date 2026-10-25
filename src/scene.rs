@@ -857,6 +857,11 @@ impl Scene {
         Self::assemble(World::single(Volume::new(dims)), crate::vox::default_palette(), &Default::default(), Vec::new(), RenderSettings::default())
     }
 
+    /// A scene of `world`'s models with `palette` and default materials.
+    pub fn from_world(world: World, palette: Vec<[u8; 4]>) -> Self {
+        Self::assemble(world, palette, &Default::default(), Vec::new(), RenderSettings::default())
+    }
+
     /// Opens in edit mode when there is one model, else in World mode.
     fn assemble(
         world: World,

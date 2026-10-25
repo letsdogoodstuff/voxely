@@ -270,9 +270,14 @@ impl World {
         Node::new("", None, -1, Kind::Group)
     }
 
+    /// Just the root group.
+    pub fn empty() -> World {
+        World { nodes: vec![Some(Self::root_group())], layers: vec![Layer { id: 0, name: String::new(), hidden: false }], anim: Default::default(), frame: 0 }
+    }
+
     /// One model filling the box `[0, size)`.
     pub fn single(volume: Volume) -> World {
-        let mut w = World { nodes: vec![Some(Self::root_group())], layers: vec![Layer { id: 0, name: String::new(), hidden: false }], anim: Default::default(), frame: 0 };
+        let mut w = World::empty();
         w.add_model(ROOT, "", volume, IVec3::ZERO);
         w
     }

@@ -2,6 +2,7 @@
 mod agents;
 mod anim;
 mod app;
+mod backdrop;
 mod control;
 mod edit;
 mod env;
@@ -9,6 +10,7 @@ mod export;
 mod gltf;
 mod gltf_import;
 mod gpu;
+mod import;
 mod grid;
 mod mcp;
 mod modeler;

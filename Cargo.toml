@@ -11,6 +11,7 @@ egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = "0.37"
 egui-winit = "0.37"
 env_logger = "0.11.11"
+flate2 = "1.1.10"
 glam = "0.34.1"
 log = "0.4.34"
 naga = { version = "30.0.1", features = ["glsl-in"] }
@@ -19,6 +20,7 @@ pollster = "1.0.1"
 rfd = "0.17.2"
 rquickjs = "0.14"
 serde_json = "1.0.154"
+trash = "5.2.9"
 wgpu = { version = "30.0.1", features = ["naga-ir"] }
 winit = "0.30.13"
 zune-jpeg = "0.5.15"

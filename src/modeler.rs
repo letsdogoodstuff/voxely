@@ -8,6 +8,7 @@ use crate::gpu::Camera;
 use crate::scene::{Mask, Projection, Volume};
 
 const MODELER_WGSL: &str = include_str!("shaders/modeler.wgsl");
+const REFERENCE_WGSL: &str = include_str!("shaders/reference.wgsl");
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SHADOW_SIZE: u32 = 2048;
 /// Direction the modeler's light comes from. Tilted off every axis so no
@@ -157,8 +158,132 @@ struct Uniforms {
     palette: [[f32; 4]; 256],
 }
 
+/// Where the reference picture hangs, in the view's voxel coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RefPlane {
+    /// The picture's bottom-left corner, and its right and up edges.
+    pub corner: Vec3,
+    pub right: Vec3,
+    pub up: Vec3,
+    pub opacity: f32,
+    /// Drawn over the voxels instead of hidden behind them.
+    pub on_top: bool,
+}
+
+/// Must match `U` in reference.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RefUniforms {
+    view_proj: [[f32; 4]; 4],
+    corner: [f32; 4],
+    right: [f32; 4],
+    up: [f32; 4],
+    opts: [f32; 4],
+}
+
+/// A reference picture's texture and the pipelines that draw it.
+struct Reference {
+    behind: wgpu::RenderPipeline,
+    on_top: wgpu::RenderPipeline,
+    uniforms: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl Reference {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, w: u32, h: u32, rgba: &[u8]) -> Reference {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("reference"), source: wgpu::ShaderSource::Wgsl(REFERENCE_WGSL.into()) });
+        let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("reference"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+            size,
+        );
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("reference"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reference_uniforms"),
+            size: std::mem::size_of::<RefUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("reference"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let view = tex.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("reference"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let pipeline = |label: &str, compare: wgpu::CompareFunction| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(compare),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        Reference { behind: pipeline("reference", wgpu::CompareFunction::LessEqual), on_top: pipeline("reference_on_top", wgpu::CompareFunction::Always), uniforms, bind_group }
+    }
+}
+
 pub struct Modeler {
     pub options: ModelerOptions,
+    /// Where to show the reference picture this frame (None hides it).
+    pub reference_plane: Option<RefPlane>,
+    reference: Option<Reference>,
+    format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     /// Same as `pipeline` without back-face culling, for wireframe.
     wire_pipeline: wgpu::RenderPipeline,
@@ -356,6 +481,9 @@ impl Modeler {
         let (vertices, vertex_count) = vertex_buffer(device, volume, None);
         let mut m = Modeler {
             options: ModelerOptions::default(),
+            reference_plane: None,
+            reference: None,
+            format,
             pipeline,
             wire_pipeline,
             shadow_pipeline,
@@ -409,6 +537,11 @@ impl Modeler {
         self.highlight = highlight_mesh(dims, cells).map(|mesh| (mesh_buffer(device, &mesh), mesh.len() as u32));
     }
 
+    /// Use an RGBA picture (rows top down) as the reference, or none.
+    pub fn set_reference(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, picture: Option<(u32, u32, &[u8])>) {
+        self.reference = picture.filter(|p| p.0 > 0 && p.1 > 0).map(|(w, h, rgba)| Reference::new(device, queue, self.format, w, h, rgba));
+    }
+
     /// The modeler shows palette colors as-is, like MagicaVoxel.
     pub fn set_palette(&mut self, palette: &[[u8; 4]]) {
         for (dst, src) in self.palette.iter_mut().zip(palette) {
@@ -445,8 +578,20 @@ impl Modeler {
         let (x, y, w, h) = viewport;
         let o = &self.options;
         let light = LIGHT.normalize();
+        let vp = view_proj(camera, fov, projection, w as f32 / h as f32, self.dims);
+        let reference = self.reference.as_ref().zip(self.reference_plane);
+        if let Some((r, p)) = reference {
+            let ru = RefUniforms {
+                view_proj: vp.to_cols_array_2d(),
+                corner: p.corner.extend(0.0).to_array(),
+                right: p.right.extend(0.0).to_array(),
+                up: p.up.extend(0.0).to_array(),
+                opts: [p.opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
+            };
+            queue.write_buffer(&r.uniforms, 0, bytemuck::bytes_of(&ru));
+        }
         let u = Uniforms {
-            view_proj: view_proj(camera, fov, projection, w as f32 / h as f32, self.dims).to_cols_array_2d(),
+            view_proj: vp.to_cols_array_2d(),
             light: light.extend(0.0).to_array(),
             ambient: o.ambient.extend(0.0).to_array(),
             grid: [0.0, 0.0, 0.0, 0.75],
@@ -515,6 +660,11 @@ impl Modeler {
             if let Some((buf, count, _)) = &self.context {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..*count, 0..1);
+            }
+            if let Some((r, p)) = reference {
+                pass.set_pipeline(if p.on_top { &r.on_top } else { &r.behind });
+                pass.set_bind_group(0, &r.bind_group, &[]);
+                pass.draw(0..6, 0..1);
             }
             if let Some((buf, count)) = &self.highlight {
                 pass.set_bind_group(0, &self.plain_bind_group, &[]);

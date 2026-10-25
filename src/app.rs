@@ -54,7 +54,7 @@ pub struct EditState {
     pub matter_tab: ui::MatterTab,
     pub material_clipboard: Option<crate::scene::GpuMaterial>,
     pub image: ui::ImageSettings,
-    /// Result of the last export, shown under the Export buttons.
+    /// Result of the last export or import, shown under the Export buttons.
     pub export_status: Option<String>,
     /// MCP agent control of this window.
     pub agent: crate::agents::AgentState,
@@ -81,6 +81,12 @@ pub struct EditState {
     cameras: [Option<Camera>; QUICK_SLOT + 1],
     /// State for agent tools (symmetry, checkpoints, last edit, ...).
     pub tools: crate::control::ToolState,
+    /// A file picked for import, while its Import window is open.
+    pub import: Option<crate::import::window::Pending>,
+    /// The reference picture shown behind the model.
+    pub backdrop: crate::backdrop::Backdrop,
+    /// A project waiting for its delete to be confirmed.
+    pub confirm_delete: Option<PathBuf>,
 }
 
 /// Parts dragged across the plane of the face first clicked.
@@ -134,6 +140,9 @@ impl EditState {
             timeline: Default::default(),
             cameras: [None; QUICK_SLOT + 1],
             tools: Default::default(),
+            import: None,
+            backdrop: Default::default(),
+            confirm_delete: None,
         }
     }
 
@@ -624,6 +633,100 @@ pub(crate) fn open_project(path: PathBuf, r: &mut Renderer, scene: &mut Scene, e
     Ok(())
 }
 
+/// Import `path` read `how`: as a new project (named after the file), or
+/// as new parts of this scene (one undo step). Returns what came in.
+pub(crate) fn import_file(path: &Path, how: &crate::import::How, new_project: bool, add_colors: bool, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) -> Result<String> {
+    let models = crate::import::read(path, how)?;
+    let stem = path.file_stem().map_or("import".into(), |n| n.to_string_lossy().into_owned());
+    let what = crate::import::summary(&models);
+    if new_project {
+        let ibl = r.settings.ibl_path.clone();
+        *scene = crate::import::new_scene(&models)?;
+        scene.settings.ibl_path = ibl;
+        ed.source = None;
+        ed.save_path = (1..).map(|k| if k == 1 { project_path(&stem) } else { project_path(&format!("{stem}-{k}")) }).find(|p| !p.exists()).unwrap();
+        loaded(r, scene, ed);
+        Ok(format!("Imported {} as {} ({what}); Ctrl+S saves it", path.display(), ed.name()))
+    } else {
+        let (top, written) = crate::import::add_to_scene(scene, &models, &stem, add_colors)?;
+        ed.editor.reset();
+        ed.world_drag = None;
+        scene.settings = r.settings.clone();
+        scene.rebuild_lights();
+        r.load_scene(scene);
+        let colors = if written.is_empty() { String::new() } else { format!("; {} colors added to the palette", written.len()) };
+        Ok(format!("Imported {} as `{}` ({what}{colors})", path.display(), scene.world.label(top)))
+    }
+}
+
+/// Show `path` as the reference picture (None: no picture).
+fn set_backdrop(r: &mut Renderer, ed: &mut EditState, path: Option<PathBuf>) {
+    let picture = match path.as_deref().map(crate::backdrop::load).transpose() {
+        Ok(p) => p,
+        Err(e) => {
+            ed.export_status = Some(format!("Reference: {e:#}"));
+            None
+        }
+    };
+    if let Some(m) = r.modeler.as_mut() {
+        m.set_reference(&r.device, &r.queue, picture.as_ref().map(|(w, h, px)| (*w, *h, px.as_slice())));
+    }
+    let b = &mut ed.backdrop;
+    match (picture, path) {
+        (Some((w, h, _)), Some(p)) => {
+            (b.size, b.path, b.show, b.open) = ((w, h), Some(p), true, true);
+        }
+        _ => (b.size, b.path) = ((0, 0), None),
+    }
+}
+
+/// Ask before deleting `ed.confirm_delete`.
+fn confirm_delete(ctx: &egui::Context, ed: &mut EditState, cmds: &mut Vec<Command>) {
+    let Some(path) = ed.confirm_delete.clone() else { return };
+    let name = path.file_stem().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    let mut keep = true;
+    egui::Modal::new(egui::Id::unique("confirm_delete")).show(ctx, |ui| {
+        ui.set_width(300.0);
+        ui.heading(format!("Delete \u{201c}{name}\u{201d}?"));
+        ui.add_space(4.0);
+        ui.label(format!("{} and its saved references move to the Trash.", path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())));
+        if ed.source.as_deref() == Some(path.as_path()) {
+            ui.weak("It's the open project: it stays open here, and saving writes it again.");
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let delete = egui::Button::new(egui::RichText::new("Move to Trash").color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(170, 40, 40));
+            if ui.add(delete).clicked() {
+                cmds.push(Command::DeleteProjectConfirmed(path.clone()));
+            }
+            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                keep = false;
+            }
+        });
+    });
+    if !keep {
+        ed.confirm_delete = None;
+    }
+}
+
+/// Move a project (and its saved references) to the Trash. The scene
+/// stays open if it's the current one; saving writes it again.
+fn delete_project(path: &Path, ed: &mut EditState) -> Result<String> {
+    anyhow::ensure!(path.parent().is_some_and(|d| same_dir(d, &workspace_dir())), "only projects in the workspace can be deleted");
+    let name = path.file_stem().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    trash::delete(path).with_context(|| format!("moving {} to the Trash", path.display()))?;
+    let refs = workspace_dir().join("refs").join(&name);
+    if refs.is_dir() {
+        let _ = trash::delete(&refs);
+    }
+    ed.rescan();
+    let current = ed.source.as_deref() == Some(path);
+    if current {
+        ed.source = None;
+    }
+    Ok(if current { format!("Moved {name} to the Trash; it's still open here, and saving writes it again") } else { format!("Moved {name} to the Trash") })
+}
+
 /// Show a newly opened or created scene.
 pub(crate) fn loaded(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     ed.editor.reset();
@@ -812,6 +915,87 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             }
             ed.editor.reset();
             true
+        }
+        Command::ImportPick => {
+            let dialog = rfd::FileDialog::new()
+                .add_filter("Everything voxely imports", &crate::import::extensions())
+                .add_filter("Voxel formats", crate::import::formats::EXTENSIONS)
+                .add_filter("Meshes", crate::import::mesh::EXTENSIONS)
+                .add_filter("Pictures (image, heightmap, slices)", crate::import::IMAGES)
+                .set_directory(dialog_dir(ed));
+            if let Some(p) = dialog.pick_file() {
+                ed.import = crate::import::window::Pending::new(p);
+            }
+            false
+        }
+        Command::ImportPath(p) => {
+            ed.import = crate::import::window::Pending::new(p);
+            false
+        }
+        Command::Import(crate::import::window::ImportCmd::Pick(folder)) => {
+            let dialog = rfd::FileDialog::new().set_directory(dialog_dir(ed));
+            let picked = if folder { dialog.pick_folder() } else { dialog.add_filter("Everything voxely imports", &crate::import::extensions()).pick_file() };
+            if let Some(p) = picked {
+                let keep = ed.import.as_ref().map(|i| (i.new_project, i.add_colors, i.how));
+                ed.import = crate::import::window::Pending::new(p);
+                if let (Some(i), Some((new, add, how))) = (ed.import.as_mut(), keep) {
+                    (i.new_project, i.add_colors) = (new, add);
+                    // A folder keeps the slice settings chosen so far.
+                    if folder && matches!(how, crate::import::How::Slices(_)) {
+                        i.how = how;
+                    }
+                }
+            }
+            false
+        }
+        Command::Import(crate::import::window::ImportCmd::Run) => {
+            let Some(p) = ed.import.take() else { return };
+            match import_file(&p.path, &p.how, p.new_project, p.add_colors, r, scene, ed) {
+                Ok(msg) => {
+                    eprintln!("{msg}");
+                    ed.export_status = Some(msg);
+                }
+                Err(e) => ed.import = Some(crate::import::window::Pending { error: Some(format!("{e:#}")), ..p }),
+            }
+            false
+        }
+        Command::ToggleReference => {
+            ed.backdrop.open ^= true;
+            false
+        }
+        Command::Reference(cmd) => {
+            use crate::backdrop::RefCmd;
+            let path = match cmd {
+                RefCmd::Pick => rfd::FileDialog::new().add_filter("Pictures", crate::import::IMAGES).set_directory(dialog_dir(ed)).pick_file(),
+                RefCmd::Load(ref p) => Some(p.clone()),
+                RefCmd::Agent(v) => ed.backdrop.agent(v),
+                RefCmd::Clear => None,
+            };
+            if cmd == RefCmd::Clear {
+                set_backdrop(r, ed, None);
+            } else if let Some(p) = path {
+                set_backdrop(r, ed, Some(p));
+                // A new picture starts as tall as the canvas; an agent's
+                // view keeps its pinned placement.
+                if matches!(cmd, RefCmd::Pick | RefCmd::Load(_)) {
+                    ed.backdrop.fit(scene.volume.dims, scene.origin);
+                }
+            }
+            ed.backdrop.save_current();
+            false
+        }
+        Command::DeleteProject(p) => {
+            ed.confirm_delete = Some(p);
+            false
+        }
+        Command::DeleteProjectConfirmed(p) => {
+            ed.confirm_delete = None;
+            ed.export_status = Some(match delete_project(&p, ed) {
+                Ok(msg) => msg,
+                Err(e) => format!("Couldn't delete {}: {e:#}", p.display()),
+            });
+            eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
+            false
         }
         Command::Frame(f) => {
             if f == scene.world.frame {
@@ -1223,6 +1407,19 @@ pub fn build_ui(
     }
     crate::palette_lib::window(ui.ctx(), ed, cmds);
     crate::palette_lib::handle_drops(ui.ctx(), ed, cmds);
+    crate::import::window::window(ui.ctx(), &mut ed.import, cmds);
+    // The reference picture follows the project.
+    let (open, project) = (ed.backdrop.open, ed.name());
+    if let Some(path) = ed.backdrop.sync_project(&project) {
+        let show = ed.backdrop.show;
+        set_backdrop(r, ed, path);
+        (ed.backdrop.open, ed.backdrop.show) = (open, show);
+    }
+    crate::backdrop::window(ui.ctx(), &mut ed.backdrop, scene.volume.dims, scene.origin, cmds);
+    if let Some(m) = r.modeler.as_mut() {
+        m.reference_plane = ed.backdrop.plane(scene.volume.dims, scene.origin);
+    }
+    confirm_delete(ui.ctx(), ed, cmds);
     actions.viewport = Some(ui.available_rect_before_wrap());
     draw_overlay(&ui.ctx().layer_painter(egui::LayerId::background()), r, scene, ed, ppp);
 
@@ -1550,6 +1747,7 @@ impl App {
                 "y" => Some(Command::Redo),
                 "s" if shift => Some(Command::SaveAs),
                 "s" => Some(Command::Save),
+                "o" if shift => Some(Command::ImportPick),
                 "o" => Some(Command::Open),
                 "p" => Some(Command::New),
                 "a" => Some(Command::SelectAll),
