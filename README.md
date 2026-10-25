@@ -73,7 +73,7 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Area | Tools |
 |---|---|
 | Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
-| Animation | `set_animation`, `go_to_frame`, `set_keyframe`, `delete_keyframe`, `new_drawing`, `remove_drawing`, `frame_strip` (several frames in one image) |
+| Animation | `set_animation`, `go_to_frame`, `play` (plays it in the window), `set_keyframe`, `delete_keyframe`, `new_drawing`, `remove_drawing`, `frame_strip` (several frames in one image) |
 | Rigs | `create_rig` (humanoid, quadruped), `apply_motion` (idle, walk, run, jump, attack, wave, death, quad_walk, quad_idle), `import_animation` (glTF clips) |
 | Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup, detach), `group_parts` |
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |

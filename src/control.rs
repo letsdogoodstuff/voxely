@@ -233,6 +233,10 @@ fn base_tools() -> Value {
         tool("remove_drawing", "Remove a part's flipbook drawing that starts on `frame` (the previous drawing shows instead).", json!({
             "part": { "type": ["string", "integer"] }, "frame": { "type": "integer" },
         }), &["part", "frame"]),
+        tool("play", "Play or stop the animation in the voxely window, so the person can watch it (it plays at the timeline's fps, looping if set). Use frame_strip to check motion yourself.", json!({
+            "playing": { "type": "boolean", "description": "true to play (default), false to stop" },
+            "from_frame": { "type": "integer", "description": "Start from this frame (default: where it is)" },
+        }), &[]),
         tool("frame_strip", "See the motion: modeler images of several frames side by side in one picture, left to right then top to bottom, from the current camera.", json!({
             "frames": { "type": "array", "items": { "type": "integer" }, "description": "Which frames (default: up to 12 spread over the animation)" },
             "width": { "type": "integer", "description": "Each frame's width (default 240)" },
@@ -833,6 +837,27 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
             let drawings: Vec<u32> = ctx.scene.world.node(id).map(|n| n.flip.iter().map(|s| s.frame).collect()).unwrap_or_default();
             Ok(vec![text(format!("`{}` drawings start on frames {drawings:?}; edit this one with the voxel tools (part = `{}`) while on frame {f}", ctx.scene.world.label(id), ctx.scene.world.label(id)))])
+        }
+        "play" => {
+            let on = boolean(a, "playing").unwrap_or(true);
+            if !ctx.live {
+                bail!("no voxely window is open to play in (running headless); use frame_strip to see the motion");
+            }
+            if on && ctx.scene.world.anim.frames < 2 {
+                bail!("there's only one frame; set_animation sets the frame count");
+            }
+            if get(a, "from_frame").is_some() {
+                let f = frame_arg(ctx, &json!({ "frame": a["from_frame"] }))?;
+                go_to(ctx, f);
+            }
+            ctx.ed.timeline.open = true;
+            ctx.ed.timeline.play(on);
+            let an = &ctx.scene.world.anim;
+            Ok(vec![text(if on {
+                format!("Playing from frame {}: {}", ctx.scene.world.frame, crate::timeline::describe(an))
+            } else {
+                format!("Stopped on frame {}", ctx.scene.world.frame)
+            })])
         }
         "frame_strip" => {
             let total = ctx.scene.world.anim.frames;
