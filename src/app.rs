@@ -2672,7 +2672,12 @@ impl ApplicationHandler<UserEvent> for App {
             if resp.repaint {
                 g.window.request_redraw();
             }
-            let pointer_on_ui = g.egui_ctx.egui_wants_pointer_input();
+            // egui judges by the last frame's pointer, so a click right after
+            // the pointer jumps onto a panel could reach the view: also check
+            // that the press is inside the 3D view.
+            let (vx, vy, vw, vh) = g.renderer.viewport();
+            let outside = self.mouse.pos.is_some_and(|(x, y)| x < vx as f64 || y < vy as f64 || x >= (vx + vw) as f64 || y >= (vy + vh) as f64);
+            let pointer_on_ui = g.egui_ctx.egui_wants_pointer_input() || outside;
             let press = matches!(event, WindowEvent::MouseInput { state: ElementState::Pressed, .. } | WindowEvent::MouseWheel { .. });
             // Escape closes any open dropdown, wherever the focus is.
             if let WindowEvent::KeyboardInput { event: KeyEvent { logical_key: Key::Named(NamedKey::Escape), state: ElementState::Pressed, .. }, .. } = &event {
