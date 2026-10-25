@@ -290,9 +290,9 @@ fn base_tools() -> Value {
             "part": { "type": ["string", "integer"], "description": "Part name or id, or \"world\"" },
         }), &["part"]),
         tool("create_part", "Add a new empty part (a separate model) and start editing it.", json!({
-            "name": { "type": "string" },
+            "name": { "type": "string", "description": "A taken name gets a number (\"arm 2\")" },
             "size": xyz("Size in voxels, up to 256 per axis for MagicaVoxel compatibility"),
-            "position": xyz("World position of its minimum corner (default: beside the existing parts)"),
+            "position": xyz("World position of its minimum corner (default: beside the existing parts, on the ground)"),
             "parent": { "type": ["string", "integer"], "description": "Group to put it in (default: the top level)" },
             "fill": color_schema(),
         }), &["name", "size"]),
@@ -303,7 +303,7 @@ fn base_tools() -> Value {
             "rotate_axis": axis,
             "quarter_turns": { "type": "integer", "description": "Counter-clockwise quarter turns about rotate_axis (negative for clockwise)" },
             "flip_axis": axis,
-            "free_rotation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] degrees about the pivot, applied x then y then z; replaces any previous free rotation. [0, 0, 0] straightens." },
+            "free_rotation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] degrees about the pivot and world axes (like rotate_axis), applied x then y then z; replaces any previous free rotation. [0, 0, 0] straightens." },
             "attach_to": { "type": "string", "description": "\"part:socket\" (e.g. \"body:shoulder_r\") to snap onto a socket and attach, or \"part\" to attach where it is. Attached parts follow their parent's moves and turns (and nest in glTF exports)." },
             "link": { "type": "boolean", "description": "With attach_to: false only lines it up without attaching (default true)" },
             "frame": { "type": "integer", "description": "Go to this animation frame first (the change is keyed there when animating)" },
@@ -318,7 +318,7 @@ fn base_tools() -> Value {
         tool("go_to_frame", "Show a frame: the window, screenshot, render and the voxel tools all use it. A part with flipbook drawings shows (and edits) the drawing for this frame.", json!({
             "frame": { "type": "integer" },
         }), &["frame"]),
-        tool("set_keyframe", "Key a part's pose on a frame: goes to the frame, applies any of transform_part's changes (move, position, rotate_axis + quarter_turns, flip_axis, free_rotation, attach_to), then records the key. Free rotations are absolute, about the part's pivot.", json!({
+        tool("set_keyframe", "Key a part's pose on a frame: goes to the frame, applies any of transform_part's changes (move, position, rotate_axis + quarter_turns, flip_axis, free_rotation, attach_to), then records the key. Free rotations are absolute, about the part's pivot and world axes.", json!({
             "part": { "type": ["string", "integer"] },
             "frame": { "type": "integer" },
             "move": xyz("[dx, dy, dz] offset"),
@@ -328,7 +328,7 @@ fn base_tools() -> Value {
             "flip_axis": axis,
             "free_rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees" },
         }), &["part", "frame"]),
-        tool("delete_keyframe", "Remove a part's keyframe on a frame.", json!({
+        tool("delete_keyframe", "Remove a part's keyframe on a frame (also one past the timeline's end, which doesn't play).", json!({
             "part": { "type": ["string", "integer"] }, "frame": { "type": "integer" },
         }), &["part", "frame"]),
         tool("new_drawing", "Flipbook animation: from `frame` on (until its next drawing) the part shows its own copy of its voxels, which the voxel tools then edit while on that frame. Copy, then change only what moves (a blink, a lifted foot).", json!({
@@ -353,12 +353,12 @@ fn base_tools() -> Value {
             "scale": { "type": "integer", "description": "Voxels per template unit, default 1 (a humanoid is 26 tall at 1)" },
             "position": xyz("World position of its feet (default: beside the existing parts)"),
         }), &["template"]),
-        tool("apply_motion", "Key a ready-made motion onto a rig (parts found by name: create_rig's names, or Mixamo / Unreal / Blender style like LeftArm, upperarm_l, thigh.L). Replaces those parts' keys; their pose on frame 0 is the rest pose. Motions: idle, walk, run, jump, attack, wave, death, quad_walk, quad_idle. Check with frame_strip, then adjust with set_keyframe.", json!({
+        tool("apply_motion", "Key a ready-made motion onto a rig (parts found by name: create_rig's names, or Mixamo / Unreal / Blender style like LeftArm, upperarm_l, thigh.L). Replaces those parts' keys, starting from their pose before any motion (applying again replaces it, never adds to it). Sets the timeline to the motion's length; keeps its loop and smooth settings. Motions: idle, walk, run, jump, attack, wave, death, quad_walk, quad_idle. Check with frame_strip, then adjust with set_keyframe.", json!({
             "motion": { "type": "string", "enum": ["idle", "walk", "run", "jump", "attack", "wave", "death", "quad_walk", "quad_idle"] },
-            "frames": { "type": "integer", "description": "Length of the motion in frames (default: the timeline's length, or 24)" },
+            "frames": { "type": "integer", "description": "Length of the motion in frames, 2-10000; the timeline becomes this long (default: the timeline's length, or 24)" },
             "amount": { "type": "number", "description": "Scale the motion, e.g. 0.5 for subtle, 1.5 for exaggerated (default 1)" },
             "rig": { "type": ["string", "integer"], "description": "Any part of the rig to animate when there are several (default: the first rig with the right limbs)" },
-            "fps": { "type": "number" },
+            "fps": { "type": "number", "description": "Playback speed, 0.5-120" },
         }), &["motion"]),
         tool("import_animation", "Retarget an animation clip from a glTF file (.glb/.gltf) onto a rig: free CC0 libraries such as Quaternius's Universal Animation Library, Blender exports, or voxely's own exports. Joints are matched to parts by name (hips, spine, head, upper arms, forearms, thighs, shins, in voxely / Mixamo / Unreal / Rigify naming); each part turns rigidly like its joint, with rest poses lined up (T-pose clips work on arms-down rigs). Without `clip`, lists the file's clips.", json!({
             "path": { "type": "string" },
@@ -690,7 +690,7 @@ fn part_json(scene: &Scene, id: usize) -> Value {
         v["pivot"] = json!(w.to_part(id, w.pivot_local(id)).to_array());
     }
     if n.tilted() {
-        v["free_rotation"] = json!(n.tilt.to_array());
+        v["free_rotation"] = json!(w.tilt_world(id).to_array());
     }
     if !n.sockets.is_empty() {
         v["sockets"] = n
@@ -742,8 +742,10 @@ fn frame_arg(ctx: &Ctx, a: &Value) -> Result<u32> {
 
 fn go_to(ctx: &mut Ctx, f: u32) {
     if f != ctx.scene.world.frame {
-        ctx.scene.set_frame(f);
-        ctx.ed.editor.reset();
+        let e = &mut ctx.ed.editor;
+        if !ctx.scene.set_frame(f, |v| e.undo(v)) {
+            ctx.ed.editor.reset();
+        }
         app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
     }
 }
@@ -804,12 +806,12 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "create_part" => {
             let name = string(a, "name").context("missing `name`")?.trim().to_string();
+            if name.is_empty() {
+                bail!("`name` can't be empty");
+            }
             let size = ivec3(a, "size")?;
             if size.cmplt(IVec3::ONE).any() || size.cmpgt(IVec3::splat(ops::MAX_DIM)).any() {
                 bail!("size must be 1..={} per axis", ops::MAX_DIM);
-            }
-            if !name.is_empty() && ctx.scene.world.find(&name).is_some() {
-                bail!("a part named `{name}` already exists");
             }
             let parent = match get(a, "parent") {
                 Some(p) => find_part(ctx.scene, Some(p))?,
@@ -818,7 +820,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let w = &ctx.scene.world;
             let position = match opt_ivec3(a, "position")? {
                 Some(p) => p,
-                None => w.bounds(crate::world::ROOT).map_or(IVec3::ZERO, |(lo, s)| IVec3::new(lo.x + s.x + 2, lo.y, lo.z.max(0))),
+                None => w.reach().map_or(IVec3::ZERO, |(lo, s)| IVec3::new(lo.x + s.x + 2, lo.y, 0)),
             };
             let mut v = Volume::new(size);
             if let Some(c) = get(a, "fill") {
@@ -890,7 +892,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                     w.translate(id, d);
                 }
                 if let Some(t) = tilt {
-                    w.set_tilt(id, t);
+                    w.set_tilt_world(id, t);
                 }
                 match &attach {
                     Some((target, sock, own)) if link => Some(w.attach_to(id, *target, sock.as_deref(), own.as_deref())),
@@ -952,12 +954,20 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "delete_keyframe" => {
             let id = find_part(ctx.scene, get(a, "part"))?;
-            let f = frame_arg(ctx, a)?;
-            if !ctx.scene.world.node(id).is_some_and(|n| n.keys.iter().any(|k| k.frame == f)) {
-                bail!("`{}` has no key on frame {f}", ctx.scene.world.label(id));
+            let f = int(a, "frame").context("missing `frame`")?;
+            let keys: Vec<u32> = ctx.scene.world.node(id).map(|n| n.keys.iter().map(|k| k.frame).collect()).unwrap_or_default();
+            if f < 0 || !keys.contains(&(f as u32)) {
+                bail!("`{}` has no key on frame {f}; its keys: {keys:?}", ctx.scene.world.label(id));
             }
-            go_to(ctx, f);
-            app::tree_op(crate::outline::TreeOp::DeleteKey(id), ctx.scene, ctx.ed);
+            let f = f as u32;
+            if f < ctx.scene.world.anim.frames {
+                go_to(ctx, f);
+                app::tree_op(crate::outline::TreeOp::DeleteKey(id), ctx.scene, ctx.ed);
+            } else {
+                // Past the end of the timeline: nothing to go to.
+                ctx.scene.change_quiet(|w| w.remove_key(id, f));
+                ctx.ed.editor.reset();
+            }
             app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
             Ok(vec![text(format!("Removed `{}`'s key on frame {f}", ctx.scene.world.label(id)))])
         }
@@ -970,7 +980,10 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             go_to(ctx, f);
             let has = ctx.scene.world.node(id).is_some_and(|n| n.flip.iter().any(|s| s.frame == f));
             let op = if name == "new_drawing" {
-                if has || f == 0 && ctx.scene.world.node(id).is_some_and(|n| !n.flip.is_empty()) {
+                if f == 0 {
+                    bail!("frame 0 always shows `{}`'s first drawing; start a new one on a later frame", ctx.scene.world.label(id));
+                }
+                if has {
                     bail!("`{}` already has a drawing starting on frame {f}", ctx.scene.world.label(id));
                 }
                 crate::outline::TreeOp::SplitFrame(id)
@@ -983,7 +996,15 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             app::tree_op(op, ctx.scene, ctx.ed);
             app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
             let drawings: Vec<u32> = ctx.scene.world.node(id).map(|n| n.flip.iter().map(|s| s.frame).collect()).unwrap_or_default();
-            Ok(vec![text(format!("`{}` drawings start on frames {drawings:?}; edit this one with the voxel tools (part = `{}`) while on frame {f}", ctx.scene.world.label(id), ctx.scene.world.label(id)))])
+            let label = ctx.scene.world.label(id);
+            Ok(vec![text(if name == "new_drawing" {
+                format!("`{label}` has a new drawing from frame {f} (a copy of the one before); edit it with the voxel tools (part = `{label}`) while on frame {f}. Drawings start on frames {drawings:?}")
+            } else if drawings.is_empty() {
+                format!("Removed `{label}`'s drawing from frame {f}; it shows its one drawing on every frame again")
+            } else {
+                let from = drawings.iter().rev().find(|&&d| d < f).copied().unwrap_or(0);
+                format!("Removed `{label}`'s drawing from frame {f}; frame {f} on shows the drawing from frame {from}. Drawings start on frames {drawings:?}")
+            })])
         }
         "play" => {
             let on = boolean(a, "playing").unwrap_or(true);
@@ -1052,7 +1073,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let scale = int(a, "scale").unwrap_or(1).clamp(1, 16) as i32;
             let at = match opt_ivec3(a, "position")? {
                 Some(p) => p,
-                None => ctx.scene.world.bounds(crate::world::ROOT).map_or(IVec3::ZERO, |(lo, s)| IVec3::new(lo.x + s.x + 3, lo.y, 0)),
+                None => ctx.scene.world.reach().map_or(IVec3::ZERO, |(lo, s)| IVec3::new(lo.x + s.x + 3, lo.y, 0)),
             };
             let colors = app::rig_colors(&ctx.scene.palette);
             let root = ctx.scene.change_quiet(|w| if quad { crate::rig::quadruped(w, at, scale, &prefix, colors) } else { crate::rig::humanoid(w, at, scale, &prefix, colors) });
@@ -1065,22 +1086,35 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "apply_motion" => {
             let name = string(a, "motion").context("missing `motion`")?.to_string();
-            if let Some(fps) = get(a, "fps").and_then(Value::as_f64) {
-                ctx.scene.world.anim.fps = (fps as f32).clamp(0.5, 120.0);
-            }
-            let frames = int(a, "frames").map_or(if ctx.scene.world.anim.frames > 1 { ctx.scene.world.anim.frames } else { 24 }, |f| f.clamp(2, 10_000) as u32);
+            let fps = match get(a, "fps") {
+                Some(v) => match v.as_f64() {
+                    Some(f) if (0.5..=120.0).contains(&f) => Some(f as f32),
+                    _ => bail!("fps must be 0.5-120"),
+                },
+                None => None,
+            };
+            let frames = match int(a, "frames") {
+                Some(f) if (2..=10_000).contains(&f) => f as u32,
+                Some(_) => bail!("frames must be 2-10000"),
+                None if ctx.scene.world.anim.frames > 1 => ctx.scene.world.anim.frames,
+                None => 24,
+            };
             let amount = get(a, "amount").and_then(Value::as_f64).unwrap_or(1.0) as f32;
             let rig = match get(a, "rig") {
                 Some(v) => Some(find_part(ctx.scene, Some(v))?),
                 None => None,
             };
-            let res = ctx.scene.change_quiet(|w| crate::rig::apply_motion(w, rig, &name, frames, amount));
+            // Try it on a copy first: a failure changes nothing.
+            crate::rig::apply_motion(&mut ctx.scene.world.clone(), rig, &name, frames, amount).map_err(|e| anyhow!(e))?;
+            let res = ctx.scene.change_quiet(|w| {
+                if let Some(f) = fps {
+                    w.anim.fps = f;
+                }
+                crate::rig::apply_motion(w, rig, &name, frames, amount)
+            });
             ctx.ed.editor.reset();
             app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
             let applied = res.map_err(|e| anyhow!(e))?;
-            if applied.bones.is_empty() {
-                bail!("no rig parts found; name parts like create_rig does (hips, torso, head, upper_arm_l ...) or use create_rig");
-            }
             ctx.ed.timeline.open = true;
             let mut msg = format!(
                 "Keyed `{name}` over {frames} frames on {} ({}). Timeline: {}.",
@@ -1127,10 +1161,18 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let id = find_part(ctx.scene, get(a, "part"))?;
             let w = &ctx.scene.world;
             let pivot = match get(a, "pivot") {
-                Some(Value::String(s)) if s == "center" => None,
-                Some(Value::String(s)) if s == "bottom" => {
-                    let (_, size) = w.bounds(id).context("empty")?;
-                    Some(w.from_part(id, Vec3::new(size.x as f32 * 0.5, size.y as f32 * 0.5, 0.0)))
+                // A part's box in part coordinates starts at 0; a group's is
+                // its world box.
+                Some(Value::String(s)) if s == "center" || s == "bottom" => {
+                    let n = w.node(id).context("no such part")?;
+                    let (lo, size) = match n.volume() {
+                        Some(v) => (Vec3::ZERO, w.place(id).rot.extent(v.dims).as_vec3()),
+                        None => w.bounds(id).map(|(lo, size)| (lo.as_vec3(), size.as_vec3())).context("the group is empty")?,
+                    };
+                    let z = if s == "bottom" { 0.0 } else { size.z * 0.5 };
+                    // The default center follows a group's contents; a freely
+                    // rotated one keeps a fixed point so it doesn't jump.
+                    (s == "bottom" || (n.is_group() && w.tilted(id))).then(|| w.from_part(id, lo + Vec3::new(size.x * 0.5, size.y * 0.5, z)))
                 }
                 Some(v) => Some(w.from_part(id, vec3_value(v).context("pivot is [x, y, z], \"center\" or \"bottom\"")?)),
                 None => bail!("missing `pivot`"),
@@ -1174,18 +1216,27 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let msg = match string(a, "action").context("missing `action`")? {
                 "rename" => {
                     let name = string(a, "name").context("rename needs `name`")?.trim().to_string();
-                    ctx.scene.change(|w| w.node_mut(id).map(|n| n.name = name.clone()));
-                    format!("Renamed `{label}` to `{name}`")
+                    if name.is_empty() {
+                        bail!("`name` can't be empty");
+                    }
+                    let unique = ctx.scene.world.unique_name(&name, Some(id));
+                    ctx.scene.change(|w| w.node_mut(id).map(|n| n.name = unique.clone()));
+                    if unique == name {
+                        format!("Renamed `{label}` to `{name}`")
+                    } else {
+                        format!("Renamed `{label}` to `{unique}` (`{name}` is taken)")
+                    }
                 }
                 "duplicate" => {
-                    let width = ctx.scene.world.bounds(id).map_or(0, |b| b.1.x);
+                    let width = ctx.scene.world.bounds_all(id).map_or(0, |b| b.1.x);
                     let offset = opt_ivec3(a, "offset")?.unwrap_or(IVec3::new(width + 1, 0, 0));
-                    let name = string(a, "name").map(|n| n.trim().to_string());
+                    let name = string(a, "name").map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
                     let copy = ctx.scene.change(|w| {
                         let c = w.duplicate(id)?;
-                        w.translate(c, offset);
-                        if let (Some(n), Some(name)) = (w.node_mut(c), name) {
-                            n.name = name;
+                        w.shift(c, offset);
+                        if let Some(name) = name {
+                            let name = w.unique_name(&name, Some(c));
+                            w.node_mut(c)?.name = name;
                         }
                         Some(c)
                     });
@@ -1198,8 +1249,15 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                     if left.models().is_empty() {
                         bail!("can't delete the last part");
                     }
+                    let mut attached = Vec::new();
+                    ctx.scene.world.visit(id, &mut |i, _| attached.push(i));
+                    let attached: Vec<String> = attached[1..].iter().map(|&i| format!("`{}`", ctx.scene.world.label(i))).collect();
                     ctx.scene.change(|w| w.delete(id));
-                    format!("Deleted `{label}`")
+                    if attached.is_empty() {
+                        format!("Deleted `{label}`")
+                    } else {
+                        format!("Deleted `{label}` and what was in or attached to it: {}", attached.join(", "))
+                    }
                 }
                 act @ ("hide" | "show") => {
                     ctx.scene.change(|w| w.node_mut(id).map(|n| n.hidden = act == "hide"));
@@ -1229,14 +1287,15 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let name = string(a, "name").unwrap_or_default().trim().to_string();
             let g = ctx.scene.change(|w| {
                 let g = w.group(&ids)?;
-                if let Some(n) = w.node_mut(g) {
-                    n.name = name;
-                }
+                let name = w.unique_name(&name, Some(g));
+                w.node_mut(g)?.name = name;
                 Some(g)
             });
             let g = g.context("nothing to group")?;
             tree_changed(ctx);
-            Ok(vec![text(format!("Grouped {} into `{}` (id {g})", ids.len(), ctx.scene.world.label(g)))])
+            let w = &ctx.scene.world;
+            let inside: Vec<String> = w.node(g).map(|n| n.children().iter().map(|&c| format!("`{}`", w.label(c))).collect()).unwrap_or_default();
+            Ok(vec![text(format!("Grouped {} into `{}` (id {g}); attached parts come with what they hang from", inside.join(", "), w.label(g)))])
         }
         "get_scene_info" => {
             let v = &ctx.scene.volume;
@@ -1262,7 +1321,9 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "save_path": ctx.ed.save_path.display().to_string(),
                 "can_undo": ctx.ed.editor.can_undo() || ctx.scene.can_undo_tree(),
                 "editing_part": ctx.scene.editing().map(|id| ctx.scene.world.label(id)),
-                "part_position": arr(ctx.scene.origin),
+                // Like list_parts: the world box on the current frame.
+                "part_position": arr(ctx.scene.editing().and_then(|id| ctx.scene.world.bounds(id)).map_or(ctx.scene.origin, |b| b.0)),
+                "part_position_frame": ctx.scene.world.frame,
                 "parts": ctx.scene.world.models().len(),
                 "animation": { "frames": ctx.scene.world.anim.frames, "frame": ctx.scene.world.frame, "fps": ctx.scene.world.anim.fps, "loop": ctx.scene.world.anim.looping, "smooth": ctx.scene.world.anim.smooth },
                 "camera": { "yaw": cam.yaw.to_degrees(), "pitch": cam.pitch.to_degrees(), "distance": cam.dist, "target": cam.target.to_array() },

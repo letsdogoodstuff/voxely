@@ -471,6 +471,9 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
     // The scene as it stands on frame 0; animation is sampled from keys.
     let mut posed = scene.synced_world().into_owned();
     posed.set_frame(0);
+    // Rigs rest as they were before a motion was keyed on (engines'
+    // bind pose; importing the clip back maps it onto the same rest).
+    crate::rig::pose_rest(&mut posed, crate::world::ROOT);
     let world = &posed;
     let models: Vec<usize> = world.models().into_iter().filter(|&m| world.visible(m)).collect();
 

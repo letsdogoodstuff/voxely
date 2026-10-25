@@ -419,6 +419,8 @@ pub fn import(w: &mut World, g: &Gltf, clip: Option<&str>, rig: Option<usize>, r
     // source bone's rest direction.
     let c = from_gltf();
     w.set_frame(0);
+    // From the rest pose, so importing again replaces the last clip.
+    crate::rig::pose_rest(w, root);
     // A bone's direction points at the next bone in its chain (torso to
     // head, upper arm to forearm ...), else at its first joint child that
     // isn't an attachment point.
@@ -469,7 +471,7 @@ pub fn import(w: &mut World, g: &Gltf, clip: Option<&str>, rig: Option<usize>, r
         })
         .collect();
     let target_rest: HashMap<usize, Mat3> = pairs.iter().map(|&(_, _, d)| (d, Mat3::from(w.affine(d).matrix3))).collect();
-    let rest_keys: HashMap<usize, Key> = pairs.iter().filter_map(|&(_, _, d)| Some((d, w.node(d)?.key_now(0)))).collect();
+    let rest_keys: HashMap<usize, Key> = pairs.iter().filter_map(|&(_, _, d)| Some((d, crate::rig::rest_of(w.node(d)?)))).collect();
 
     // Hips movement, scaled from the clip's hip height to the rig's.
     let hips = pairs.iter().find(|p| p.0 == Bone::Hips).map(|p| (p.1, p.2));
@@ -521,6 +523,7 @@ pub fn import(w: &mut World, g: &Gltf, clip: Option<&str>, rig: Option<usize>, r
     }
     for (d, list) in keys {
         if let Some(n) = w.node_mut(d) {
+            n.rest = rest_keys.get(&d).copied();
             n.keys = list;
         }
     }
@@ -607,6 +610,35 @@ mod tests {
             for (b, d) in &src[f] {
                 let got = dst[f][b];
                 assert!(got.dot(*d) > 0.99, "frame {f} {b:?}: {got} vs {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_motion_round_trips_and_importing_again_replaces_it() {
+        // Walk's first frame isn't the rest pose: the export rests in the
+        // pose before the motion, so the clip maps back onto the same rest.
+        let mut s = Scene::empty(IVec3::ONE);
+        s.world = rig_world();
+        crate::rig::apply_motion(&mut s.world, None, "walk", 12, 1.0).unwrap();
+        s.world.anim.fps = 12.0;
+        s.world_mode();
+        let path = std::env::temp_dir().join(format!("voxely-motion-{}.glb", std::process::id()));
+        crate::gltf::write(&s, &path).unwrap();
+        let g = Gltf::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let src = directions(&mut s.world.clone(), 12);
+        let mut fresh = rig_world();
+        fresh.anim.fps = 12.0;
+        let mut again = s.world.clone();
+        for w in [&mut fresh, &mut again] {
+            import(w, &g, None, None, true).unwrap();
+            import(w, &g, None, None, true).unwrap();
+            let dst = directions(w, 12);
+            for f in 0..12 {
+                for (b, d) in &src[f] {
+                    assert!(dst[f][b].dot(*d) > 0.99, "frame {f} {b:?}: {} vs {d}", dst[f][b]);
+                }
             }
         }
     }

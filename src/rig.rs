@@ -15,7 +15,7 @@ use glam::{IVec3, Vec3};
 
 use crate::anim::{tilt_deg, tilt_quat, Key};
 use crate::scene::Volume;
-use crate::world::{Socket, World, ROOT};
+use crate::world::{Node, Socket, World, ROOT};
 
 /// The bones motions and imports know about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -41,25 +41,69 @@ pub enum Bone {
 
 use Bone::*;
 
-/// Which bone a part or joint name means, if any.
+/// A name's words, lowercase: split at punctuation, spaces, digits and
+/// camelCase humps ("mixamorig:LeftForeArm" -> mixamorig, left, fore, arm).
+fn words(name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev: Option<char> = None;
+    for c in name.chars() {
+        let hump = prev.is_some_and(|p| (p.is_lowercase() && c.is_uppercase()) || (p.is_ascii_digit() != c.is_ascii_digit()));
+        if !c.is_alphanumeric() || hump {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if c.is_alphanumeric() {
+            cur.extend(c.to_lowercase());
+        }
+        prev = Some(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Words other rigs put in front of every bone name (Mixamo's
+/// "mixamorig:", Rigify's "DEF-", 3ds Max's "Bip01 ").
+fn rig_word(w: &str) -> bool {
+    w.ends_with("rig") || matches!(w, "def" | "bip" | "bip01" | "bip001" | "armature")
+}
+
+/// Which bone a part or joint name means, if any. Whole words only, so
+/// "farmer" isn't an arm; a name saying both left and right is neither.
+#[cfg(test)]
 pub fn bone_of(name: &str) -> Option<Bone> {
-    let n = name.to_ascii_lowercase().replace(['.', '-', ' ', ':'], "_");
-    // Strip rig prefixes like "mixamorig_".
-    let n = n.rsplit_once("rig_").map_or(n.as_str(), |(_, b)| b).to_string();
-    let words: Vec<&str> = n.split('_').filter(|w| !w.is_empty()).collect();
-    let has = |w: &str| words.contains(&w) || n.contains(w);
-    let left = words.iter().any(|w| *w == "l" || *w == "left") || n.starts_with("left") || n.ends_with("_l");
-    let right = words.iter().any(|w| *w == "r" || *w == "right") || n.starts_with("right") || n.ends_with("_r");
-    let side = |l: Bone, r: Bone| if left { Some(l) } else if right { Some(r) } else { None };
-    let front = words.iter().any(|w| matches!(*w, "front" | "f" | "fl" | "fr")) || n.contains("front");
-    let back = words.iter().any(|w| matches!(*w, "back" | "b" | "rear" | "hind" | "bl" | "br")) || n.contains("hind") || n.contains("rear");
-    if (front || back) && has("leg") {
-        let (l, r) = (n.contains("fl") || n.contains("bl") || left, n.contains("fr") || n.contains("br") || right);
+    bone_of_words(&words(name))
+}
+
+fn bone_of_words(all: &[String]) -> Option<Bone> {
+    let ws: Vec<&str> = all.iter().map(String::as_str).filter(|w| !rig_word(w) && !w.chars().all(|c| c.is_ascii_digit())).collect();
+    let has = |w: &str| ws.contains(&w);
+    let pair = |a: &str, b: &str| ws.windows(2).any(|p| p[0] == a && p[1] == b);
+    // Leaf markers ("HeadTop_End") and finger / toe joints aren't bones here.
+    if ["end", "top", "index", "middle", "ring", "pinky", "thumb", "toe", "toebase", "hand", "foot", "neck", "shoulder", "clavicle"].iter().any(|w| has(w)) {
+        return None;
+    }
+    let left = has("l") || has("left");
+    let right = has("r") || has("right");
+    let side = |l: Bone, r: Bone| match (left, right) {
+        (true, false) => Some(l),
+        (false, true) => Some(r),
+        _ => None,
+    };
+    let front = ["front", "f", "fl", "fr", "fore"].iter().any(|w| has(w));
+    let back = ["back", "b", "rear", "hind", "bl", "br"].iter().any(|w| has(w));
+    let leg = has("leg") || has("foreleg") || has("hindleg");
+    if (front || back || has("foreleg") || has("hindleg")) && leg {
+        let (l, r) = (left || has("fl") || has("bl"), right || has("fr") || has("br"));
+        let front = (front || has("foreleg")) && !has("hindleg");
         return match (front, l, r) {
-            (true, true, _) => Some(LegFL),
-            (true, _, true) => Some(LegFR),
-            (false, true, _) => Some(LegBL),
-            (false, _, true) => Some(LegBR),
+            (true, true, false) => Some(LegFL),
+            (true, false, true) => Some(LegFR),
+            (false, true, false) => Some(LegBL),
+            (false, false, true) => Some(LegBR),
             _ => None,
         };
     }
@@ -70,19 +114,19 @@ pub fn bone_of(name: &str) -> Option<Bone> {
         return Some(Head);
     }
     // ("root" is usually the armature above the hips, so it isn't one.)
-    if has("hips") || has("pelvis") || n == "hip" {
+    if has("hips") || has("pelvis") || (has("hip") && !left && !right) {
         return Some(Hips);
     }
-    if has("forearm") || has("lowerarm") || has("lower_arm") || has("elbow") {
+    if has("forearm") || has("lowerarm") || pair("lower", "arm") || pair("fore", "arm") || has("elbow") {
         return side(LowerArmL, LowerArmR);
     }
-    if has("upperarm") || has("upper_arm") || has("arm") {
+    if has("upperarm") || has("arm") {
         return side(UpperArmL, UpperArmR);
     }
-    if has("thigh") || has("upleg") || has("upperleg") || has("upper_leg") {
+    if has("thigh") || has("upleg") || has("upperleg") || pair("up", "leg") || pair("upper", "leg") {
         return side(UpperLegL, UpperLegR);
     }
-    if has("shin") || has("calf") || has("lowerleg") || has("lower_leg") || has("knee") {
+    if has("shin") || has("calf") || has("lowerleg") || pair("lower", "leg") || has("knee") {
         return side(LowerLegL, LowerLegR);
     }
     if has("leg") {
@@ -108,13 +152,30 @@ pub fn find_bones(w: &World, root: usize) -> HashMap<Bone, usize> {
 
 /// Bones among `(id, name)` pairs in hierarchy order: the first match
 /// wins, and a plain "leg" next to an "upleg" / "thigh" is the lower leg.
+/// Words every name starts with (a rig prefix like "farmer_" or "left_")
+/// are skipped when that finds more bones.
 pub fn map_bones(named: &[(usize, String)]) -> HashMap<Bone, usize> {
+    let split: Vec<(usize, Vec<String>)> = named.iter().map(|(id, n)| (*id, words(n))).collect();
+    let mut common = split.first().map_or(0, |s| s.1.len());
+    for (_, ws) in &split {
+        let first = &split[0].1;
+        common = common.min(ws.iter().zip(first).take_while(|(a, b)| a == b).count()).min(ws.len().saturating_sub(1));
+    }
+    let plain = map_words(&split, 0);
+    if common == 0 || split.len() < 2 {
+        return plain;
+    }
+    let stripped = map_words(&split, common);
+    if stripped.len() >= plain.len() { stripped } else { plain }
+}
+
+fn map_words(named: &[(usize, Vec<String>)], skip: usize) -> HashMap<Bone, usize> {
     let mut out = HashMap::new();
     let mut plain_legs = Vec::new();
-    for (id, name) in named {
-        if let Some(b) = bone_of(name) {
-            let lower = name.to_ascii_lowercase();
-            if matches!(b, UpperLegL | UpperLegR) && !["up", "thigh", "upper"].iter().any(|k| lower.contains(k)) {
+    for (id, ws) in named {
+        let ws = &ws[skip.min(ws.len())..];
+        if let Some(b) = bone_of_words(ws) {
+            if matches!(b, UpperLegL | UpperLegR) && !ws.iter().any(|w| matches!(w.as_str(), "up" | "upleg" | "upper" | "upperleg" | "thigh")) {
                 plain_legs.push((b, *id));
                 continue;
             }
@@ -194,9 +255,10 @@ pub fn humanoid(w: &mut World, origin: IVec3, scale: i32, prefix: &str, (main, s
     let hips = b.part("hips", o + IVec3::new(0, 0, 10), IVec3::new(8, 4, 3), dark, p(4.0, 2.0, 1.5), None);
     let torso = b.part("torso", o + IVec3::new(0, 0, 13), IVec3::new(8, 4, 7), main, p(4.0, 2.0, 0.0), Some(hips));
     b.part("head", o + IVec3::new(1, -1, 20), IVec3::new(6, 6, 6), skin, p(3.0, 3.0, 0.0), Some(torso));
+    let mut hands = Vec::new();
     for (side, x) in [("l", 8), ("r", -3)] {
         let up = b.part(&format!("upper_arm_{side}"), o + IVec3::new(x, 0, 15), IVec3::new(3, 3, 5), main, p(1.5, 1.5, 5.0), Some(torso));
-        b.part(&format!("lower_arm_{side}"), o + IVec3::new(x, 0, 10), IVec3::new(3, 3, 5), skin, p(1.5, 1.5, 5.0), Some(up));
+        hands.push((side, b.part(&format!("lower_arm_{side}"), o + IVec3::new(x, 0, 10), IVec3::new(3, 3, 5), skin, p(1.5, 1.5, 5.0), Some(up))));
         let lx = if side == "l" { 4 } else { 1 };
         let ul = b.part(&format!("upper_leg_{side}"), o + IVec3::new(lx, 0, 5), IVec3::new(3, 4, 5), dark, p(1.5, 2.0, 5.0), Some(hips));
         b.part(&format!("lower_leg_{side}"), o + IVec3::new(lx, 0, 0), IVec3::new(3, 4, 5), dark, p(1.5, 2.0, 5.0), Some(ul));
@@ -205,11 +267,9 @@ pub fn humanoid(w: &mut World, origin: IVec3, scale: i32, prefix: &str, (main, s
     if let Some(n) = w.node_mut(torso) {
         n.sockets.push(Socket { name: "back".into(), pos: Vec3::new(4.0, 4.0, 4.0) * scale as f32 });
     }
-    for side in ["l", "r"] {
-        if let Some(id) = w.find(&format!("{prefix}lower_arm_{side}")) {
-            if let Some(n) = w.node_mut(id) {
-                n.sockets.push(Socket { name: format!("hand_{side}"), pos: Vec3::new(1.5, 1.5, 0.0) * scale as f32 });
-            }
+    for (side, id) in hands {
+        if let Some(n) = w.node_mut(id) {
+            n.sockets.push(Socket { name: format!("hand_{side}"), pos: Vec3::new(1.5, 1.5, 0.0) * scale as f32 });
         }
     }
     hips
@@ -365,9 +425,34 @@ pub struct Applied {
     pub keys: usize,
 }
 
+/// A bone's pose to key a motion onto: the one it had before the last
+/// motion or clip was keyed on, else its pose now.
+pub fn rest_of(n: &Node) -> Key {
+    match n.rest {
+        Some(r) if !n.keys.is_empty() => r,
+        _ => n.key_now(0),
+    }
+}
+
+/// Put every keyed part under `root` back in its rest pose (until the next
+/// `set_frame`).
+pub fn pose_rest(w: &mut World, root: usize) {
+    let mut ids = Vec::new();
+    w.visit(root, &mut |id, _| ids.push(id));
+    for id in ids {
+        if let Some(n) = w.node_mut(id) {
+            let r = rest_of(n);
+            (n.rot, n.t, n.tilt) = (r.rot, r.t, r.tilt);
+        }
+    }
+}
+
 /// Key `name` onto the rig in `w` over `frames` frames from frame 0,
-/// replacing the keys of the bones it moves. The rest pose is each bone's
-/// pose on frame 0.
+/// replacing the keys of the bones it moves (applying it again, or
+/// another motion, starts from the same rest pose; see `rest_of`). The
+/// timeline becomes `frames` long. Loop and smooth settings are kept:
+/// on a stepped timeline every frame is keyed, and a cycle that doesn't
+/// loop gets a key on its last frame. Nothing changes on an error.
 ///
 /// `rig` is any part of the rig to animate (its top-level object is used);
 /// without one, the first top-level object with the limbs the motion needs.
@@ -382,37 +467,37 @@ pub fn apply_motion(w: &mut World, rig: Option<usize>, name: &str, frames: u32, 
             bones.insert(Torso, b);
         }
     }
-    let frames = frames.max(2);
-    if w.anim.frames < frames {
-        w.anim.frames = frames;
+    let mut used: Vec<Bone> = Vec::new();
+    for b in motion(name, 0.25, 1.0).unwrap().keys().chain(motion(name, 0.6, 1.0).unwrap().keys()) {
+        if !used.contains(b) {
+            used.push(*b);
+        }
     }
-    w.anim.smooth = true;
-    w.anim.looping = !matches!(name, "death" | "jump" | "attack");
+    if !used.iter().any(|b| bones.contains_key(b)) {
+        return Err("no rig parts found; name parts like create_rig does (hips, torso, head, upper_arm_l ...) or use create_rig".into());
+    }
+    let frames = frames.max(2);
+    w.anim.frames = frames;
     w.set_frame(0);
-    let rest: HashMap<Bone, Key> = bones.iter().filter_map(|(&b, &id)| Some((b, w.node(id)?.key_now(0)))).collect();
-    let used: Vec<Bone> = motion(name, 0.25, 1.0).unwrap().keys().copied().chain(motion(name, 0.6, 1.0).unwrap().keys().copied()).collect();
-    let mut applied = Applied { bones: Vec::new(), missing: Vec::new(), keys: 0 };
-    let step = (frames / 12).max(1);
+    // Cycles end where they start; the others play once, start to end.
+    let cycle = !matches!(name, "death" | "jump" | "attack");
+    let step = if w.anim.smooth { (frames / 12).max(1) } else { 1 };
     let mut sample: Vec<u32> = (0..frames).step_by(step as usize).collect();
-    if !w.anim.looping && sample.last() != Some(&(frames - 1)) {
+    if !(cycle && w.anim.looping) && sample.last() != Some(&(frames - 1)) {
         sample.push(frames - 1);
     }
-    let looping = w.anim.looping;
-    let mut done = Vec::new();
+    let mut applied = Applied { bones: Vec::new(), missing: Vec::new(), keys: 0 };
     for b in used {
-        if done.contains(&b) {
-            continue;
-        }
-        done.push(b);
-        let (Some(&id), Some(r)) = (bones.get(&b), rest.get(&b)) else {
+        let Some(&id) = bones.get(&b) else {
             applied.missing.push(b);
             continue;
         };
         let Some(n) = w.node_mut(id) else { continue };
+        let r = rest_of(n);
+        n.rest = Some(r);
         n.keys.clear();
         for &f in &sample {
-            // Looping cycles end where they start, so sample a full turn.
-            let t = if looping { f as f32 / frames as f32 } else { f as f32 / (frames - 1) as f32 };
+            let t = if cycle { f as f32 / frames as f32 } else { f as f32 / (frames - 1) as f32 };
             let (turn, lift) = motion(name, t, amount).unwrap().get(&b).copied().unwrap_or_default();
             let q = tilt_quat(r.tilt) * tilt_quat(turn);
             let k = Key { frame: f, rot: r.rot, t: r.t + lift.round().as_ivec3(), tilt: tilt_deg(q) };
@@ -532,5 +617,115 @@ mod tests {
         let tail = w.find("dog_tail").unwrap();
         let a = apply_motion(&mut w, Some(tail), "quad_idle", 16, 1.0).unwrap();
         assert!(a.bones.iter().any(|(_, name)| name == "dog_head") && w.node(body).is_some());
+    }
+
+    #[test]
+    fn whole_words_and_rig_prefixes() {
+        for (name, bone) in [
+            ("farmer_upper_arm_l", UpperArmL),
+            ("farmer_hips", Hips),
+            ("upper_arm_l 2", UpperArmL),
+            ("mixamorig:LeftLeg", UpperLegL),
+            ("mixamorig1:RightForeArm", LowerArmR),
+            ("Bip01 L UpperArm", UpperArmL),
+            ("hindleg_l", LegBL),
+        ] {
+            assert_eq!(bone_of(name), Some(bone), "{name}");
+        }
+        // Substrings aren't words: "farmer" has no arm, "bleg" no leg.
+        for other in ["farmer", "swarm", "bleg_l", "mixamorig:HeadTop_End", "left_leg_front_r"] {
+            assert_eq!(bone_of(other), None, "{other}");
+        }
+        let empty = || {
+            let mut w = World::single(Volume::new(IVec3::ONE));
+            let first = w.models()[0];
+            w.delete(first);
+            w
+        };
+        // A rig whose prefix is a side or a back-leg word.
+        let mut w = empty();
+        let body = quadruped(&mut w, IVec3::ZERO, 1, "left_", (1, 2, 3));
+        let bones = find_bones(&w, body);
+        assert_eq!(bones.len(), 7, "{bones:?}");
+        assert_eq!(w.label(bones[&LegFR]), "left_leg_front_r");
+        assert_eq!(w.label(bones[&LegBL]), "left_leg_back_l");
+        let mut w = empty();
+        let hips = humanoid(&mut w, IVec3::ZERO, 1, "b_", (1, 2, 3));
+        let bones = find_bones(&w, hips);
+        assert_eq!(bones.len(), 11, "{bones:?}");
+        assert!(!bones.contains_key(&LegBL));
+        // Legs-only names all starting with "leg" keep their words.
+        let named: Vec<(usize, String)> = ["leg_front_l", "leg_front_r", "leg_back_l", "leg_back_r"].iter().enumerate().map(|(i, n)| (i + 1, n.to_string())).collect();
+        assert_eq!(map_bones(&named).len(), 4);
+    }
+
+    #[test]
+    fn a_second_rig_gets_numbered_names_and_its_own_bones() {
+        let mut w = World::single(Volume::new(IVec3::ONE));
+        let first = w.models()[0];
+        w.delete(first);
+        humanoid(&mut w, IVec3::ZERO, 1, "", (1, 2, 3));
+        let hips2 = humanoid(&mut w, IVec3::new(30, 0, 0), 1, "", (1, 2, 3));
+        assert_eq!(w.label(hips2), "hips 2");
+        let bones = find_bones(&w, hips2);
+        assert_eq!(bones.len(), 11, "{bones:?}");
+        assert_eq!(w.label(bones[&LowerArmL]), "lower_arm_l 2");
+        // Its hands have sockets (they used to go on the first rig).
+        assert!(w.socket_world(bones[&LowerArmL], "hand_l").is_some());
+        let a = apply_motion(&mut w, Some(hips2), "wave", 12, 1.0).unwrap();
+        assert!(a.bones.iter().all(|(_, n)| n.ends_with(" 2")), "{:?}", a.bones);
+    }
+
+    #[test]
+    fn applying_again_replaces_and_failures_change_nothing() {
+        let mut w = World::single(Volume::new(IVec3::ONE));
+        let first = w.models()[0];
+        w.delete(first);
+        humanoid(&mut w, IVec3::ZERO, 1, "", (1, 2, 3));
+        let keys = |w: &World| w.nodes.iter().flatten().map(|n| n.keys.clone()).collect::<Vec<_>>();
+        apply_motion(&mut w, None, "walk", 24, 1.0).unwrap();
+        let once = keys(&w);
+        apply_motion(&mut w, None, "walk", 24, 1.0).unwrap();
+        assert_eq!(keys(&w), once, "a second walk doesn't add to the first");
+        apply_motion(&mut w, None, "run", 24, 1.0).unwrap();
+        apply_motion(&mut w, None, "walk", 24, 1.0).unwrap();
+        assert_eq!(keys(&w), once, "nor does one after another motion");
+        // Saved and reloaded, the rest pose is still known.
+        let path = std::env::temp_dir().join(format!("voxely-motion-{}.vox", std::process::id()));
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[], &[]).unwrap();
+        let mut back = World::from_vox(&crate::vox::VoxFile::load(&path).unwrap());
+        std::fs::remove_file(&path).ok();
+        apply_motion(&mut back, None, "walk", 24, 1.0).unwrap();
+        let named = |w: &World| {
+            let mut v: Vec<(String, Vec<Key>)> = w.nodes.iter().flatten().map(|n| (n.name.clone(), n.keys.clone())).filter(|n| !n.0.is_empty()).collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let (a, b) = (named(&back), named(&w));
+        for ((na, ka), (nb, kb)) in a.iter().zip(&b) {
+            assert_eq!(na, nb);
+            assert_eq!(ka.len(), kb.len(), "{na}");
+            for (x, y) in ka.iter().zip(kb) {
+                assert!(x.frame == y.frame && x.rot == y.rot && x.t == y.t && (x.tilt - y.tilt).abs().max_element() < 1e-3, "{na}: {x:?} vs {y:?}");
+            }
+        }
+        // A shorter motion sets the timeline's length; loop and smooth
+        // settings stay, and a stepped timeline is keyed every frame.
+        w.anim.looping = false;
+        w.anim.smooth = false;
+        apply_motion(&mut w, None, "idle", 10, 1.0).unwrap();
+        assert_eq!((w.anim.frames, w.anim.looping, w.anim.smooth), (10, false, false));
+        assert_eq!(w.node(find_bones(&w, ROOT)[&Torso]).unwrap().keys.len(), 10);
+        // Moved after the motion: applying again starts from there.
+        let hips = find_bones(&w, ROOT)[&Hips];
+        let was = w.node(hips).unwrap().keys[0].t;
+        w.translate(hips, IVec3::new(20, 0, 0));
+        apply_motion(&mut w, None, "idle", 10, 1.0).unwrap();
+        assert_eq!(w.node(hips).unwrap().keys[0].t, was + IVec3::new(20, 0, 0));
+        // No rig: an error, and nothing changed.
+        let mut lone = World::single(Volume::new(IVec3::ONE));
+        let before = lone.anim.clone();
+        assert!(apply_motion(&mut lone, None, "walk", 48, 1.0).is_err());
+        assert_eq!(lone.anim, before);
     }
 }
