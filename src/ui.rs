@@ -656,6 +656,7 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
             ui.toggle_value(&mut o.ao, "AO").on_hover_text("Show Ambient Occlusion");
             ui.toggle_value(&mut o.shadow, "SW").on_hover_text("Display Shadow [Ctrl+W]");
             ui.toggle_value(&mut o.wire, "WR").on_hover_text("Display Wireframes [Ctrl+M]");
+            ui.toggle_value(&mut o.canvas_box, "BB").on_hover_text("Display the canvas Bounding Box while editing");
             ui.separator();
         }
         let field = |v: Option<i32>| v.map_or("-".to_string(), |v| v.to_string());

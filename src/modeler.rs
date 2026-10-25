@@ -148,6 +148,8 @@ pub struct ModelerOptions {
     pub shadow: bool,
     /// Each model's box in World mode [WR].
     pub wire: bool,
+    /// The canvas box while editing [BB].
+    pub canvas_box: bool,
     pub background: Vec3,
     pub ambient: Vec3,
 }
@@ -164,6 +166,7 @@ impl Default for ModelerOptions {
             fade: true,
             shadow: false,
             wire: true,
+            canvas_box: true,
             background: Vec3::new(0.17, 0.17, 0.17),
             // `ambient_color` from MagicaVoxel's config.txt.
             ambient: Vec3::new(0.19, 0.18, 0.26),
@@ -761,7 +764,7 @@ impl Modeler {
                 pass.draw(0..*count, 0..1);
             }
             // The canvas box while editing; in World mode, model boxes [WR].
-            if self.lines.1 > 0 && (editing || o.wire) {
+            if self.lines.1 > 0 && (if editing { o.canvas_box } else { o.wire }) {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_bind_group(0, &self.plain_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.lines.0.slice(..));
