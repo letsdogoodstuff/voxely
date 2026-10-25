@@ -102,8 +102,15 @@ and warn when shapes were clipped by the canvas. get_slice / get_projection give
 checkpoint / restore snapshot the whole scene before risky changes; autosave saves every 25 edits. \
 save_stamp / place_stamp reuse pieces; apply_palette_preset loads a coherent palette; \
 voxelize_image turns a picture into voxels. \
+With a reference image or photo (any subject: character, animal, vehicle, building, scene), \
+measure instead of eyeballing: analyze_image finds the views and colors, set_reference stores a view, \
+reference_profile gives its silhouette as voxel rows to build from, and compare_reference scores the model \
+against it (silhouette IoU, width errors, colors, diff image); the build_from_reference prompt walks through it. \
+render views \"turnaround\" path traces front/right/back/left in one image; render frame true auto-frames. \
 For loops, procedural builds or anything needing many calls, use run_script: one JavaScript program \
-that calls every tool as voxely.<camelCaseName>({...}) and can edit a part's whole grid as a Uint8Array. \
+that calls every tool as voxely.<camelCaseName>({...}) and can edit a part's whole grid as a Uint8Array; \
+its util library has seeded noise and signed distance shapes (smoothUnion, capsule, displace ...) for organic \
+forms (get_guide scripting). \
 Every edit is undoable. If the voxely window is open, edits appear in it live. \
 Before building something, read get_guide (topic craft, plus character / prop / building as fits): \
 pick a scale, block out the silhouette first, use a few shades per material, and check each stage \
