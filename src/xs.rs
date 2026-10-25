@@ -472,6 +472,62 @@ pub fn run(
     Ok(Volume::from_cells(dims, cells))
 }
 
+/// `run` `iterations` times [1 - 64], each pass reading the previous
+/// pass's output, like MagicaVoxel's Iteration field.
+#[allow(clippy::too_many_arguments)]
+pub fn run_iterations(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    shader: &XsShader,
+    args: &[f32],
+    volume: &Volume,
+    palette: &[[u8; 4]],
+    color: u8,
+    sels: &[u8],
+    iterations: u32,
+) -> Result<Volume> {
+    let mut out = run(device, queue, shader, args, volume, palette, color, sels)?;
+    for _ in 1..iterations.clamp(1, 64) {
+        out = run(device, queue, shader, args, &out, palette, color, sels)?;
+    }
+    Ok(out)
+}
+
+/// Argument values as text for Export Args: one `var = value` line each.
+pub fn args_text(shader: &XsShader, values: &[f32]) -> String {
+    let mut s = format!("// {} args\n", shader.name);
+    for (i, a) in shader.args.iter().enumerate() {
+        s.push_str(&format!("{} = {}\n", a.var, values.get(i).copied().unwrap_or(a.value)));
+    }
+    s
+}
+
+/// Read Export Args text into `values` (one per arg of `shader`): lines
+/// name an arg by its var or label. Fails on unknown names, bad numbers
+/// or values outside an arg's range, changing nothing.
+pub fn parse_args_text(shader: &XsShader, values: &[f32], text: &str) -> Result<Vec<f32>> {
+    let mut out: Vec<f32> = shader.args.iter().enumerate().map(|(i, a)| values.get(i).copied().unwrap_or(a.value)).collect();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let (k, v) = t.split_once('=').with_context(|| format!("expected `name = value`, got `{t}`"))?;
+        let (k, v) = (k.trim(), v.trim());
+        let Some(i) = shader.args.iter().position(|a| a.var == k || a.name == k) else {
+            let names: Vec<&str> = shader.args.iter().map(|a| a.var.as_str()).collect();
+            bail!("`{k}` is not an arg of {} (its args: {})", shader.name, if names.is_empty() { "none".to_string() } else { names.join(", ") });
+        };
+        let a = &shader.args[i];
+        let x: f32 = v.parse().with_context(|| format!("`{k}`: `{v}` is not a number"))?;
+        if !(a.min..=a.max).contains(&x) {
+            bail!("`{k}` = {x} is outside {} to {}", a.min, a.max);
+        }
+        out[i] = x;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +566,49 @@ mod tests {
         // Args outside the header are ignored.
         let s = XsShader::parse("x", "// arg : { var = 'a' }\nfloat map(vec3 v){return 0.0;}").unwrap();
         assert!(s.args.is_empty());
+    }
+
+    #[test]
+    fn args_text_round_trips_and_rejects_bad_values() {
+        let g = XsShader::parse("gear", GEAR_HEADER).unwrap();
+        let text = args_text(&g, &[12.0, 0.25]);
+        assert_eq!(parse_args_text(&g, &[6.0, 0.5], &text).unwrap(), vec![12.0, 0.25]);
+        // Labels work too; unnamed args keep their values.
+        assert_eq!(parse_args_text(&g, &[6.0, 0.5], "Teeth = 8").unwrap(), vec![8.0, 0.5]);
+        assert!(parse_args_text(&g, &[6.0, 0.5], "m_teeth = 99").unwrap_err().to_string().contains("outside"));
+        assert!(parse_args_text(&g, &[6.0, 0.5], "m_size = 1").unwrap_err().to_string().contains("m_teeth, m_inner"));
+        assert!(parse_args_text(&g, &[6.0, 0.5], "m_teeth = x").is_err());
+    }
+
+    #[test]
+    fn gpu_iterations_feed_back() {
+        let (d, q) = gpu();
+        // Each pass grows the column by one voxel along +x.
+        let src = "float map(vec3 v) { float c = voxel(v); return c != 0.0 ? c : voxel(v - vec3(1.0, 0.0, 0.0)); }\n";
+        let s = XsShader::parse("grow", src).unwrap();
+        let mut vol = Volume::new(IVec3::new(8, 1, 1));
+        vol.set(IVec3::ZERO, 4);
+        let out = run_iterations(&d, &q, &s, &[], &vol, &pal(), 1, &[], 3).unwrap();
+        assert_eq!(out.cells.iter().filter(|&&c| c == 4).count(), 4);
+    }
+
+    #[test]
+    fn gpu_sphere_fits_a_brush_box() {
+        // The Code brush runs over its box: the sphere fills a 6x4x4 box.
+        let (d, q) = gpu();
+        let src = "float map( vec3 v ) {\n\tv = ( v - i_volume_size * 0.5 ) / ( i_volume_size * 0.5 );\n\treturn i_color_index * step( length( v ), 1.0 );\n}\n";
+        let s = XsShader::parse("sphere", src).unwrap();
+        let mut canvas = Volume::new(IVec3::splat(16));
+        canvas.set(IVec3::new(12, 12, 12), 2);
+        let lo = IVec3::new(9, 10, 11);
+        let sub = crate::edit::sub_volume(&canvas, lo, IVec3::new(6, 4, 4));
+        let out = run(&d, &q, &s, &[], &sub, &pal(), 7, &[]).unwrap();
+        let (mut min, mut max) = (IVec3::MAX, IVec3::MIN);
+        for (p, _) in out.filled() {
+            (min, max) = (min.min(p), max.max(p));
+        }
+        assert_eq!((min, max), (IVec3::ZERO, IVec3::new(5, 3, 3)));
+        assert_eq!(out.get(IVec3::ZERO), 0);
     }
 
     #[test]

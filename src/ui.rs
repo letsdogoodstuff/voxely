@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use egui::{CollapsingHeader, ComboBox, Slider, Ui};
 use glam::{IVec3, Vec3};
 
-use crate::edit::{Brush, Editor, GeoShape, MarqueeMode, Tool};
+use crate::edit::{Brush, Editor, GeoShape, MarqueeMode, Tool, XformMode};
 use crate::env::EnvMode;
 use crate::modeler::ModelerOptions;
 use crate::scene::{BgMode, DenoiseView, GpuMaterial, MaterialKind, Projection, RenderSettings, Scene};
@@ -106,6 +106,8 @@ pub enum Command {
     SelectShader(PathBuf),
     /// Run the chosen voxel shader over the model (or the selection).
     RunShader,
+    /// Import (true) or Export the shader's arg values as a text file.
+    ShaderArgs(bool),
     /// Paste the copied material onto the selected color.
     PasteMaterial,
     ResetMaterial,
@@ -265,6 +267,8 @@ pub struct ShaderState {
     pub files: Vec<PathBuf>,
     pub current: Option<(PathBuf, crate::xs::XsShader)>,
     pub values: Vec<f32>,
+    /// Passes per run, each over the last one's output [1 - 64].
+    pub iterations: u32,
     /// Last compile or run error.
     pub error: Option<String>,
 }
@@ -1092,7 +1096,7 @@ pub fn brush_panel(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
     egui::Grid::new("brushes").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
         ui.selectable_value(&mut e.brush, Brush::Geo, "Geo").on_hover_text("Geometry mode [L]: line, square, circle");
         ui.selectable_value(&mut e.brush, Brush::Code, "Code").on_hover_text("Voxel shader mode [C]");
-        ui.selectable_value(&mut e.brush, Brush::Pattern, "Pattern").on_hover_text("Pattern mode [P] : Rot [-/+/0/9]");
+        ui.selectable_value(&mut e.brush, Brush::Pattern, "Pattern").on_hover_text("Pattern mode [P] : Rot [-/+/0/9] : Move [Dir/Page/Home]");
         ui.end_row();
         ui.selectable_value(&mut e.brush, Brush::Voxel, "Voxel").on_hover_text("Voxel mode [V] : Resize [-/+/Ctrl+Alt+Drag]");
         ui.selectable_value(&mut e.brush, Brush::Face, "Face").on_hover_text("Face mode [F] : Extrude [Drag]");
@@ -1107,7 +1111,7 @@ pub fn brush_panel(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
     });
     ui.separator();
     egui::Grid::new("select_tools").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
-        ui.selectable_value(&mut e.tool, Tool::Move, "Move").on_hover_text("Drag the selection, or the model : Normal axis [Shift]");
+        ui.selectable_value(&mut e.tool, Tool::Move, "Move").on_hover_text("Transform: move, scale, wrap or rotate the selection, or the model");
         ui.selectable_value(&mut e.tool, Tool::Marquee, "Select").on_hover_text("Marquee select [M] : Add [Shift] : Remove [Shift+Alt]");
         ui.selectable_value(&mut e.tool, Tool::Region, "Region").on_hover_text("Region select [N] : Add [Shift] : Remove [Shift+Alt]");
         ui.end_row();
@@ -1122,11 +1126,17 @@ pub fn brush_panel(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
         for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
             ui.toggle_value(&mut e.mirror[i], *n).on_hover_text(format!("F{}", 5 + i));
         }
+        if ui.small_button("Off").on_hover_text("Reset mirror mode").clicked() {
+            e.mirror = [false; 3];
+        }
     });
     ui.horizontal(|ui| {
         ui.label("Axis").on_hover_text("Axis mode: extend the brush through the canvas");
         for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
             ui.toggle_value(&mut e.opts.axis[i], *n);
+        }
+        if ui.small_button("Off").on_hover_text("Reset axis mode").clicked() {
+            e.opts.axis = [false; 3];
         }
     });
     ui.separator();
@@ -1346,6 +1356,29 @@ fn pick2<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, a: (T, &str, &str), b: (T,
 
 /// Options for the current brush or selection tool.
 fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
+    if e.tool == Tool::Move {
+        ui.label("Transform");
+        egui::Grid::new("xform").num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
+            ui.selectable_value(&mut e.opts.xform, XformMode::Move, "Move").on_hover_text("Move/Loop [Ctrl+LButton] : Normal axis [Shift]");
+            ui.selectable_value(&mut e.opts.xform, XformMode::Scale, "Scale").on_hover_text("Scale : Commit [Enter] : Cancel [Esc] : Two-sided [Shift]");
+            ui.end_row();
+            ui.selectable_value(&mut e.opts.xform, XformMode::Wrap, "Wrap").on_hover_text("Wrap/Crop : Commit [Enter] : Cancel [Esc] : Two-sided [Shift]");
+            ui.selectable_value(&mut e.opts.xform, XformMode::Rotate, "Rotate").on_hover_text("Rotate : Commit [Enter] : Cancel [Esc] : Snap [Shift]");
+            ui.end_row();
+        });
+        if e.opts.xform == XformMode::Wrap {
+            ui.label("Wrap spacing");
+            ui.horizontal(|ui| {
+                for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.add(egui::DragValue::new(&mut e.opts.wrap_space[i]).range(0..=256)).on_hover_text(format!("Wrap spacing : {n}"));
+                }
+            });
+        }
+        if e.xform_pending() {
+            ui.weak("Commit [Enter] : Cancel [Esc]");
+        }
+        return;
+    }
     if e.tool == Tool::Marquee {
         ui.label("Marquee");
         ui.horizontal(|ui| {
@@ -1399,6 +1432,15 @@ fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
                 }
             }
             pick2(ui, &mut e.opts.pattern_palette, (true, "Palette", "Use palette color"), (false, "Voxel", "Use the pattern's colors"));
+            let off = e.opts.pattern_offset;
+            if off != IVec3::ZERO {
+                ui.horizontal(|ui| {
+                    ui.weak(format!("Offset {} {} {}", off.x, off.y, off.z)).on_hover_text("Move [Dir/Page] : Reset [Home]");
+                    if ui.small_button("Reset").on_hover_text("[Home]").clicked() {
+                        e.opts.pattern_offset = IVec3::ZERO;
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 command(ui, cmds, "From selection", "Create pattern from selection", Command::PatternFromSelection);
             });
@@ -1536,7 +1578,20 @@ pub fn project_panel(
                         ui.label(&arg.name);
                         ui.add(Slider::new(value, arg.min..=arg.max).step_by(arg.step.max(0.0) as f64).max_decimals(arg.precision as usize));
                     }
-                    command(ui, cmds, "Run", "Execute shader on the model (or the selection)", Command::RunShader);
+                    ui.horizontal(|ui| {
+                        ui.label("Iteration").on_hover_text("Iteration number");
+                        ui.add(egui::DragValue::new(&mut shaders.iterations).range(1..=64)).on_hover_text("Run the shader this many times, each over the last result [1 - 64]");
+                    });
+                    ui.horizontal(|ui| {
+                        command(ui, cmds, "Run", "Execute shader on the model (or the selection)", Command::RunShader);
+                        if let Some((p, _)) = &shaders.current {
+                            command(ui, cmds, "Refresh", "Refresh shader: reload the file", Command::SelectShader(p.clone()));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        command(ui, cmds, "Import", "Import args", Command::ShaderArgs(true));
+                        command(ui, cmds, "Export", "Export args", Command::ShaderArgs(false));
+                    });
                     ui.add(egui::Label::new(egui::RichText::new("Or drag a box with the Code brush [C]").weak()).wrap());
                 }
                 if let Some(e) = &shaders.error {

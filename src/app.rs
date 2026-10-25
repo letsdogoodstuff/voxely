@@ -218,7 +218,7 @@ impl EditState {
             ui_scale: 1.0,
             transform_text: ui::TransformText::default(),
             palette: ui::PaletteState::default(),
-            shaders: ui::ShaderState { files: or_install(list_shaders(source.as_deref()), list_shaders), current: None, values: Vec::new(), error: None },
+            shaders: ui::ShaderState { files: or_install(list_shaders(source.as_deref()), list_shaders), current: None, values: Vec::new(), iterations: 1, error: None },
             editor: Editor::new(color),
             hover: None,
             enabled: true,
@@ -416,11 +416,12 @@ fn render_final(r: &Renderer, scene: &Scene, image: ui::ImageSettings, project: 
     }
 }
 
-/// Run the chosen shader over the volume.
-fn shader_output(r: &Renderer, scene: &Scene, ed: &mut EditState) -> Option<crate::scene::Volume> {
+/// Run the chosen shader over `volume`, Iteration times.
+fn shader_output(r: &Renderer, volume: &crate::scene::Volume, palette: &[[u8; 4]], ed: &mut EditState) -> Option<crate::scene::Volume> {
     let (_, shader) = ed.shaders.current.as_ref()?;
     let sels: Vec<u8> = (1..256).filter(|&i| ed.palette.selected[i]).map(|i| i as u8).collect();
-    match crate::xs::run(&r.device, &r.queue, shader, &ed.shaders.values, &scene.volume, &scene.palette, ed.editor.color, &sels) {
+    let (values, n) = (&ed.shaders.values, ed.shaders.iterations);
+    match crate::xs::run_iterations(&r.device, &r.queue, shader, values, volume, palette, ed.editor.color, &sels, n) {
         Ok(v) => {
             ed.shaders.error = None;
             Some(v)
@@ -432,9 +433,42 @@ fn shader_output(r: &Renderer, scene: &Scene, ed: &mut EditState) -> Option<crat
     }
 }
 
-/// Before a Code brush stroke, compute what the shader would make.
+/// Before releasing a Code brush stroke, run the shader over the dragged
+/// box. Like MagicaVoxel, the box is the shader's whole volume: its size
+/// is `i_volume_size` and `v` counts from its corner.
 pub fn prepare_code_brush(r: &Renderer, scene: &Scene, ed: &mut EditState) {
-    ed.editor.code = if ed.editor.brush == edit::Brush::Code { shader_output(r, scene, ed) } else { None };
+    ed.editor.code = ed.editor.code_box(&scene.volume).and_then(|(lo, size)| {
+        let sub = edit::sub_volume(&scene.volume, lo, size);
+        shader_output(r, &sub, &scene.palette, ed).map(|out| (lo, out))
+    });
+}
+
+/// Import Args (read values from a text file) or Export Args (write them).
+fn shader_args_file(ed: &mut EditState, import: bool) {
+    let Some(sh) = ed.shaders.current.as_ref().map(|c| c.1.clone()) else {
+        ed.fail("Pick a shader in Project > Shader first".to_string());
+        return;
+    };
+    let dialog = file_dialog().add_filter("Shader args", &["txt"]).set_directory(ed.dialog_dir("shader_args", workspace_dir()));
+    if import {
+        let Some(path) = dialog.pick_file() else { return };
+        ed.picked("shader_args", &path);
+        let read = std::fs::read_to_string(&path).map_err(anyhow::Error::from).and_then(|t| crate::xs::parse_args_text(&sh, &ed.shaders.values, &t));
+        match read {
+            Ok(values) => {
+                ed.shaders.values = values;
+                ed.say(format!("Read args from {}", path.display()));
+            }
+            Err(e) => ed.fail(format!("Import args {}: {e:#}", path.display())),
+        }
+    } else {
+        let Some(path) = dialog.set_file_name(format!("{}_args.txt", sh.name)).save_file() else { return };
+        ed.picked("shader_args", &path);
+        match std::fs::write(&path, crate::xs::args_text(&sh, &ed.shaders.values)) {
+            Ok(()) => ed.say(format!("Saved args to {}", path.display())),
+            Err(e) => ed.fail(format!("Export args {}: {e:#}", path.display())),
+        }
+    }
 }
 
 /// Snap to the nearest isometric view (orthographic, 45 degree turns).
@@ -1522,7 +1556,11 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         Command::SelectShader(p) => {
             match crate::xs::XsShader::load(&p) {
                 Ok(sh) => {
-                    ed.shaders.values = sh.args.iter().map(|a| a.value).collect();
+                    // Refresh (the same file again) keeps the values of
+                    // args that are still there.
+                    let old = ed.shaders.current.as_ref().filter(|(q, _)| *q == p).map(|(_, o)| o);
+                    let keep = |a: &crate::xs::XsArg| old.and_then(|o| o.args.iter().position(|b| b.var == a.var)).and_then(|i| ed.shaders.values.get(i).copied());
+                    ed.shaders.values = sh.args.iter().map(|a| keep(a).unwrap_or(a.value)).collect();
                     ed.shaders.current = Some((p, sh));
                     ed.shaders.error = None;
                     ed.editor.brush = edit::Brush::Code;
@@ -1531,7 +1569,11 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             }
             false
         }
-        Command::RunShader => match shader_output(r, scene, ed) {
+        Command::ShaderArgs(import) => {
+            shader_args_file(ed, import);
+            false
+        }
+        Command::RunShader => match shader_output(r, &scene.volume, &scene.palette, ed) {
             Some(out) => {
                 // With a selection, only selected voxels change.
                 let new = match ed.editor.selection() {
@@ -2344,7 +2386,24 @@ impl App {
         let ed = &mut self.edit.editor;
         let r = &mut g.renderer;
         let mut command = None;
+        let pattern_keys = r.modeling && ed.brush == edit::Brush::Pattern;
+        let arrow = match event.logical_key.as_ref() {
+            Key::Named(NamedKey::ArrowLeft) => -IVec3::X,
+            Key::Named(NamedKey::ArrowRight) => IVec3::X,
+            Key::Named(NamedKey::ArrowDown) => -IVec3::Y,
+            Key::Named(NamedKey::ArrowUp) => IVec3::Y,
+            Key::Named(NamedKey::PageDown) => -IVec3::Z,
+            Key::Named(NamedKey::PageUp) => IVec3::Z,
+            _ => IVec3::ZERO,
+        };
+        let mut synced = false;
         match event.logical_key.as_ref() {
+            // Scale / Wrap / Rotate: Commit [Enter] : Cancel [Esc].
+            Key::Named(NamedKey::Enter) if ed.xform_pending() => synced = ed.commit_xform(&self.scene.volume),
+            Key::Named(NamedKey::Escape) if ed.xform_pending() => synced = ed.cancel_xform(&mut self.scene.volume),
+            // Pattern mode : Move [Dir/Page/Home].
+            _ if pattern_keys && arrow != IVec3::ZERO => ed.opts.pattern_offset += arrow,
+            Key::Named(NamedKey::Home) if pattern_keys => ed.opts.pattern_offset = IVec3::ZERO,
             Key::Named(NamedKey::Delete | NamedKey::Backspace) => command = Some(Command::Op(Op::Clear)),
             Key::Named(NamedKey::F5) => ed.mirror[0] ^= true,
             Key::Named(NamedKey::F6) => ed.mirror[1] ^= true,
@@ -2389,6 +2448,13 @@ impl App {
                 "i" => command = Some(Command::Op(Op::Fill)),
                 "1" => ed.color = ed.color.saturating_sub(1).max(1),
                 "2" => ed.color = ed.color.saturating_add(1),
+                // Previous / next pattern in the Pattern list.
+                "3" | "4" => {
+                    let e = (&self.edit.projects, &self.edit.samples, &self.edit.folder);
+                    let files: Vec<&Path> = e.0.iter().chain(e.1).chain(e.2.iter().flat_map(|f| &f.1)).map(PathBuf::as_path).collect();
+                    let current = ed.pattern.as_ref().map(|p| p.name.as_str());
+                    command = edit::step_pattern(&files, current, if c == "3" { -1 } else { 1 }).map(|p| Command::LoadPattern(p.to_path_buf()));
+                }
                 "5" => command = Some(Command::Focus),
                 "6" => command = Some(Command::Snapshot),
                 "7" => self.edit.cameras[QUICK_SLOT] = Some(r.camera),
@@ -2409,6 +2475,9 @@ impl App {
                 "x" => self.mouse.focus = true,
                 _ => return,
             },
+        }
+        if synced {
+            sync_volume(&mut g.renderer, &mut self.scene, &mut self.edit.editor);
         }
         // Camera and sun changes need a fresh accumulation.
         g.renderer.reset();
@@ -2644,14 +2713,16 @@ impl App {
                     } else if (cmd && self.edit.editor.selected_count() > 0) || tool == Tool::Move {
                         if let Some(hit) = hover {
                             let shift = self.modifiers.shift_key();
-                            self.edit.editor.begin_move(&self.scene.volume, hit, shift);
+                            if cmd {
+                                self.edit.editor.begin_move(&self.scene.volume, hit, shift);
+                            } else {
+                                let (ro, rd) = self.ray().unwrap_or((Vec3::ZERO, Vec3::NEG_Z));
+                                self.edit.editor.begin_transform(&self.scene.volume, hit, ro, rd, shift);
+                            }
                         }
                     } else if tool == Tool::Marquee && self.edit.editor.opts.marquee == edit::MarqueeMode::Rect {
                         self.edit.marquee = pos.map(|p| (p, p));
                     } else if let Some(hit) = hover {
-                        if let Some(g) = self.gfx.as_ref() {
-                            prepare_code_brush(&g.renderer, &self.scene, &mut self.edit);
-                        }
                         let (ro, rd) = self.ray().unwrap_or((Vec3::ZERO, Vec3::NEG_Z));
                         if self.edit.editor.begin(&mut self.scene.volume, hit, ro, rd) {
                             self.sync();
@@ -2665,8 +2736,13 @@ impl App {
                     }
                     if let Some((a, b)) = self.edit.marquee.take() {
                         self.finish_marquee(a, b);
-                    } else if self.edit.editor.active() && self.edit.editor.end(&mut self.scene.volume) {
-                        self.sync();
+                    } else if self.edit.editor.active() {
+                        if let Some(g) = self.gfx.as_ref() {
+                            prepare_code_brush(&g.renderer, &self.scene, &mut self.edit);
+                        }
+                        if self.edit.editor.end(&mut self.scene.volume) {
+                            self.sync();
+                        }
                     }
                 }
                 self.update_hover();
