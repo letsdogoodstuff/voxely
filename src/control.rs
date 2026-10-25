@@ -104,7 +104,8 @@ save_stamp / place_stamp reuse pieces; apply_palette_preset loads a coherent pal
 voxelize_image turns a picture into voxels. \
 With a reference image or photo (any subject: character, animal, vehicle, building, scene), \
 measure instead of eyeballing: analyze_image finds the views and colors, set_reference stores a view, \
-reference_profile gives its silhouette as voxel rows to build from, and compare_reference scores the model \
+reference_profile gives its silhouette as voxel rows to build from, paint_from_reference colors the model \
+from it, and compare_reference scores the model \
 against it (silhouette IoU, width errors, colors, diff image); the build_from_reference prompt walks through it. \
 render views \"turnaround\" path traces front/right/back/left in one image; render frame true auto-frames. \
 For loops, procedural builds or anything needing many calls, use run_script: one JavaScript program \

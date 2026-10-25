@@ -28,7 +28,7 @@ pub const PART_TOOLS: &[&str] = &["draw_tube", "extrude_polygon", "place_stamp"]
 const UNMIRRORED: &[&str] = &[
     "edit_model", "transform_model", "resize_canvas", "run_shader", "move_selection",
     // Surface passes: per-voxel noise and images shouldn't be forced symmetric.
-    "vary_colors", "shade_edges", "paint_faces", "voxelize_image",
+    "vary_colors", "shade_edges", "paint_faces", "voxelize_image", "paint_from_reference",
 ];
 
 pub const SHAPES: &[&str] =

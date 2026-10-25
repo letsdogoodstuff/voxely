@@ -111,6 +111,23 @@ pub fn tools() -> Vec<Value> {
             }),
             &["view"],
         ),
+        tool(
+            "paint_from_reference",
+            "Color the model from a reference view: every voxel visible from that view (across all parts, so whatever is in front gets painted, not what it hides) takes the reference's color at that spot, matched to the nearest allowed palette color (OKLab, lightness counted half since references are shaded). \
+             Gets straps, trim, faces, markings, liveries and facades right in one call; then shade and fix by hand. Aligned like compare_reference (pinned scale if set, else fit). Run it per view (front, then back and sides) on a finished shape; later views only repaint what they see. Each part changed is one undo step.",
+            json!({
+                "view": view,
+                "colors": { "type": "array", "items": { "type": ["integer", "string"] }, "description": "Palette colors to choose from (indices or \"#rrggbb\"); default: the colors the scene already uses" },
+                "palette_range": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2, "description": "Or [first, last] palette indices to choose from" },
+                "keep": { "type": "array", "items": { "type": ["integer", "string"] }, "description": "Colors never painted over (e.g. emissive eyes, a logo you placed by hand)" },
+                "only_color": { "type": "array", "items": { "type": ["integer", "string"] }, "description": "Paint only voxels that currently have one of these colors" },
+                "parts": { "type": "array", "items": { "type": ["string", "integer"] }, "description": "Only paint these parts (names or ids); default: every visible part" },
+                "depth": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Voxels deep to paint from the visible surface, within the same part (default 1)" },
+                "clean": { "type": "integer", "minimum": 0, "maximum": 4, "description": "Majority-filter passes over the chosen colors before painting, removing the photo's speckle while keeping features 2+ voxels wide (default 1; 0 = raw)" },
+                "align": { "type": "string", "enum": ["fit", "pinned"] },
+            }),
+            &["view"],
+        ),
     ]
 }
 
@@ -121,6 +138,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Va
         "list_references" => list_references(ctx),
         "reference_profile" => reference_profile(ctx, args),
         "compare_reference" => compare_reference(ctx, args),
+        "paint_from_reference" => paint_from_reference(ctx, args),
         _ => return None,
     })
 }
@@ -499,6 +517,15 @@ fn set_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     if origin.is_some() && height.is_none() {
         bail!("`origin` needs `height` (it pins scale and position together)");
     }
+    // A pinned scale also pins the position, in world coordinates, so later
+    // cropping or adding parts doesn't slide the reference around.
+    let origin = origin.or_else(|| {
+        let hh = height.filter(|h| *h > 0.0)?;
+        let t = target(ctx, a, true).ok()?;
+        let (hx, vx) = (view.h_axis(), view.v_axis());
+        let o = default_origin(&t, view, hh);
+        Some([o[0] + t.zero[hx] as f32, o[1] + t.zero[vx] as f32])
+    });
     let r = Ref {
         name: string(a, "name").map_or_else(|| format!("{} {}", Path::new(&path).file_stem().map_or("reference".into(), |s| s.to_string_lossy()), view.key()), str::to_string),
         source: path.clone(),
@@ -810,6 +837,16 @@ fn compare_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     if compare::bounds(&model, |&c| c != 0).is_none() {
         bail!("{} has no voxels to compare", t.label);
     }
+    let (place, how, align, pinned) = alignment(view, &t, r, &model, a)?;
+    let c = compare::compare(view, &model, &palette, pic, place);
+    compare_report(view, r, &t, &c, &palette, &how, align, pinned)
+}
+
+/// Where the reference sits over `model` (a projection of `t`): its
+/// placement, a description, the align mode used and whether a pinned scale
+/// exists.
+fn alignment<'a>(view: View, t: &Target, r: &Ref, model: &compare::Grid<u8>, a: &'a Value) -> Result<(Placement, String, &'a str, bool)> {
+    let pic = &r.pic;
     let (h, v) = (view.h_axis(), view.v_axis());
     let pinned = r.height.map(|hh| (hh, r.origin)).or(r.traced.map(|(hh, o)| (hh, Some(o))));
     let align = string(a, "align").unwrap_or(if r.height.is_some() { "pinned" } else { "fit" });
@@ -830,7 +867,12 @@ fn compare_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         }
         other => bail!("unknown align {other:?}; use \"fit\" or \"pinned\""),
     };
-    let c = compare::compare(view, &model, &palette, pic, place);
+    Ok((place, how, align, pinned.is_some()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_report(view: View, r: &Ref, t: &Target, c: &compare::Compare, palette: &[[u8; 4]], how: &str, align: &str, pinned: bool) -> Result<Vec<Value>> {
+    let pic = &r.pic;
     let mut out = vec![
         format!("compare_reference {} `{}` vs {}. Alignment {how}.", view.title(), r.name, t.label),
         format!(
@@ -843,14 +885,14 @@ fn compare_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             c.ref_only
         ),
     ];
-    let findings = compare::width_findings(&c, 8);
+    let findings = compare::width_findings(c, 8);
     if findings.is_empty() {
         out.push("Outline: matches row by row (within a voxel).".to_string());
     } else {
         out.push("Outline findings, largest first (left/right as the view shows; cells = mismatched area):".to_string());
         out.extend(findings.iter().enumerate().map(|(i, f)| format!("  {}. {f}", i + 1)));
     }
-    let (table, worst) = compare::color_findings(&c, &palette, 5);
+    let (table, worst) = compare::color_findings(c, palette, 5);
     out.push(format!("Color: mean dE {:.1} over {} shared cells; agreement {} (dE 0 = same, ~10 = clearly different shade, 25+ = different color).", c.mean_de, c.both, pct(c.agreement)));
     if !table.is_empty() {
         out.push("  Mean dE by region, top down:".to_string());
@@ -861,9 +903,161 @@ fn compare_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         out.extend(worst.iter().map(|l| format!("    - {l}")));
     }
     out.push(format!("Score {:.0}/100 = 75% x IoU {:.2} + 25% x color agreement {:.2}.", c.score, c.iou, c.agreement));
-    if align == "fit" && pinned.is_some() {
+    if align == "fit" && pinned {
         out.push("A trace or pinned scale exists: align \"pinned\" also checks size and position.".to_string());
     }
-    let img = compare::diff_image(&c, pic, &palette);
+    let img = compare::diff_image(c, pic, palette);
     Ok(vec![super::image(img.w, img.h, &img.px)?, text(out.join("\n"))])
+}
+
+// ---------------------------------------------------------------- painting
+
+fn color_set(ctx: &Ctx, a: &Value, key: &str) -> Result<Option<Vec<u8>>> {
+    let Some(list) = get(a, key) else { return Ok(None) };
+    let list = list.as_array().ok_or_else(|| anyhow!("`{key}` is a list of colors"))?;
+    list.iter().map(|c| super::color(ctx.scene, c)).collect::<Result<Vec<u8>>>().map(Some)
+}
+
+fn paint_from_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
+    let view = view_arg(a)?;
+    let prev = ctx.scene.editing();
+    let w = ctx.scene.synced_world();
+    let comp = w.composite(None).ok_or_else(|| anyhow!("the scene has no visible parts"))?;
+    let t = Target { label: "the whole scene".into(), vol: comp.volume.clone(), origin: comp.origin, zero: IVec3::ZERO };
+    let model = compare::project(&t.vol, t.origin, view);
+    let r = get_ref(ctx, view)?;
+    let (place, how, _, _) = alignment(view, &t, r, &model, a)?;
+    let refc = compare::raster(&r.pic, &place, model.su0, model.v0, model.cols, model.rows);
+    let name = r.name.clone();
+
+    // Allowed colors, protected colors and the parts to touch.
+    let palette = ctx.scene.palette.clone();
+    let mut allowed: Vec<u8> = match (color_set(ctx, a, "colors")?, get(a, "palette_range").and_then(Value::as_array)) {
+        (Some(c), _) => c,
+        (None, Some(r)) if r.len() == 2 => {
+            let (lo, hi) = (r[0].as_u64().unwrap_or(1).clamp(1, 255) as u8, r[1].as_u64().unwrap_or(255).clamp(1, 255) as u8);
+            (lo.min(hi)..=lo.max(hi)).collect()
+        }
+        _ => {
+            let mut used = [false; 256];
+            comp.volume.cells.iter().for_each(|&c| used[c as usize] = true);
+            (1..=255u8).filter(|&c| used[c as usize]).collect()
+        }
+    };
+    let keep = color_set(ctx, a, "keep")?.unwrap_or_default();
+    allowed.retain(|c| !keep.contains(c));
+    if allowed.is_empty() {
+        bail!("no colors to paint with; pass `colors` or `palette_range`");
+    }
+    let only = color_set(ctx, a, "only_color")?;
+    let parts: Option<Vec<u32>> = match get(a, "parts").and_then(Value::as_array) {
+        Some(list) => Some(list.iter().map(|p| super::find_part(ctx.scene, Some(p)).map(|id| id as u32)).collect::<Result<_>>()?),
+        None => None,
+    };
+    let labs: Vec<(u8, Vec3)> = allowed.iter().map(|&c| (c, segment::lab(palette[c as usize]))).collect();
+    let depth = int(a, "depth").unwrap_or(1).clamp(1, 8) as i32;
+
+    // Walk each screen cell into the scene: paint the first voxel (and
+    // `depth` behind it in the same part) with the nearest allowed color.
+    let (h, v, d, mirrored, from_max) = view.axes();
+    let dims = comp.volume.dims;
+    let (cols, rows) = (dims[h], dims[v]);
+    let nearest = |want: &Vec3| labs.iter().min_by(|x, y| compare::delta_e(x.1, *want).total_cmp(&compare::delta_e(y.1, *want))).map(|b| b.0).unwrap();
+    let mut chosen: Vec<u8> = (0..rows * cols)
+        .map(|i| match (refc.get(model.su0 + i % cols, model.v0 + i / cols), model.cells[i as usize]) {
+            (Some(Some(want)), m) if m != 0 => nearest(want),
+            _ => 0,
+        })
+        .collect();
+    // Majority filter: a cell takes the color most of its 3x3 neighbours
+    // share (5 of 9) so single-voxel speckle from the photo goes away.
+    for _ in 0..int(a, "clean").unwrap_or(1).clamp(0, 4) {
+        let prev = chosen.clone();
+        for r in 0..rows {
+            for c in 0..cols {
+                let i = (r * cols + c) as usize;
+                if prev[i] == 0 {
+                    continue;
+                }
+                let mut count = [0u8; 256];
+                for (dr, dc) in (-1..=1).flat_map(|dr| (-1..=1).map(move |dc| (dr, dc))) {
+                    let (rr, cc) = (r + dr, c + dc);
+                    if rr >= 0 && cc >= 0 && rr < rows && cc < cols {
+                        count[prev[(rr * cols + cc) as usize] as usize] += 1;
+                    }
+                }
+                let (best, n) = (1..256).map(|k| (k as u8, count[k])).max_by_key(|&(_, n)| n).unwrap();
+                if n >= 5 {
+                    chosen[i] = best;
+                }
+            }
+        }
+    }
+    let mut edits: std::collections::BTreeMap<u32, Vec<(IVec3, u8)>> = Default::default();
+    for row in 0..dims[v] {
+        for col in 0..dims[h] {
+            let best = chosen[(row * cols + col) as usize];
+            if best == 0 {
+                continue;
+            }
+            let lh = if mirrored { dims[h] - 1 - col } else { col };
+            let mut owner = 0u32;
+            let mut painted = 0;
+            for step in 0..dims[d] {
+                let mut p = IVec3::ZERO;
+                p[h] = lh;
+                p[v] = row;
+                p[d] = if from_max { dims[d] - 1 - step } else { step };
+                let i = comp.volume.index(p);
+                let c = comp.volume.cells[i];
+                if c == 0 {
+                    if owner != 0 { break } else { continue }
+                }
+                let o = comp.owners[i];
+                if owner == 0 {
+                    owner = o;
+                } else if o != owner {
+                    break;
+                }
+                let skip = keep.contains(&c) || only.as_ref().is_some_and(|l| !l.contains(&c)) || parts.as_ref().is_some_and(|l| !l.contains(&o));
+                if !skip && c != best {
+                    edits.entry(o).or_default().push((comp.origin + p, best));
+                }
+                painted += 1;
+                if painted >= depth {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut total = 0;
+    for (id, cells) in &edits {
+        super::focus_part(ctx, Some(&json!(*id)))?;
+        let origin = ctx.scene.origin;
+        let mut new = ctx.scene.volume.clone();
+        let mut n = 0;
+        for &(p, c) in cells {
+            let l = p - origin;
+            if new.contains(l) {
+                new.set_index(new.index(l), c);
+                n += 1;
+            }
+        }
+        super::apply(ctx, new);
+        total += n;
+        lines.push(format!("`{}` {n}", ctx.scene.world.label(*id as usize)));
+    }
+    // Back to what was being edited (or World mode).
+    if ctx.scene.editing() != prev {
+        crate::app::set_mode(ctx.scene, ctx.ed, prev);
+        crate::app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+    }
+    let mut out = format!("Painted {total} voxels from `{name}` ({}), choosing among {} colors. Alignment {how}.", view.title(), allowed.len());
+    if !lines.is_empty() {
+        out.push_str(&format!("\nPer part: {}.", lines.join(", ")));
+    }
+    out.push_str("\nNext: compare_reference to check color agreement; shade_edges / vary_colors for depth.");
+    Ok(vec![text(out)])
 }
