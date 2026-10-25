@@ -2985,6 +2985,7 @@ dependencies = [
  "serde_json",
  "wgpu",
  "winit",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -21,3 +21,4 @@ rquickjs = "0.14"
 serde_json = "1.0.154"
 wgpu = { version = "30.0.1", features = ["naga-ir"] }
 winit = "0.30.13"
+zune-jpeg = "0.5.15"
