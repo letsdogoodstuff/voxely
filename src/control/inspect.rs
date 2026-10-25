@@ -105,7 +105,7 @@ pub fn tools() -> Vec<Value> {
         }), &["name"]),
         tool("set_autosave", "Autosave saves the project (as save_file without a path does) after every `every` voxel edits, and before open_project/open_file/new_project/new_scene replace a scene with unsaved edits. On by default, every 25 edits. Edit reports show the unsaved count once it reaches 10.", json!({
             "enabled": { "type": "boolean" },
-            "every": { "type": "integer", "description": "Edits between autosaves (default 25)" },
+            "every": { "type": "integer", "minimum": 1, "maximum": 100000, "description": "Edits between autosaves (default 25)" },
         }), &[]),
     ]
 }

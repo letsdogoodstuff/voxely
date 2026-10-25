@@ -36,7 +36,7 @@ pub const SHAPES: &[&str] =
 
 pub fn tools() -> Vec<Value> {
     let axis = json!({ "type": "string", "enum": ["x", "y", "z"] });
-    let uv = json!({ "type": "array", "items": { "type": "array", "items": { "type": "number" } } });
+    let uv = json!({ "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } });
     vec![
         tool("set_symmetry", "Mirror every voxel edit across the part's center plane(s), like a symmetric sculpting mode, and report the current state. While on, set_voxels, fill_box, draw_shape, draw_line, draw_tube, extrude_polygon, place_stamp and run_script edits are mirrored (each still one undo step); edit_model, transform_model, run_shader and move_selection aren't. The axes are one setting shared with the window's Mirror X/Y/Z brush toggles: they stay on when you switch parts, and each part mirrors about its own center unless `center` moved its plane. Call with no arguments to see the state.", json!({
             "x": { "type": "boolean" }, "y": { "type": "boolean" }, "z": { "type": "boolean" },
@@ -44,7 +44,7 @@ pub fn tools() -> Vec<Value> {
             "center": { "type": ["array", "string"], "items": { "type": ["number", "null"] }, "description": "[x, y, z] plane coordinates in the edited part's cells (whole or .5; null keeps that axis centered), or \"reset\". Default: the part's center ((size-1)/2)" },
         }), &[]),
         tool("draw_tube", "Draw a round tube along a smooth curve through points: tails, tentacles, horns, cables, branches, handles. The radius can taper from start to end.", json!({
-            "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "[[x, y, z], ...] cells the curve goes through (or its control points for bezier), at least 2" },
+            "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }, "minItems": 2, "description": "[[x, y, z], ...] cells the curve goes through (or its control points for bezier), at least 2" },
             "radius": { "type": "number", "description": "Radius in voxels at the start (default 1; 0.5 is one voxel thick)" },
             "end_radius": { "type": "number", "description": "Radius at the end (default: radius), e.g. 0.5 for a pointed tail or horn" },
             "curve": { "type": "string", "enum": ["smooth", "bezier", "straight"], "description": "smooth (default): Catmull-Rom through every point; bezier: points are control points (passes through the first and last); straight: a polyline" },
@@ -52,9 +52,9 @@ pub fn tools() -> Vec<Value> {
             "color": color_schema(),
         }), &["points", "color"]),
         tool("extrude_polygon", "Fill a 2D polygon and extrude it through a range of layers: signs, letters, gear and cog outlines, roof and arch profiles, floor plans. Points are cells on the outline (outline cells are included); the polygon may be concave.", json!({
-            "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "[[u, v], ...] outline cells. axis z: u = x, v = y; axis y: u = x, v = z; axis x: u = y, v = z (as in get_slice)" },
+            "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }, "minItems": 2, "description": "[[u, v], ...] outline cells. axis z: u = x, v = y; axis y: u = x, v = z; axis x: u = y, v = z (as in get_slice)" },
             "axis": { "type": "string", "enum": ["x", "y", "z"], "description": "The direction it's extruded along (default z: the polygon lies flat and extrudes upward)" },
-            "depth": { "type": ["array", "integer"], "items": { "type": "integer" }, "description": "[from, to] layers along axis, inclusive, or one layer" },
+            "depth": { "type": ["array", "integer"], "items": { "type": "integer" }, "minItems": 2, "maxItems": 2, "description": "[from, to] layers along axis, inclusive, or one layer" },
             "holes": { "type": "array", "items": uv, "description": "Polygons to leave empty, each [[u, v], ...] (their outline cells are empty too)" },
             "hollow": { "type": "boolean", "description": "Only the outer shell" },
             "color": color_schema(),
