@@ -668,6 +668,8 @@ pub struct Status<'a> {
     pub options: Option<&'a mut ModelerOptions>,
     /// Hovered voxel and its color index.
     pub hover: Option<(IVec3, u8)>,
+    /// Shown instead of the hovered voxel while a transform gizmo is up.
+    pub xform: Option<String>,
     pub projection: &'a mut Projection,
     pub iso: bool,
     /// Free camera: rotating turns the view around the eye.
@@ -704,13 +706,16 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
             Some((p, i)) => (Some(p), Some(i as i32)),
             None => (None, None),
         };
-        ui.monospace(format!(
-            "x:{:<4} y:{:<4} z:{:<4} i:{:<4}",
-            field(p.map(|p| p.x)),
-            field(p.map(|p| p.y)),
-            field(p.map(|p| p.z)),
-            field(i)
-        ));
+        match s.xform {
+            Some(text) => ui.monospace(format!("{text:<28}")),
+            None => ui.monospace(format!(
+                "x:{:<4} y:{:<4} z:{:<4} i:{:<4}",
+                field(p.map(|p| p.x)),
+                field(p.map(|p| p.y)),
+                field(p.map(|p| p.z)),
+                field(i)
+            )),
+        };
         ui.separator();
         let pers = *s.projection == Projection::Perspective;
         if ui.selectable_label(pers && !*s.free, "Pers").on_hover_text("Perspective, orbiting the target").clicked() {

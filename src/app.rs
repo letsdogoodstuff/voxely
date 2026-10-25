@@ -73,6 +73,9 @@ pub struct EditState {
     canvas_for: IVec3,
     /// Marquee drag corners in window pixels.
     pub marquee: Option<(Vec2, Vec2)>,
+    /// Gizmo handle under the mouse, and the one being dragged.
+    pub gizmo_hover: Option<edit::Handle>,
+    pub gizmo_drag: Option<edit::Handle>,
     pub outline: crate::outline::OutlineState,
     /// World mode: parts being dragged.
     pub world_drag: Option<WorldDrag>,
@@ -228,6 +231,8 @@ impl EditState {
             canvas: IVec3::ZERO,
             canvas_for: IVec3::ZERO,
             marquee: None,
+            gizmo_hover: None,
+            gizmo_drag: None,
             outline: Default::default(),
             world_drag: None,
             last_click: None,
@@ -1745,6 +1750,15 @@ fn draw_overlay(p: &egui::Painter, r: &Renderer, scene: &Scene, ed: &EditState, 
         p.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 160, 255)), egui::StrokeKind::Inside);
         return;
     }
+    if let Some(g) = ed.editor.gizmo(&scene.volume) {
+        if g.kind != edit::GizmoKind::Rings {
+            outline(p, r, ppp, g.lo, g.hi, egui::Stroke::new(1.0, egui::Color32::from_gray(225)));
+        }
+        crate::gizmo::draw(p, &g, r, ppp, ed.gizmo_drag.or(ed.gizmo_hover));
+        if ed.gizmo_hover.is_some() || ed.gizmo_drag.is_some() {
+            return;
+        }
+    }
     let cells = ed.editor.preview(&scene.volume, ed.hover);
     if cells.is_empty() {
         return;
@@ -1886,7 +1900,8 @@ pub fn build_ui(
             let iso = is_iso(r);
             let options = r.modeler.as_mut().filter(|_| r.modeling).map(|m| &mut m.options);
             let notice = &mut ed.notice;
-            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, agent: &mut ed.agent, timeline: &mut ed.timeline.open, hint, notice };
+            let xform = (r.modeling && ed.enabled && scene.mode != Mode::World).then(|| ed.editor.xform_status(&scene.volume)).flatten();
+            let status = ui::Status { options, hover, xform, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, agent: &mut ed.agent, timeline: &mut ed.timeline.open, hint, notice };
             if ui::status_bar(ui, status, cmds) {
                 iso_camera(r);
             }
@@ -2237,6 +2252,17 @@ impl App {
 
     fn update_hover(&mut self) {
         self.edit.hover = self.ray().and_then(|(ro, rd)| edit::pick(&self.scene.volume, ro, rd));
+        self.edit.gizmo_hover = self.gizmo_handle();
+    }
+
+    /// The transform gizmo handle under the mouse.
+    fn gizmo_handle(&self) -> Option<edit::Handle> {
+        let (g, (x, y)) = (self.gfx.as_ref()?, self.mouse.pos?);
+        if !g.renderer.modeling || !self.edit.enabled || self.scene.mode == Mode::World {
+            return None;
+        }
+        let gizmo = self.edit.editor.gizmo(&self.scene.volume)?;
+        crate::gizmo::pick(&gizmo, &g.renderer, Vec2::new(x as f32, y as f32), g.egui_ctx.pixels_per_point())
     }
 
     fn sel_mode(&self) -> SelMode {
@@ -2710,15 +2736,18 @@ impl App {
                         if let Some(h) = hover.filter(|h| !h.on_ground()) {
                             self.edit.editor.color = self.scene.volume.get(h.cell);
                         }
+                    } else if let Some(handle) = self.gizmo_handle().filter(|_| !cmd) {
+                        // Gizmo arrows and rings (Marquee, Scale, Wrap, Rotate).
+                        let (ro, rd) = self.ray().unwrap_or((Vec3::ZERO, Vec3::NEG_Z));
+                        if self.edit.editor.begin_handle(&self.scene.volume, handle, ro, rd, self.modifiers.shift_key()) {
+                            self.edit.gizmo_drag = Some(handle);
+                        }
                     } else if (cmd && self.edit.editor.selected_count() > 0) || tool == Tool::Move {
-                        if let Some(hit) = hover {
-                            let shift = self.modifiers.shift_key();
-                            if cmd {
-                                self.edit.editor.begin_move(&self.scene.volume, hit, shift);
-                            } else {
-                                let (ro, rd) = self.ray().unwrap_or((Vec3::ZERO, Vec3::NEG_Z));
-                                self.edit.editor.begin_transform(&self.scene.volume, hit, ro, rd, shift);
-                            }
+                        // Move/Loop [Ctrl+LButton] : Normal Axis [Shift]. Scale,
+                        // Wrap and Rotate only take their gizmo handles.
+                        let shift = self.modifiers.shift_key();
+                        if let Some(hit) = hover.filter(|_| cmd || self.edit.editor.opts.xform == edit::XformMode::Move) {
+                            self.edit.editor.begin_move(&self.scene.volume, hit, shift);
                         }
                     } else if tool == Tool::Marquee && self.edit.editor.opts.marquee == edit::MarqueeMode::Rect {
                         self.edit.marquee = pos.map(|p| (p, p));
@@ -2731,6 +2760,7 @@ impl App {
                         self.edit.editor.select_none();
                     }
                 } else if !down {
+                    self.edit.gizmo_drag = None;
                     if self.edit.world_drag.take().is_some() {
                         self.edit.editor.reset();
                     }

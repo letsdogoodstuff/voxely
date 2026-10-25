@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use glam::{IVec3, Quat, Vec3};
+use glam::{IVec3, Quat, Vec2, Vec3};
 
 use crate::ops;
 use crate::scene::{Mask, Volume};
@@ -67,7 +67,7 @@ pub enum MarqueeMode {
     Rect,
     /// Paint the selection with the voxel brush.
     Brush,
-    /// 3D box dragged on a plane.
+    /// 3D box from the pressed voxel to the one under the cursor.
     Box,
 }
 
@@ -76,12 +76,39 @@ pub enum MarqueeMode {
 pub enum XformMode {
     /// Drag the selection; voxels pushed off the canvas loop around.
     Move,
-    /// Drag a face to stretch : Commit [Enter] : Cancel [Esc] : Two-sided [Shift].
+    /// Drag a face arrow to stretch : Commit [Enter] : Cancel [Esc] : Two-sided [Shift].
     Scale,
-    /// Drag a face to repeat or crop : Commit [Enter] : Cancel [Esc] : Two-sided [Shift].
+    /// Drag a face arrow to repeat or crop : Commit [Enter] : Cancel [Esc] : Two-sided [Shift].
     Wrap,
-    /// Drag around the face's axis : Commit [Enter] : Cancel [Esc] : Snap [Shift].
+    /// Drag a ring to turn about its axis : Commit [Enter] : Cancel [Esc] : Snap [Shift].
     Rotate,
+}
+
+/// A transform gizmo handle, like MagicaVoxel's: an arrow along an axis
+/// (`sign` says which end) for Move, Scale and Wrap, or the ring around an
+/// axis for Rotate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Handle {
+    Arrow { axis: usize, sign: i32 },
+    Ring { axis: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GizmoKind {
+    /// Arrows through the box center: drag the selection along an axis.
+    Move,
+    /// An arrow out of each face of the box: Scale and Wrap.
+    Faces,
+    /// A ring around each axis through the box center: Rotate.
+    Rings,
+}
+
+/// The gizmo to show: its kind and the box it works on (world units).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gizmo {
+    pub kind: GizmoKind,
+    pub lo: Vec3,
+    pub hi: Vec3,
 }
 
 /// Brush settings from MagicaVoxel's brush option panels.
@@ -102,9 +129,9 @@ pub struct BrushOptions {
     pub geo: GeoShape,
     /// Geometry line follows the surface under it.
     pub project: bool,
-    /// Square and circle are filled rather than outlines.
+    /// Square and circle include their center cell ("Fill Center").
     pub fill: bool,
-    /// Square and circle have an even width (centered between cells).
+    /// Square and circle have an even width (centered on a cell corner).
     pub even: bool,
     /// Axis mode: extend brushes through the whole canvas along these axes.
     pub axis: [bool; 3],
@@ -382,8 +409,10 @@ struct Xform {
     /// Scale and Wrap: the target box (min corner, size).
     box_lo: IVec3,
     box_size: IVec3,
-    /// Rotate: the turn about the source box's center.
+    /// Rotate: the turn about the source box's center, and the current
+    /// drag's angle in degrees.
     rot: Quat,
+    angle: f32,
     /// Nothing was selected, so don't select the result.
     whole: bool,
     drag: Option<XformDrag>,
@@ -404,8 +433,9 @@ struct XformDrag {
     rot: Quat,
 }
 
-/// Snap step for Rotate with Shift.
-const ROTATE_SNAP: f32 = std::f32::consts::PI / 12.0;
+/// Rotate turns in whole degrees, or in steps of this many with Shift
+/// (measured in MagicaVoxel).
+const ROTATE_SNAP_DEG: f32 = 5.0;
 
 impl Xform {
     /// Draw the transformed voxels over `before` into `v`; returns the
@@ -490,6 +520,10 @@ struct Move {
     delta: IVec3,
     /// Moving everything (nothing was selected), so don't select it.
     whole: bool,
+    /// Started from a gizmo arrow (the gizmo stays up while dragging), at
+    /// this offset along the axis from `anchor`.
+    handle: bool,
+    t0: f32,
 }
 
 pub struct Editor {
@@ -510,6 +544,9 @@ pub struct Editor {
     stroke: Option<Stroke>,
     moving: Option<Move>,
     xform: Option<Xform>,
+    /// A Code brush result, selected and still movable with the gizmo
+    /// arrows; the next stroke lets go of it.
+    floating: bool,
     /// Selected cells per volume cell; empty when nothing is selected.
     sel: Mask,
     sel_count: usize,
@@ -535,6 +572,7 @@ impl Editor {
             stroke: None,
             moving: None,
             xform: None,
+            floating: false,
             sel: Mask::new(IVec3::ZERO),
             sel_count: 0,
             clipboard: Vec::new(),
@@ -575,6 +613,7 @@ impl Editor {
 
     /// Combine solid cells `cells` with the selection using `mode`.
     pub fn select(&mut self, v: &Volume, cells: impl IntoIterator<Item = usize>, mode: SelMode) {
+        self.floating = false;
         let mut mask = match (mode, self.sel.dims() == v.dims) {
             (SelMode::Replace, _) | (_, false) => Mask::new(v.dims),
             _ => std::mem::replace(&mut self.sel, Mask::new(IVec3::ZERO)),
@@ -588,6 +627,7 @@ impl Editor {
     }
 
     pub fn select_all(&mut self, v: &Volume) {
+        self.floating = false;
         let mut mask = Mask::new(v.dims);
         for (i, _) in v.cells.filled() {
             mask.set(i, true);
@@ -596,6 +636,7 @@ impl Editor {
     }
 
     pub fn select_none(&mut self) {
+        self.floating = false;
         if self.sel_count > 0 {
             self.sel = Mask::new(IVec3::ZERO);
             self.sel_count = 0;
@@ -604,6 +645,7 @@ impl Editor {
     }
 
     pub fn select_invert(&mut self, v: &Volume) {
+        self.floating = false;
         let had = self.selection().cloned();
         let mut mask = Mask::new(v.dims);
         for (i, _) in v.cells.filled() {
@@ -749,7 +791,7 @@ impl Editor {
             return false;
         }
         let whole = sel.is_none();
-        self.moving = Some(Move { before: v.clone(), cells, anchor: hit.cell, axis: axis_of(hit.normal), along_normal, delta: IVec3::ZERO, whole });
+        self.moving = Some(Move { before: v.clone(), cells, anchor: hit.cell, axis: axis_of(hit.normal), along_normal, delta: IVec3::ZERO, whole, handle: false, t0: 0.0 });
         true
     }
 
@@ -759,7 +801,7 @@ impl Editor {
             // Closest point on the normal line through the grabbed voxel.
             let Some(t) = axis_offset(m.anchor.as_vec3() + 0.5, m.axis, ro, rd) else { return false };
             let mut delta = IVec3::ZERO;
-            delta[m.axis] = t.round() as i32;
+            delta[m.axis] = (t - m.t0).round() as i32;
             delta
         } else {
             let Some(cell) = plane_cell(ro, rd, m.axis, m.anchor[m.axis]) else { return false };
@@ -791,24 +833,95 @@ impl Editor {
         let Some(m) = self.moving.take() else { return false };
         let moved = std::mem::replace(v, m.before);
         let mask = std::mem::replace(&mut self.sel, Mask::new(IVec3::ZERO));
+        let floating = self.floating;
         let changed = self.commit(v, moved);
         if !m.whole {
             self.set_selection(v, mask);
         }
+        self.floating = floating;
+        if changed && floating {
+            // Placing a Code brush result: one undo step with the stroke.
+            self.merge_last_two();
+        }
         changed
+    }
+
+    /// Fold the newest undo step into the one before it.
+    fn merge_last_two(&mut self) {
+        let n = self.undo.len();
+        if n < 2 || !matches!((&self.undo[n - 2], &self.undo[n - 1]), (Entry::Cells(_), Entry::Cells(_))) {
+            return;
+        }
+        let (Some(Entry::Cells(b)), Some(Entry::Cells(a))) = (self.undo.pop(), self.undo.pop()) else { return };
+        let mut cells: HashMap<usize, (u8, u8)> = a.into_iter().map(|(i, x, y)| (i, (x, y))).collect();
+        for (i, x, y) in b {
+            cells.entry(i).and_modify(|e| e.1 = y).or_insert((x, y));
+        }
+        let mut entries: Vec<(usize, u8, u8)> = cells.into_iter().filter(|(_, (x, y))| x != y).map(|(i, (x, y))| (i, x, y)).collect();
+        entries.sort_unstable_by_key(|e| e.0);
+        self.undo.push(Entry::Cells(entries));
     }
 
     // ---- Scale / Wrap / Rotate ----
 
-    /// Press with the Move tool: Move drags the selection (see
-    /// `begin_move`); Scale, Wrap and Rotate start dragging the face of the
-    /// selection's box (or the model's) under the cursor. Those stay
-    /// pending across drags until committed [Enter] or cancelled [Esc].
-    pub fn begin_transform(&mut self, v: &Volume, hit: Pick, ro: Vec3, rd: Vec3, shift: bool) -> bool {
-        let mode = self.opts.xform;
-        if mode == XformMode::Move {
-            return self.begin_move(v, hit, shift);
+    /// The gizmo for the current tool, like MagicaVoxel's: Scale and Wrap
+    /// show arrows on the faces of the selection's box (or the model's),
+    /// Rotate rings round its center, and Marquee select (or a Code brush
+    /// result being placed) arrows to move the selection.
+    pub fn gizmo(&self, v: &Volume) -> Option<Gizmo> {
+        let moving = self.moving.as_ref().is_some_and(|m| m.handle);
+        if (self.tool == Tool::Marquee || (self.floating && self.brush == Brush::Code)) && self.stroke.is_none() && (self.moving.is_none() || moving) {
+            let (lo, hi) = self.solid_bounds(v, true)?;
+            return Some(Gizmo { kind: GizmoKind::Move, lo, hi });
         }
+        let kind = match (self.tool, self.opts.xform) {
+            (Tool::Move, XformMode::Scale | XformMode::Wrap) => GizmoKind::Faces,
+            (Tool::Move, XformMode::Rotate) => GizmoKind::Rings,
+            _ => return None,
+        };
+        let (lo, hi) = match &self.xform {
+            Some(x) if kind == GizmoKind::Faces => (x.box_lo.as_vec3(), (x.box_lo + x.box_size).as_vec3()),
+            Some(x) => (x.lo.as_vec3(), (x.lo + x.src.dims).as_vec3()),
+            None => self.solid_bounds(v, false)?,
+        };
+        Some(Gizmo { kind, lo, hi })
+    }
+
+    /// Box around the selected voxels (or all of them, unless `selected`).
+    fn solid_bounds(&self, v: &Volume, selected: bool) -> Option<(Vec3, Vec3)> {
+        let sel = self.selection();
+        if selected && sel.is_none() {
+            return None;
+        }
+        let mut cells = v.cells.filled().map(|(i, _)| i).filter(|&i| sel.is_none_or(|s| s[i])).map(|i| v.position(i));
+        let first = cells.next()?;
+        let (lo, hi) = cells.fold((first, first), |(lo, hi), p| (lo.min(p), hi.max(p)));
+        Some((lo.as_vec3(), (hi + IVec3::ONE).as_vec3()))
+    }
+
+    /// Press on a gizmo handle (see `gizmo`). Move arrows drag the selection
+    /// along their axis; Scale and Wrap arrows move their face of the box
+    /// (both faces with Shift); Rotate rings turn about their axis (in 5
+    /// degree steps with Shift). Scale, Wrap and Rotate stay pending across
+    /// drags until committed [Enter] or cancelled [Esc].
+    pub fn begin_handle(&mut self, v: &Volume, handle: Handle, ro: Vec3, rd: Vec3, shift: bool) -> bool {
+        let Some(g) = self.gizmo(v) else { return false };
+        if g.kind == GizmoKind::Move {
+            let Handle::Arrow { axis, .. } = handle else { return false };
+            let center = ((g.lo + g.hi) * 0.5).floor().as_ivec3();
+            let hit = Pick { cell: center, normal: IVec3::ZERO };
+            let floating = self.floating;
+            if !self.begin_move(v, Pick { normal: [IVec3::X, IVec3::Y, IVec3::Z][axis], ..hit }, true) {
+                return false;
+            }
+            self.floating = floating;
+            if let Some(m) = self.moving.as_mut() {
+                m.handle = true;
+                m.t0 = axis_offset(center.as_vec3() + 0.5, axis, ro, rd).unwrap_or(0.0);
+            }
+            return true;
+        }
+        let mode = self.opts.xform;
         if self.xform.as_ref().is_some_and(|x| x.mode != mode) {
             self.commit_xform(v);
         }
@@ -822,19 +935,24 @@ impl Editor {
                 src.set(p - lo, c);
             }
             let size = src.dims;
-            self.xform = Some(Xform { mode, before: v.clone(), src, lo, box_lo: lo, box_size: size, rot: Quat::IDENTITY, whole: sel.is_none(), drag: None });
+            self.xform = Some(Xform { mode, before: v.clone(), src, lo, box_lo: lo, box_size: size, rot: Quat::IDENTITY, angle: 0.0, whole: sel.is_none(), drag: None });
         }
         let x = self.xform.as_mut().unwrap();
-        let axis = axis_of(hit.normal);
-        let sign = if hit.normal[axis] < 0 { -1 } else { 1 };
-        let coord = (hit.cell[axis] + (sign > 0) as i32) as f32;
-        let mut origin = hit.cell.as_vec3() + 0.5;
-        origin[axis] = coord;
-        if mode == XformMode::Rotate {
-            // The point grabbed on the face's plane.
-            let Some(p) = plane_point(ro, rd, axis, coord) else { return false };
-            origin = p;
-        }
+        let (axis, sign, origin) = match handle {
+            Handle::Arrow { axis, sign } if mode != XformMode::Rotate => {
+                let (lo, size) = (x.box_lo.as_vec3(), x.box_size.as_vec3());
+                let mut origin = lo + size * 0.5;
+                origin[axis] = if sign > 0 { lo[axis] + size[axis] } else { lo[axis] };
+                (axis, sign.signum(), origin)
+            }
+            Handle::Ring { axis } if mode == XformMode::Rotate => {
+                // The point grabbed on the ring's plane.
+                let center = x.lo.as_vec3() + x.src.dims.as_vec3() * 0.5;
+                let Some(p) = plane_point(ro, rd, axis, center[axis]) else { return false };
+                (axis, 1, p)
+            }
+            _ => return false,
+        };
         let t0 = axis_offset(origin, axis, ro, rd).unwrap_or(0.0);
         x.drag = Some(XformDrag { axis, sign, shift, origin, t0, box_lo: x.box_lo, box_size: x.box_size, rot: x.rot });
         true
@@ -853,10 +971,10 @@ impl Editor {
             if p0.length_squared() < 1e-6 || p1.length_squared() < 1e-6 {
                 return false;
             }
-            let mut angle = (p0[u] * p1[w] - p0[w] * p1[u]).atan2(p0[u] * p1[u] + p0[w] * p1[w]);
-            if d.shift {
-                angle = (angle / ROTATE_SNAP).round() * ROTATE_SNAP;
-            }
+            let deg = (p0[u] * p1[w] - p0[w] * p1[u]).atan2(p0[u] * p1[u] + p0[w] * p1[w]).to_degrees();
+            let deg = if d.shift { (deg / ROTATE_SNAP_DEG).trunc() * ROTATE_SNAP_DEG } else { deg.round() };
+            x.angle = deg;
+            let angle = deg.to_radians();
             let mut dir = Vec3::ZERO;
             dir[a] = 1.0;
             let rot = Quat::from_axis_angle(dir, angle) * d.rot;
@@ -891,6 +1009,18 @@ impl Editor {
             self.set_selection(v, mask);
         }
         true
+    }
+
+    /// Status bar text while a gizmo is up, like MagicaVoxel's: the box
+    /// size for Scale and Wrap, the angle for Rotate.
+    pub fn xform_status(&self, v: &Volume) -> Option<String> {
+        let g = self.gizmo(v)?;
+        let s = (g.hi - g.lo).as_ivec3();
+        match g.kind {
+            GizmoKind::Faces => Some(format!("x.{} y.{} z.{}", s.x, s.y, s.z)),
+            GizmoKind::Rings => Some(format!("angle:{}", self.xform.as_ref().map_or(0.0, |x| x.angle))),
+            GizmoKind::Move => None,
+        }
     }
 
     /// A Scale, Wrap or Rotate is waiting for Enter or Esc.
@@ -1135,30 +1265,27 @@ impl Editor {
                 out
             }
             GeoShape::Line => line(a, b),
-            GeoShape::Square => {
-                let h = (b[u] - a[u]).abs().max((b[w] - a[w]).abs());
-                let (lo, hi) = (-h, h - o.even as i32);
+            // Like MagicaVoxel: centered on the press cell; Even centers on
+            // its lower corner instead. Fill off leaves out only the center
+            // cell (the 2x2 around the corner when Even).
+            GeoShape::Square | GeoShape::Circle => {
+                let (du, dw) = (b[u] - a[u], b[w] - a[w]);
+                let even = o.even as i32;
+                let center = |x: i32, y: i32| (x == 0 || x == -even) && (y == 0 || y == -even);
+                // Square: half side = the larger drag offset. Circle: radius
+                // = the drag length rounded up, less half a cell, measured
+                // between cell centers.
+                let h = du.abs().max(dw.abs());
+                let n = ((((du * du + dw * dw) as f32).sqrt() - 1e-4).ceil() as i32).max(1);
+                let r = n as f32 - 0.5 + 0.5 * even as f32;
+                let k = if o.geo == GeoShape::Square { h } else { n };
+                let c = 0.5 * even as f32;
                 let mut out = Vec::new();
-                for dw in lo..=hi {
-                    for du in lo..=hi {
-                        if o.fill || du == lo || du == hi || dw == lo || dw == hi {
-                            out.push(at(du, dw));
-                        }
-                    }
-                }
-                out
-            }
-            GeoShape::Circle => {
-                let d = Vec3::new((b[u] - a[u]) as f32, (b[w] - a[w]) as f32, 0.0);
-                let r = d.length() + 0.5;
-                let c = if o.even { 0.5 } else { 0.0 };
-                let k = r.ceil() as i32 + 1;
-                let mut out = Vec::new();
-                for dw in -k..=k {
-                    for du in -k..=k {
-                        let dist = Vec3::new(du as f32 - c, dw as f32 - c, 0.0).length();
-                        if dist <= r && (o.fill || dist > r - 1.0) {
-                            out.push(at(du, dw));
+                for y in -k - even..=k {
+                    for x in -k - even..=k {
+                        let inside = o.geo == GeoShape::Square || Vec2::new(x as f32 + c, y as f32 + c).length() <= r + 1e-4;
+                        if inside && (o.fill || !center(x, y)) {
+                            out.push(at(x, y));
                         }
                     }
                 }
@@ -1170,6 +1297,9 @@ impl Editor {
     /// Mouse press with the camera ray. Returns whether the volume changed.
     pub fn begin(&mut self, v: &mut Volume, hit: Pick, ro: Vec3, rd: Vec3) -> bool {
         self.commit_xform(v);
+        if std::mem::take(&mut self.floating) {
+            self.select_none();
+        }
         match self.tool {
             Tool::Region => {
                 if !hit.on_ground() {
@@ -1249,12 +1379,17 @@ impl Editor {
         let (anchor, axis) = (s.anchor, s.axis);
         let marquee = (self.tool == Tool::Marquee).then_some(self.opts.marquee);
         // Attach draws on the plane of the first voxel; erase, paint and
-        // brush select follow whatever surface is under the cursor.
-        let planar = matches!(self.brush, Brush::Box | Brush::Geo | Brush::Code) || (self.brush == Brush::Voxel && self.tool == Tool::Attach);
+        // brush select follow whatever surface is under the cursor. Like
+        // MagicaVoxel, the Box and Code boxes span from the pressed cell to
+        // the one under the cursor (in depth too), or stay on the press
+        // plane over empty space; so does Box select.
+        let planar = self.brush == Brush::Geo || (self.brush == Brush::Voxel && self.tool == Tool::Attach);
+        let boxed = matches!(self.brush, Brush::Box | Brush::Code);
         let cell = match marquee {
-            Some(MarqueeMode::Box) => plane_cell(ro, rd, axis, anchor[axis]),
+            Some(MarqueeMode::Box) => hit.and_then(|h| target(Tool::Paint, h)).or_else(|| plane_cell(ro, rd, axis, anchor[axis])),
             Some(_) => hit.and_then(|h| target(Tool::Paint, h)),
             None if planar => plane_cell(ro, rd, axis, anchor[axis]),
+            None if boxed => hit.and_then(|h| target(self.tool, h)).or_else(|| plane_cell(ro, rd, axis, anchor[axis])),
             None => hit.and_then(|h| target(self.tool, h)),
         };
         let Some(cell) = cell else { return false };
@@ -1331,7 +1466,15 @@ impl Editor {
                     // The shader's voxels: attached into empty cells,
                     // painted over or erased from solid ones.
                     let cells: Vec<(IVec3, u8)> = out.filled().map(|(p, c)| (lo + p, c)).collect();
-                    self.apply_colored(v, &cells)
+                    let changed = self.apply_colored(v, &cells);
+                    // Like MagicaVoxel, the result stays selected with the
+                    // move arrows up, to place it before the next stroke.
+                    let placed: Vec<usize> = self.stroke.as_ref().map_or(Vec::new(), |s| s.changes.iter().filter(|(_, c)| c.1 != 0).map(|(&i, _)| i).collect());
+                    if changed && !placed.is_empty() {
+                        self.select(v, placed, SelMode::Replace);
+                        self.floating = true;
+                    }
+                    changed
                 } else {
                     self.apply(v, &cells)
                 }
@@ -1430,6 +1573,7 @@ impl Editor {
     }
 
     pub fn undo(&mut self, v: &mut Volume) -> bool {
+        self.floating = false;
         if self.cancel_xform(v) {
             return true;
         }
@@ -1441,6 +1585,7 @@ impl Editor {
     }
 
     pub fn redo(&mut self, v: &mut Volume) -> bool {
+        self.floating = false;
         self.commit_xform(v);
         let Some(entry) = self.redo.pop() else { return false };
         let entry = Self::step(v, entry, true);
@@ -1685,7 +1830,9 @@ mod tests {
         let mut e = Editor::new(4);
         e.brush = Brush::Geo;
         let down = Vec3::NEG_Z;
-        for (shape, fill, expect) in [(GeoShape::Square, true, 25), (GeoShape::Square, false, 16), (GeoShape::Circle, true, 21)] {
+        // Measured in MagicaVoxel: a 2-cell drag makes a 5x5 square or a
+        // 3x3 circle; Fill off leaves out only the center cell.
+        for (shape, fill, expect) in [(GeoShape::Square, true, 25), (GeoShape::Square, false, 24), (GeoShape::Circle, true, 9), (GeoShape::Circle, false, 8)] {
             let mut v = Volume::new(IVec3::splat(16));
             e.opts.geo = shape;
             e.opts.fill = fill;
@@ -1697,6 +1844,49 @@ mod tests {
             e.drag(&mut v, ro2, down, hit2);
             e.end(&mut v);
             assert_eq!(count(&v, 4), expect, "{shape:?} fill {fill}");
+        }
+    }
+
+    /// Geo shape cell count for a drag of (dx, dy) on the floor.
+    fn geo_count(shape: GeoShape, fill: bool, even: bool, dx: f32, dy: f32) -> usize {
+        let mut e = Editor::new(4);
+        e.brush = Brush::Geo;
+        (e.opts.geo, e.opts.fill, e.opts.even) = (shape, fill, even);
+        let mut v = Volume::new(IVec3::splat(24));
+        let down = Vec3::NEG_Z;
+        let ro = Vec3::new(12.5, 12.5, 30.0);
+        let hit = pick(&v, ro, down).unwrap();
+        e.begin(&mut v, hit, ro, down);
+        let ro2 = ro + Vec3::new(dx, dy, 0.0);
+        let hit2 = pick(&v, ro2, down);
+        e.drag(&mut v, ro2, down, hit2);
+        e.end(&mut v);
+        count(&v, 4)
+    }
+
+    #[test]
+    fn geo_shapes_match_magicavoxel() {
+        use GeoShape::{Circle, Square};
+        // (shape, fill, even, drag, cells), counted in MagicaVoxel 0.99.6.
+        for (shape, fill, even, (dx, dy), expect) in [
+            (Circle, true, false, (1.0, 0.0), 1),
+            (Circle, true, false, (1.0, 1.0), 9),
+            (Circle, true, false, (3.0, 0.0), 21),
+            (Circle, true, false, (2.0, 1.0), 21),
+            (Circle, true, false, (2.0, 2.0), 21),
+            (Circle, true, false, (3.0, 1.0), 37),
+            (Circle, true, false, (4.0, 0.0), 37),
+            (Circle, false, false, (4.0, 0.0), 36),
+            (Circle, true, true, (3.0, 0.0), 32),
+            (Circle, true, true, (4.0, 0.0), 52),
+            (Circle, false, true, (3.0, 0.0), 28),
+            (Square, true, false, (3.0, 0.0), 49),
+            (Square, true, false, (3.0, -3.0), 49),
+            (Square, false, false, (3.0, 0.0), 48),
+            (Square, true, true, (3.0, 0.0), 64),
+            (Square, false, true, (3.0, 0.0), 60),
+        ] {
+            assert_eq!(geo_count(shape, fill, even, dx, dy), expect, "{shape:?} fill {fill} even {even} drag ({dx}, {dy})");
         }
     }
 
@@ -1856,12 +2046,12 @@ mod tests {
         (0..8).filter(|&x| v.get(IVec3::new(x, 3, 0)) != 0).collect()
     }
 
-    /// Drag the +x face of the bar ending at `x_end` out to `x` with the
-    /// Move tool's `mode`.
+    /// Drag the +X arrow of the Scale / Wrap gizmo, whose box ends at
+    /// `x_end`, to `x`.
     fn drag_x_face(e: &mut Editor, v: &mut Volume, x_end: i32, x: f32, shift: bool) {
-        let hit = Pick { cell: IVec3::new(x_end, 3, 0), normal: IVec3::X };
+        e.tool = Tool::Move;
         let face = (x_end + 1) as f32;
-        assert!(e.begin_transform(v, hit, Vec3::new(face, 3.5, 20.0), Vec3::NEG_Z, shift));
+        assert!(e.begin_handle(v, Handle::Arrow { axis: 0, sign: 1 }, Vec3::new(face, 3.5, 20.0), Vec3::NEG_Z, shift));
         e.drag(v, Vec3::new(x, 3.5, 20.0), Vec3::NEG_Z, None);
         e.end(v);
     }
@@ -1903,6 +2093,7 @@ mod tests {
         // A brush stroke commits the pending transform first.
         drag_x_face(&mut e, &mut v, 3, 5.0, false);
         e.select_none();
+        e.tool = Tool::Attach;
         click(&mut e, &mut v, 0.5, 0.5);
         assert!(!e.xform_pending());
         assert_eq!(row(&v), vec![2, 3, 4]);
@@ -1929,11 +2120,11 @@ mod tests {
     fn rotate_turns_about_the_box_center() {
         let mut v = bar(2, 3);
         let mut e = Editor::new(1);
+        e.tool = Tool::Move;
         e.opts.xform = XformMode::Rotate;
-        // Grab the top face at x = 5.5 and swing it a quarter turn round z.
-        let hit = Pick { cell: IVec3::new(4, 3, 0), normal: IVec3::Z };
-        assert!(e.begin_transform(&v, hit, Vec3::new(5.5, 3.5, 20.0), Vec3::NEG_Z, true));
-        e.drag(&mut v, Vec3::new(3.6, 5.5, 20.0), Vec3::NEG_Z, None);
+        // Grab the z ring at x = 5.5 and swing it a quarter turn.
+        assert!(e.begin_handle(&v, Handle::Ring { axis: 2 }, Vec3::new(5.5, 3.5, 20.0), Vec3::NEG_Z, false));
+        e.drag(&mut v, Vec3::new(3.5, 5.5, 20.0), Vec3::NEG_Z, None);
         e.end(&mut v);
         let cells: Vec<IVec3> = v.filled().map(|(p, _)| p).collect();
         assert_eq!(cells, vec![IVec3::new(3, 2, 0), IVec3::new(3, 3, 0), IVec3::new(3, 4, 0)]);
@@ -1966,5 +2157,101 @@ mod tests {
         assert!(e.end(&mut v));
         assert_eq!((v.get(IVec3::new(1, 1, 0)), v.get(IVec3::new(4, 3, 0)), v.get(IVec3::new(2, 2, 0))), (8, 8, 3));
         assert_eq!(v.count(), 3);
+    }
+
+    #[test]
+    fn rotate_turns_in_whole_degrees_or_5_with_shift() {
+        for (shift, expect) in [(false, 37.0), (true, 35.0)] {
+            let mut v = bar(2, 3);
+            let mut e = Editor::new(1);
+            e.tool = Tool::Move;
+            e.opts.xform = XformMode::Rotate;
+            // Center (3.5, 3.5); grab at angle 0 and swing to about 37.4 degrees.
+            assert!(e.begin_handle(&v, Handle::Ring { axis: 2 }, Vec3::new(5.5, 3.5, 20.0), Vec3::NEG_Z, shift));
+            let a = 37.4f32.to_radians();
+            e.drag(&mut v, Vec3::new(3.5 + 2.0 * a.cos(), 3.5 + 2.0 * a.sin(), 20.0), Vec3::NEG_Z, None);
+            assert_eq!(e.xform_status(&v).unwrap(), format!("angle:{expect}"));
+        }
+    }
+
+    #[test]
+    fn marquee_gizmo_arrow_moves_the_selection_along_its_axis() {
+        let mut v = bar(2, 2);
+        let mut e = Editor::new(1);
+        e.tool = Tool::Marquee;
+        assert!(e.gizmo(&v).is_none());
+        e.select_all(&v);
+        let g = e.gizmo(&v).unwrap();
+        assert_eq!((g.kind, g.lo, g.hi), (GizmoKind::Move, Vec3::new(2.0, 3.0, 0.0), Vec3::new(4.0, 4.0, 1.0)));
+        // Grab the +x arrow at x = 6 and pull it to x = 8: two cells right,
+        // whatever the ray does across the arrow.
+        assert!(e.begin_handle(&v, Handle::Arrow { axis: 0, sign: 1 }, Vec3::new(6.0, 3.5, 20.0), Vec3::NEG_Z, false));
+        e.drag(&mut v, Vec3::new(8.0, 6.5, 20.0), Vec3::NEG_Z, None);
+        e.end(&mut v);
+        assert_eq!((row(&v), e.selected_count()), (vec![4, 5], 2));
+    }
+
+    #[test]
+    fn code_result_stays_movable_and_undoes_with_its_stroke() {
+        let mut v = vol();
+        let mut e = Editor::new(1);
+        e.brush = Brush::Code;
+        let rd = Vec3::NEG_Z;
+        let ro = Vec3::new(1.5, 1.5, 20.0);
+        let hit = pick(&v, ro, rd).unwrap();
+        e.begin(&mut v, hit, ro, rd);
+        let ro2 = Vec3::new(2.5, 1.5, 20.0);
+        let hit2 = pick(&v, ro2, rd);
+        e.drag(&mut v, ro2, rd, hit2);
+        let (lo, size) = e.code_box(&v).unwrap();
+        let mut out = Volume::new(size);
+        out.set(IVec3::ZERO, 8);
+        out.set(IVec3::X, 8);
+        e.code = Some((lo, out));
+        assert!(e.end(&mut v));
+        // The result is selected with the move arrows up.
+        assert_eq!((e.selected_count(), e.gizmo(&v).map(|g| g.kind)), (2, Some(GizmoKind::Move)));
+        let g = e.gizmo(&v).unwrap();
+        let top = Vec3::new(2.0, 2.0, g.hi.z + 1.0);
+        assert!(e.begin_handle(&v, Handle::Arrow { axis: 2, sign: 1 }, top + Vec3::new(0.0, -20.0, 0.0), Vec3::Y, false));
+        e.drag(&mut v, top + Vec3::new(0.0, -20.0, 3.0), Vec3::Y, None);
+        e.end(&mut v);
+        assert_eq!((v.get(IVec3::new(1, 1, 3)), v.get(IVec3::new(1, 1, 0))), (8, 0));
+        // One undo takes back the stroke and the move.
+        assert!(e.undo(&mut v));
+        assert_eq!((v.count(), e.can_undo()), (0, false));
+        // The next stroke lets go of the result.
+        let mut v = vol();
+        e.redo(&mut v);
+        click(&mut e, &mut v, 6.5, 6.5);
+        assert!(e.gizmo(&v).is_none());
+    }
+
+    #[test]
+    fn box_spans_from_the_pressed_voxel_to_the_one_under_the_cursor() {
+        // A step: a wall at y = 3 (x 0-7) and one closer at y = 1 (x 5-7),
+        // seen from -y.
+        let mut v = vol();
+        for x in 0..8 {
+            for z in 0..4 {
+                v.set(IVec3::new(x, 3, z), 2);
+                if x >= 5 {
+                    v.set(IVec3::new(x, 1, z), 2);
+                }
+            }
+        }
+        let mut e = Editor::new(1);
+        e.brush = Brush::Box;
+        e.tool = Tool::Paint;
+        let rd = Vec3::Y;
+        let ro = Vec3::new(1.5, -20.0, 0.5);
+        let hit = pick(&v, ro, rd).unwrap();
+        e.begin(&mut v, hit, ro, rd);
+        let ro2 = Vec3::new(6.5, -20.0, 2.5);
+        let hit2 = pick(&v, ro2, rd);
+        e.drag(&mut v, ro2, rd, hit2);
+        e.end(&mut v);
+        // x 1-6, y 1-3, z 0-2: the wall's cells x 1-6 and the step's x 5-6.
+        assert_eq!(count(&v, 1), 6 * 3 + 2 * 3);
     }
 }

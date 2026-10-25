@@ -7,6 +7,7 @@ mod control;
 mod edit;
 mod env;
 mod export;
+mod gizmo;
 mod gltf;
 mod gltf_import;
 mod gpu;
