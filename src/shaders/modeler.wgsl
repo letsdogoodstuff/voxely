@@ -20,6 +20,10 @@ struct U {
     shadow_vp: mat4x4<f32>,
     // x shadows on, y wireframe on.
     view: vec4<f32>,
+    // Offset of context faces (other models while editing one).
+    context: vec4<f32>,
+    // rgb color context fades toward, w = how far.
+    ghost: vec4<f32>,
     palette: array<vec4<f32>, 256>,
 }
 
@@ -43,10 +47,15 @@ const NORMALS = array<vec3<f32>, 7>(
     vec3<f32>(0.0, 0.0, 1.0),
 );
 
+const CONTEXT = 1u << 23u;
+
 @vertex
 fn vs_main(@location(0) pos: vec4<u32>, @location(1) data: u32) -> VsOut {
     var o: VsOut;
     o.pos = vec3<f32>(pos.xyz);
+    if (data & CONTEXT) != 0u {
+        o.pos += u.context.xyz;
+    }
     o.clip = u.view_proj * vec4<f32>(o.pos, 1.0);
     o.ao = f32((data >> 16u) & 3u) / 3.0;
     o.local = vec2<f32>(f32(pos.w & 1u), f32((pos.w >> 1u) & 1u));
@@ -136,6 +145,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         if (e & 4u) != 0u { d = min(d, d0.y); }
         if (e & 8u) != 0u { d = min(d, d1.y); }
         c = mix(u.edge.rgb, c, smoothstep(0.5, 1.5, d) * 0.7 + 0.3);
+    }
+    if (in.data & CONTEXT) != 0u {
+        // Other models: shown for reference, faded toward the background.
+        c = mix(c, u.ghost.rgb, u.ghost.w);
     }
     if (in.data & (1u << 18u)) != 0u {
         // Selected: tint toward the selection color and outline each voxel.

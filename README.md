@@ -73,6 +73,7 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Area | Tools |
 |---|---|
 | Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
+| Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip), `modify_part` (rename, duplicate, delete, hide, show, ungroup), `group_parts` |
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
 | Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid), `draw_line` |
 | Reading | `get_voxels`, `get_slice` (a text map of one layer) |
@@ -85,10 +86,30 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Export | `export`: **gltf** (`.glb` for game engines), plus MagicaVoxel's formats: obj, ply, mc, cube (meshes), xraw, slab, qb, vox (volumes), iso, 2d, slice (sprite images), point (point cloud) |
 
 Conventions:
-- Coordinates are voxel cells `[x, y, z]`, with z up.
+- Coordinates are voxel cells `[x, y, z]`, with z up. Voxel tools work in the edited part's own
+  coordinates; pass `part` to any of them to switch parts first. Part positions are world
+  coordinates of the part's minimum corner.
 - Colors are palette indices 1–255, or `"#rrggbb"`, which picks the nearest palette color.
   Use `set_palette_colors` for exact colors.
 - `screenshot` and `render` return PNG images that the agent can see.
+
+## Parts and the World view
+
+Like MagicaVoxel's World editor, a scene is a tree of models ("parts") and groups, each with a name,
+a hidden flag and a 90° rotation / flip plus a position. `.vox` files keep this tree when opened and
+saved, so files from MagicaVoxel round-trip with their objects, groups, names and layers.
+
+- **Tab** switches between editing one part and the **World** view (also the Edit / World switch above
+  the 3D view). While editing, the other parts show dimmed for reference, and every brush and Edit
+  operation works on the edited part only. Render mode always shows every part.
+- In World view, click a part to pick it (Shift adds, Alt picks a part inside a group), drag to move,
+  double-click to edit. The World panel on the right lists the tree and has New, Copy, Group,
+  Ungroup, Hide, Delete, and rotate / flip / move buttons. MagicaVoxel's World-editor keys work too
+  (arrows and PageUp/PageDown move, -/= and 9/0 turn, Ctrl+R group, Ctrl+H hide, Delete).
+- Undo steps through voxel edits in the current edit session, then whole-part changes.
+- A part's box stays put when you resize or reshape it, so cutting a piece out and fitting it no
+  longer shifts it.
+- Exports other than `.vox` flatten all visible parts.
 
 ## glTF export
 

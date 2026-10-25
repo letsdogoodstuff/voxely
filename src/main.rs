@@ -8,11 +8,13 @@ mod gltf;
 mod gpu;
 mod mcp;
 mod modeler;
+mod outline;
 mod ops;
 mod palette_ops;
 mod scene;
 mod ui;
 mod vox;
+mod world;
 mod xs;
 
 use std::path::{Path, PathBuf};
@@ -71,8 +73,15 @@ editor controls (MagicaVoxel layout; Cmd works for Ctrl on macOS):
   F5/F6/F7 mirror x/y/z            1 / 2  previous/next color
   Ctrl+Z undo  Ctrl+Y redo         Ctrl+S save  Ctrl+Shift+S save as
   Ctrl+O open  Ctrl+P new          Ctrl+G grid  Ctrl+F frame  Ctrl+B bounds
-  F1 model/render                  Tab  hide panels
-  arrows sun angle                 6  save a PNG snapshot to export/";
+  F1 model/render                  Ctrl+Tab  hide panels
+  arrows sun angle                 6  save a PNG snapshot to export/
+
+world mode (Tab switches between editing a model and the world):
+  click pick object (Shift adds, Alt picks a model inside a group)
+  drag move picked                 double-click  edit that model
+  arrows / PageUp / PageDown move  - / =  turn about z   9 / 0  turn about x
+  Ctrl+N new model  Delete delete  Ctrl+R group  Ctrl+Shift+R ungroup
+  Ctrl+H hide  Ctrl+Shift+H show all  Ctrl+C/V duplicate  Ctrl+A/D/I pick all/none/invert";
 
 #[derive(Default)]
 struct Args {

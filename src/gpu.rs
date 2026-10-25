@@ -236,6 +236,13 @@ pub struct Renderer {
     sun_tint: Vec3,
     /// Top-left of the image within the window, in pixels.
     offset: (u32, u32),
+    /// Where the path tracer's volume (every model) sits relative to the
+    /// edited one, which the camera and picking use.
+    trace_offset: glam::IVec3,
+    /// World position of the volume's cell 0 at the last upload; when it
+    /// moves (switching between models or World mode) the camera follows
+    /// so the view stays put.
+    frame_origin: glam::IVec3,
     pipelines: Pipelines,
     targets: Targets,
     /// Rasterized editing view (window renders only).
@@ -372,6 +379,8 @@ impl Renderer {
             env_key: String::new(),
             sun_tint: Vec3::ONE,
             offset: (0, 0),
+            trace_offset: glam::IVec3::ZERO,
+            frame_origin: scene.origin,
             pipelines,
             targets,
             modeling: modeler.is_some(),
@@ -379,6 +388,9 @@ impl Renderer {
             modeler: modeler.map(|m| m.0),
         };
         r.update_env();
+        if scene.context.is_some() {
+            r.upload_scene(scene, None);
+        }
         r
     }
 
@@ -553,7 +565,31 @@ impl Renderer {
     pub fn upload_volume(&mut self, v: &Volume, sel: Option<&[bool]>) {
         if let Some(m) = self.modeler.as_mut() {
             m.upload_volume(&self.device, v, sel);
+            m.set_context(&self.device, None);
         }
+        self.trace_offset = glam::IVec3::ZERO;
+        self.upload_trace(v);
+    }
+
+    /// Upload a scene's voxels: the edited model, with the other models
+    /// as dimmed context, for the modeler; every model for the path tracer.
+    pub fn upload_scene(&mut self, scene: &Scene, sel: Option<&[bool]>) {
+        if scene.origin != self.frame_origin {
+            self.camera.target += (self.frame_origin - scene.origin).as_vec3();
+            self.frame_origin = scene.origin;
+        }
+        if scene.context.is_none() {
+            return self.upload_volume(&scene.volume, sel);
+        }
+        if let Some(m) = self.modeler.as_mut() {
+            m.upload_volume(&self.device, &scene.volume, sel);
+            m.set_context(&self.device, scene.context.as_ref());
+        }
+        self.trace_offset = scene.flat_offset();
+        self.upload_trace(&scene.flat());
+    }
+
+    fn upload_trace(&mut self, v: &Volume) {
         let dims = [v.dims.x as u32, v.dims.y as u32, v.dims.z as u32];
         if dims != self.dims {
             let bdims = [v.brick_dims.x as u32, v.brick_dims.y as u32, v.brick_dims.z as u32];
@@ -664,7 +700,7 @@ impl Renderer {
         let s = &self.settings;
         let c = &self.camera;
         let (fwd, right, up) = c.basis();
-        let eye = c.eye();
+        let eye = c.eye() - self.trace_offset.as_vec3();
         let t = &self.targets;
         let sun_dir = s.sun_dir();
         let sun = s.sun_color * s.sun_intensity * 3.0 * self.sun_tint;
@@ -799,7 +835,7 @@ impl Renderer {
     /// Show a different scene: voxels, materials, lights and settings.
     pub fn load_scene(&mut self, scene: &Scene) {
         self.settings = scene.settings.clone();
-        self.upload_volume(&scene.volume, None);
+        self.upload_scene(scene, None);
         self.upload_materials(&scene.materials);
         self.set_palette(&scene.palette);
         self.set_lights(&scene.lights, scene.light_power);

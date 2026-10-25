@@ -165,7 +165,8 @@ fn bytes<T: bytemuck::Pod>(v: &[T]) -> &[u8] {
 pub fn write(scene: &Scene, path: &Path) -> Result<()> {
     let embedded = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gltf"));
     let name = path.file_stem().map_or("model".into(), |s| s.to_string_lossy().into_owned());
-    let v = &scene.volume;
+    let flat = scene.flat();
+    let v = &*flat;
     let center = v.dims.as_vec3() * 0.5;
     // Voxel space (z up) to glTF (y up, meters).
     let place = |p: Vec3| {
