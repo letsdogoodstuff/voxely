@@ -232,8 +232,111 @@ class Volume {
   clone() {
     return new Volume(this.size, this.cells.slice());
   }
+  /** Fill the box between two corners (inclusive); color 0 clears. */
+  fillBox(a, b, color) {
+    const lo = [0, 1, 2].map((k) => Math.max(0, Math.min(a[k], b[k]) | 0));
+    const hi = [0, 1, 2].map((k) => Math.min(this.size[k] - 1, Math.max(a[k], b[k]) | 0));
+    for (let z = lo[2]; z <= hi[2]; z++) for (let y = lo[1]; y <= hi[1]; y++) for (let x = lo[0]; x <= hi[0]; x++) this.set(x, y, z, color);
+    return this;
+  }
+  /** Set every cell (center) with sdf(x, y, z) <= 0 inside [lo, hi] (default: the whole grid).
+   *  color is an index or a function (x, y, z, d) => index (0 skips). Returns the count set. */
+  fillSdf(sdf, color, lo = [0, 0, 0], hi = null) {
+    hi = hi || this.size.map((n) => n - 1);
+    let n = 0;
+    for (let z = Math.max(0, lo[2] | 0); z <= Math.min(this.size[2] - 1, hi[2] | 0); z++)
+      for (let y = Math.max(0, lo[1] | 0); y <= Math.min(this.size[1] - 1, hi[1] | 0); y++)
+        for (let x = Math.max(0, lo[0] | 0); x <= Math.min(this.size[0] - 1, hi[0] | 0); x++) {
+          const d = sdf(x, y, z);
+          if (d > 0) continue;
+          const c = typeof color === "function" ? color(x, y, z, d) : color;
+          if (c) { this.set(x, y, z, c); n++; }
+        }
+    return n;
+  }
+  /** Copy the low-x half onto the high-x half across the plane x = cx (default: the center). */
+  mirrorX(cx = (this.size[0] - 1) / 2) {
+    for (let z = 0; z < this.size[2]; z++) for (let y = 0; y < this.size[1]; y++) for (let x = 0; x <= Math.floor(cx); x++) {
+      const m = Math.round(2 * cx - x);
+      if (m !== x && this.inside(m, y, z)) this.set(m, y, z, this.get(x, y, z));
+    }
+    return this;
+  }
+  /** Bounds of the solid cells as [lo, hi], or null if empty. */
+  bounds() {
+    let lo = null, hi = null;
+    this.forEach((x, y, z) => {
+      if (!lo) { lo = [x, y, z]; hi = [x, y, z]; return; }
+      lo = [Math.min(lo[0], x), Math.min(lo[1], y), Math.min(lo[2], z)];
+      hi = [Math.max(hi[0], x), Math.max(hi[1], y), Math.max(hi[2], z)];
+    });
+    return lo ? [lo, hi] : null;
+  }
 }
 globalThis.Volume = Volume;
+
+// Helpers for procedural modeling: seeded noise and signed distance shapes
+// (negative inside), combined with union / smooth union / subtract.
+const util = {
+  /** A repeatable pseudo-random number in [0, 1) for integer inputs. */
+  hash(x, y = 0, z = 0, seed = 0) {
+    const h = Math.sin(x * 127.1 + y * 311.7 + z * 74.7 + seed * 53.3) * 43758.5453;
+    return h - Math.floor(h);
+  },
+  /** Smooth 3D value noise in [0, 1); features about `scale` cells across. */
+  noise(x, y, z, scale = 4, seed = 0) {
+    const p = [x / scale, y / scale, z / scale], i = p.map(Math.floor), f = p.map((v, k) => v - i[k]);
+    const s = f.map((t) => t * t * (3 - 2 * t));
+    let acc = 0;
+    for (let c = 0; c < 8; c++) {
+      const o = [c & 1, (c >> 1) & 1, (c >> 2) & 1];
+      const w = o.reduce((m, b, k) => m * (b ? s[k] : 1 - s[k]), 1);
+      acc += w * util.hash(i[0] + o[0], i[1] + o[1], i[2] + o[2], seed);
+    }
+    return acc;
+  },
+  lerp: (a, b, t) => a + (b - a) * t,
+  clamp: (v, lo, hi) => Math.max(lo, Math.min(hi, v)),
+  smoothstep: (a, b, v) => { const t = util.clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); },
+  // Signed distance shapes: each returns (x, y, z) => distance.
+  sphere: (c, r) => (x, y, z) => Math.hypot(x - c[0], y - c[1], z - c[2]) - r,
+  ellipsoid: (c, r) => (x, y, z) => {
+    const k0 = Math.hypot((x - c[0]) / r[0], (y - c[1]) / r[1], (z - c[2]) / r[2]);
+    const k1 = Math.hypot((x - c[0]) / (r[0] * r[0]), (y - c[1]) / (r[1] * r[1]), (z - c[2]) / (r[2] * r[2]));
+    return k1 === 0 ? -Math.min(...r) : (k0 * (k0 - 1)) / k1;
+  },
+  /** A box from corner a to corner b (cell centers, inclusive), corners rounded by `round`. */
+  box: (a, b, round = 0) => (x, y, z) => {
+    const c = [0, 1, 2].map((k) => (a[k] + b[k]) / 2), h = [0, 1, 2].map((k) => Math.abs(b[k] - a[k]) / 2 + 0.5 - round);
+    const q = [x - c[0], y - c[1], z - c[2]].map((v, k) => Math.abs(v) - h[k]);
+    return Math.hypot(...q.map((v) => Math.max(v, 0))) + Math.min(Math.max(...q), 0) - round;
+  },
+  /** A tube from a to b, radius ra at a and rb at b (a tapered capsule). */
+  capsule: (a, b, ra, rb = ra) => (x, y, z) => {
+    const ab = [0, 1, 2].map((k) => b[k] - a[k]), ap = [x - a[0], y - a[1], z - a[2]];
+    const len2 = ab.reduce((s, v) => s + v * v, 0) || 1;
+    const t = util.clamp(ap.reduce((s, v, k) => s + v * ab[k], 0) / len2, 0, 1);
+    return Math.hypot(...ap.map((v, k) => v - ab[k] * t)) - util.lerp(ra, rb, t);
+  },
+  /** An upright cylinder (along z) centered on c with radius r from z0 to z1. */
+  cylinder: (c, r, z0, z1) => (x, y, z) => {
+    const d = [Math.hypot(x - c[0], y - c[1]) - r, Math.abs(z - (z0 + z1) / 2) - (z1 - z0) / 2 - 0.5];
+    return Math.min(Math.max(d[0], d[1]), 0) + Math.hypot(Math.max(d[0], 0), Math.max(d[1], 0));
+  },
+  union: (...fs) => (x, y, z) => Math.min(...fs.map((f) => f(x, y, z))),
+  /** Blend shapes with a fillet of size k (organic joins: limbs, hair, terrain). */
+  smoothUnion: (k, ...fs) => (x, y, z) => fs.map((f) => f(x, y, z)).reduce((a, b) => {
+    const h = util.clamp(0.5 + (0.5 * (b - a)) / k, 0, 1);
+    return util.lerp(b, a, h) - k * h * (1 - h);
+  }),
+  subtract: (f, ...cut) => (x, y, z) => Math.max(f(x, y, z), ...cut.map((g) => -g(x, y, z))),
+  intersect: (...fs) => (x, y, z) => Math.max(...fs.map((f) => f(x, y, z))),
+  /** Mirror a shape across the plane x = cx (both sides of a symmetric model). */
+  mirrorX: (f, cx) => (x, y, z) => f(cx - Math.abs(x - cx), y, z),
+  /** Roughen a shape with noise (ragged cloth hems, rocks, terrain): amp cells. */
+  displace: (f, amp, scale = 4, seed = 0) => (x, y, z) => f(x, y, z) + (util.noise(x, y, z, scale, seed) - 0.5) * 2 * amp,
+};
+globalThis.util = util;
 
 const camel = (s) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 const voxely = {
@@ -292,7 +395,39 @@ pub fn typings() -> String {
          \x20 /** Call fn for every solid voxel. */\n\
          \x20 forEach(fn: (x: number, y: number, z: number, color: number) => void): void;\n\
          \x20 clone(): Volume;\n\
-         }\n\n\
+         \x20 /** Fill the box between two corners (inclusive); color 0 clears. */\n\
+         \x20 fillBox(a: Vec3, b: Vec3, color: number): Volume;\n\
+         \x20 /** Set every cell with sdf <= 0 inside [lo, hi]; color may be a function of (x, y, z, d). Returns the count. */\n\
+         \x20 fillSdf(sdf: Sdf, color: number | ((x: number, y: number, z: number, d: number) => number), lo?: Vec3, hi?: Vec3): number;\n\
+         \x20 /** Copy the low-x half onto the high-x half across x = cx (default: the center). */\n\
+         \x20 mirrorX(cx?: number): Volume;\n\
+         \x20 /** Bounds of the solid cells, or null. */\n\
+         \x20 bounds(): [Vec3, Vec3] | null;\n\
+         }\n\
+         \n\
+         /** A signed distance function: negative inside. */\n\
+         type Sdf = (x: number, y: number, z: number) => number;\n\
+         \n\
+         /** Procedural modeling helpers: seeded noise and signed distance shapes. */\n\
+         declare const util: {\n\
+         \x20 hash(x: number, y?: number, z?: number, seed?: number): number;\n\
+         \x20 noise(x: number, y: number, z: number, scale?: number, seed?: number): number;\n\
+         \x20 lerp(a: number, b: number, t: number): number;\n\
+         \x20 clamp(v: number, lo: number, hi: number): number;\n\
+         \x20 smoothstep(a: number, b: number, v: number): number;\n\
+         \x20 sphere(c: Vec3, r: number): Sdf;\n\
+         \x20 ellipsoid(c: Vec3, r: Vec3): Sdf;\n\
+         \x20 box(a: Vec3, b: Vec3, round?: number): Sdf;\n\
+         \x20 capsule(a: Vec3, b: Vec3, ra: number, rb?: number): Sdf;\n\
+         \x20 cylinder(c: Vec3, r: number, z0: number, z1: number): Sdf;\n\
+         \x20 union(...fs: Sdf[]): Sdf;\n\
+         \x20 smoothUnion(k: number, ...fs: Sdf[]): Sdf;\n\
+         \x20 subtract(f: Sdf, ...cut: Sdf[]): Sdf;\n\
+         \x20 intersect(...fs: Sdf[]): Sdf;\n\
+         \x20 mirrorX(f: Sdf, cx: number): Sdf;\n\
+         \x20 displace(f: Sdf, amp: number, scale?: number, seed?: number): Sdf;\n\
+         };\n\
+         \n\
          /** Arguments passed after `--` on the command line, or `args` to run_script. */\n\
          declare const args: any;\n\n\
          /** Lines are returned with the script's result. */\n\

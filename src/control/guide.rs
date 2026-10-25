@@ -17,7 +17,79 @@ const TOPICS: &[(&str, &str, &str)] = &[
     ("color", "Choosing palettes and shading by hand", COLOR),
     ("rendering", "Materials, lighting and final renders", RENDERING),
     ("game_export", "Making models that work in game engines (glTF, pivots, sockets)", GAME_EXPORT),
+    ("reference", "Building from a reference image or photo: measuring, profiles, comparing", REFERENCE),
+    ("animal", "Animals and creatures with organic bodies", ANIMAL),
+    ("vehicle", "Cars, ships, aircraft and other vehicles", VEHICLE),
+    ("world", "Landscapes, terrain and large scenes", WORLD),
+    ("scripting", "run_script patterns: util shapes, noise, Volume helpers", SCRIPTING),
 ];
+
+const REFERENCE: &str = "\
+BUILDING FROM A REFERENCE IMAGE (any subject)
+- Measure, don't eyeball. analyze_image gives the image's blobs (each view on a sheet, with text captions \
+flagged), each blob's width profile and its dominant colors. set_reference stores a view (front, back, left, \
+right, top) with the project.
+- Pick the size first: the model's height (or length for vehicles/animals, footprint for buildings) in voxels. \
+Bigger references with fine detail need more voxels: faces, text and trim need ~40+ voxels of height to read.
+- reference_profile turns the silhouette into voxel rows: for each z the filled x spans. Build straight from \
+those numbers (a run_script loop over the rows, or shapes sized to the spans). Gaps between spans are real \
+(between legs, under a car, between towers).
+- Views: front = seen from -y (the subject's left is image right), back = from +y, left/right = from -x/+x, \
+top = from +z. A sheet's SIDE view is one of left/right: check which way the subject faces in it.
+- compare_reference projects the model exactly and reports silhouette IoU, row-by-row width errors and color \
+mismatches, plus a diff image (green = reference only, magenta = model only). Fix the largest findings first \
+and re-run; aim for 85%+ IoU on the main view before details, then compare again after shading for color.
+- Depth isn't in a front view: take it from the side/top references, or from what the subject is (a torso is \
+~0.6 of its width deep, a car ~0.45 of its length wide).
+- Colors: map dominant colors to materials, then give each material 3-5 hand-picked shades around the sampled \
+color (shadow, base, light). The photo's lighting is baked in, so sample from mid-tones, not highlights.";
+
+const ANIMAL: &str = "\
+ANIMALS
+- Start from the body mass as one smooth shape (run_script: util.smoothUnion of ellipsoids for chest, belly \
+and hips), then neck and head, then legs as tapered capsules (util.capsule with two radii), then tail, ears, \
+muzzle. Smooth unions keep joins organic instead of boxy.
+- Proportions come from the species: measure them from a side-view reference (reference_profile view left or \
+right). Quadrupeds: legs set at the corners of the ribcage and hips, not the middle; the back is rarely flat.
+- create_rig template quadruped gives named, jointed parts (body, head, tail, legs) ready for apply_motion.
+- Fur and feathers: vary_colors with noise on the base coat, darker along the spine and lighter underneath \
+(paint_faces bottom with a light shade), stepped edges for tufts. Patterns (stripes, spots) with a run_script \
+using util.noise thresholds.
+- Eyes are small (1-2 voxels) but placed exactly; a 1-voxel highlight makes them alive.";
+
+const VEHICLE: &str = "\
+VEHICLES
+- Measure from a side view first (length, wheelbase, height, wheel size), then front/top for width. Keep wheels \
+an odd diameter so axles center.
+- Body as one part with the cabin/greenhouse inset; wheels, doors, turrets, propellers as separate parts with \
+pivots at axles and hinges (duplicate wheels with modify_part duplicate).
+- Panels: 1-voxel grooves in a darker shade for door seams and hood lines; chrome trim in a light metal color; \
+glass as its own palette color with set_material glass; head/tail lights emissive.
+- Use draw_shape rounded_box, capsule and wedge for body curves, rotation for raked windshields and spoilers, \
+and util.box with round in scripts for soft car bodies.";
+
+const WORLD: &str = "\
+WORLDS AND LANDSCAPES
+- Pick the canvas from the scene: a diorama 64-128 wide, a level 256+. Decide the grid unit (how tall a door \
+or a person is) and keep everything on it.
+- Terrain from a height function in run_script: layered util.noise at two or three scales, flattened where \
+paths and buildings go; then paint_faces top for grass/snow, sides for rock/dirt layers, and vary_colors for \
+natural variation.
+- Water: a flat layer at sea level with a glass or blend material; rivers carved into the height function.
+- Scatter trees, rocks and props as stamps (save_stamp once, place_stamp many times with rotation and color \
+variation) or procedurally with util.hash so placements are repeatable.
+- Big scenes stay manageable as parts: terrain, buildings, vegetation, props, each its own part or group.";
+
+const SCRIPTING: &str = "\
+SCRIPTING PATTERNS (run_script)
+- One script per stage beats hundreds of calls. v = voxely.getVolume({part}); edit v; voxely.setVolume(v, {part}).
+- Volume helpers: v.fillBox(a, b, c), v.fillSdf(shape, color, lo, hi), v.mirrorX(), v.bounds().
+- util shapes are signed distance functions (negative inside): sphere, ellipsoid, box (with round), capsule \
+(two radii for taper), cylinder; combine with union, smoothUnion(k, ...) for organic joins, subtract, intersect, \
+mirrorX(shape, cx) for symmetry, displace(shape, amp, scale) for ragged edges (cloth hems, rock, terrain).
+- color may be a function of (x, y, z, d): pick shades from util.noise for variation, or from d for rims.
+- util.hash(x, y, z, seed) and util.noise(x, y, z, scale, seed) are repeatable, so a rerun gives the same model.
+- Example: v.fillSdf(util.smoothUnion(2, util.ellipsoid([20,16,20],[8,6,10]), util.sphere([20,16,33],6)), 14)";
 
 const CRAFT: &str = "\
 VOXEL CRAFT RULES
@@ -55,6 +127,7 @@ const CHARACTER: &str = "\
 CHARACTERS AND CREATURES
 - Proportions (24 tall, realistic-ish): head 4-5, torso 7-8, legs 10-11, arms reach mid-thigh. \
 Chibi/cute: head 8-10 of 24, short limbs. Heroic: head 1/8 of height, broad shoulders.
+- create_rig (template humanoid or quadruped) gives named, jointed parts to reshape, ready for animation.
 - Build as parts: torso (root), head, upper/lower arms or whole arms, legs, hands if large enough. Set \
 pivots at joints (shoulder, hip, neck) with set_pivot, and sockets where things attach (hand_r, \
 hand_l, head, back) with set_socket. Attach with transform_part attach_to so the skeleton follows.
@@ -131,46 +204,70 @@ grip or base.
 - Hide internal voxels (edit_model hull) to cut triangles; keep parts under 256 per axis.
 - Export with export format gltf (.glb). Test the pose by turning parts about their pivots first.";
 
-/// Workflow prompts: (name, description, arguments [(name, description, required)], template).
-/// `{arg}` in the template is replaced with the argument.
-const PROMPTS: &[(&str, &str, &[(&str, &str, bool)], &str)] = &[
+/// Workflow prompts: (name, description, template). Each takes one free-text
+/// `request` argument (clients split typed text unpredictably across several
+/// arguments, so everything given is joined into it); `{request}` in the
+/// template is replaced with it.
+const PROMPTS: &[(&str, &str, &str)] = &[
+    (
+        "build_from_reference",
+        "Build anything (character, creature, vehicle, building, scene) from a reference image and measure it against the image",
+        "Build this in voxely: {request}\n\
+Work from the reference image(s) and measure, don't eyeball. Call get_guide for topics reference and craft, \
+plus the subject's topic (character, animal, vehicle, prop, building or world). Then:\n\
+1) analyze_image on the reference; say which blob is which view; set_reference for each view (front, back, \
+left/right, top) with the project's target size.\n\
+2) Write a short spec before drawing: overall size in voxels; a proportions table read from reference_profile \
+(rows/heights of each major section and their widths); the parts list; colors from analyze_image's dominant \
+colors mapped to materials (3-5 shades each, set with set_palette_colors); anything asymmetric and which side it's on \
+(front view: the subject's left is image right).\n\
+3) new_project, palette, then block out every part from the profile numbers (run_script with util shapes is \
+fastest), symmetry on for symmetric subjects.\n\
+4) compare_reference for every referenced view; fix the biggest findings; repeat until the silhouette IoU stops \
+improving (aim for 85%+ before details).\n\
+5) Details, then shading (vary_colors, shade_edges, paint_faces), checking with screenshot views quad.\n\
+6) compare_reference again (shape and color) and fix what regressed. For things that move, set pivots and \
+sockets and attach parts.\n\
+7) Materials, render views turnaround, save_file. Report the final compare_reference scores per view. Save after \
+every stage.",
+    ),
     (
         "build_character",
         "Build a voxel character or creature step by step",
-        &[("subject", "What to build, e.g. \"a goblin archer\"", true), ("height", "Height in voxels (default 24)", false)],
-        "Build {subject} in voxely as a voxel character about {height} voxels tall.\n\
-First call get_guide for topics craft and character and follow them. Work in stages and check each \
-with a screenshot (views quad): 1) new_project, set a palette (3-5 shades per material), plan parts \
-and proportions and say the plan; 2) block out every part as flat-color shapes with symmetry on; \
-3) refine silhouette; 4) details (face, hands, gear); 5) shading and surface variation; 6) pivots, \
-sockets, attachments; 7) materials, a render, save_file. Save after every stage.",
+        "Build this in voxely as a voxel character: {request}\n\
+Call get_guide for topics craft and character (or animal) first and follow them. If there's a reference image, \
+follow the build_from_reference workflow instead (analyze_image, set_reference, reference_profile, \
+compare_reference). For a humanoid or quadruped, create_rig gives named, jointed parts to reshape. Stages, \
+each checked with screenshot views quad: 1) new_project, palette (3-5 shades per material), plan parts and \
+proportions and say the plan; 2) block out every part as flat-color shapes with symmetry on; 3) refine the \
+silhouette; 4) details (face, hands, gear); 5) shading and surface variation; 6) pivots, sockets, attachments; \
+7) materials, a render, save_file. Save after every stage.",
     ),
     (
         "build_prop",
         "Build a voxel prop, weapon or vehicle",
-        &[("subject", "What to build, e.g. \"a steampunk pistol\"", true), ("scale", "Size or the character scale it must fit (default: 24-voxel-tall character)", false)],
-        "Build {subject} in voxely at a scale fitting {scale}.\n\
-First call get_guide for topics craft and prop and follow them. Stages, each checked with a \
-screenshot (views quad): palette, block-out, separate moving parts with pivots/sockets, detail, \
-shading, materials, render, save_file.",
+        "Build this in voxely: {request}\n\
+Call get_guide for topics craft and prop (or vehicle) first and follow them. If there's a reference image, \
+follow the build_from_reference workflow (analyze_image, set_reference, compare_reference). Stages, each checked \
+with screenshot views quad: palette, block-out, separate moving parts with pivots/sockets, detail, shading, \
+materials, render, save_file.",
     ),
     (
         "build_environment",
-        "Build a voxel building, room or scene",
-        &[("subject", "What to build, e.g. \"a mossy stone watchtower\"", true), ("size", "Canvas size, e.g. 64x64x64 (default: choose one)", false)],
-        "Build {subject} in voxely (size: {size}).\n\
-First call get_guide for topics craft and building and follow them. Decide the grid unit and say it; \
-block out masses, openings, trim, then texture and surface variation; use run_script or stamps for \
-repetition; light it (get_guide rendering), render, save_file. Check each stage with a screenshot.",
+        "Build a voxel building, room, landscape or scene",
+        "Build this in voxely: {request}\n\
+Call get_guide for topics craft and building (or world) first and follow them. Decide the grid unit and say \
+it; block out masses, openings, trim, then texture and surface variation; use run_script (util noise and \
+shapes) or stamps for repetition and terrain; light it (get_guide rendering), render, save_file. Check each \
+stage with a screenshot. With a reference image, use analyze_image / set_reference / compare_reference.",
     ),
     (
         "review_model",
         "Critique the current voxel model and fix its weakest points",
-        &[],
-        "Review the current voxely model like an art director. Take a screenshot with views quad and a \
-quick render, call get_guide craft, then list the 3-5 biggest problems (silhouette, proportions, \
-color count and shading, flat areas, floating or broken voxels, scale consistency) and fix them one \
-at a time, checking after each. checkpoint first so you can roll back.",
+        "Review the current voxely model like an art director{request}. Take a screenshot with views quad and a \
+quick render, call get_guide craft, and if references are set run compare_reference for each. List the 3-5 \
+biggest problems (silhouette, proportions, color count and shading, flat areas, floating or broken voxels, \
+scale consistency) and fix them one at a time, checking after each. checkpoint first so you can roll back.",
     ),
 ];
 
@@ -199,30 +296,35 @@ pub fn dispatch(_ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<V
 pub fn prompts() -> Value {
     let list: Vec<Value> = PROMPTS
         .iter()
-        .map(|(name, description, args, _)| {
-            let args: Vec<Value> = args.iter().map(|(n, d, r)| json!({ "name": n, "description": d, "required": r })).collect();
-            json!({ "name": name, "description": description, "arguments": args })
+        .map(|(name, description, _)| {
+            let arg = json!({ "name": "request", "description": "What to build, in your own words (mention any attached reference image)", "required": false });
+            json!({ "name": name, "description": description, "arguments": [arg] })
         })
         .collect();
     json!({ "prompts": list })
 }
 
-/// The MCP `prompts/get` result.
+/// The MCP `prompts/get` result. Every argument given is joined into the
+/// request, in case the client split the text across arguments.
 pub fn prompt(params: &Value) -> Result<Value> {
     let name = string(params, "name").unwrap_or("");
-    let (_, description, args, template) =
-        PROMPTS.iter().find(|p| p.0 == name).ok_or_else(|| anyhow!("no prompt named {name:?}"))?;
-    let mut body = template.to_string();
-    for (arg, _, _) in args.iter() {
-        let value = params.get("arguments").and_then(|a| a.get(*arg)).and_then(Value::as_str).filter(|s| !s.trim().is_empty());
-        let value = value.unwrap_or(match *arg {
-            "height" => "24",
-            "scale" => "a 24-voxel-tall character",
-            "size" => "your choice",
-            _ => "something of your choice",
-        });
-        body = body.replace(&format!("{{{arg}}}"), value);
-    }
+    let (_, description, template) = PROMPTS.iter().find(|p| p.0 == name).ok_or_else(|| anyhow!("no prompt named {name:?}"))?;
+    let given: Vec<&str> = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .map(|a| {
+            let mut v: Vec<(&String, &str)> = a.iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.trim()))).filter(|(_, s)| !s.is_empty()).collect();
+            // `request` first, then any others in a stable order.
+            v.sort_by_key(|(k, _)| (k.as_str() != "request", (*k).clone()));
+            v.into_iter().map(|(_, s)| s).collect()
+        })
+        .unwrap_or_default();
+    let request = given.join(" ");
+    let body = if name == "review_model" {
+        template.replace("{request}", &if request.is_empty() { String::new() } else { format!(", focusing on: {request}") })
+    } else {
+        template.replace("{request}", if request.is_empty() { "something of your choice" } else { &request })
+    };
     Ok(json!({ "description": description, "messages": [{ "role": "user", "content": { "type": "text", "text": body } }] }))
 }
 
@@ -231,12 +333,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompts_fill_arguments() {
-        let p = prompt(&json!({ "name": "build_character", "arguments": { "subject": "a yeti" } })).unwrap();
+    fn prompts_take_the_whole_request() {
+        let p = prompt(&json!({ "name": "build_character", "arguments": { "request": "a yeti with a lantern" } })).unwrap();
         let text = p["messages"][0]["content"]["text"].as_str().unwrap();
-        assert!(text.contains("a yeti") && text.contains("24 voxels") && !text.contains('{'));
+        assert!(text.contains("a yeti with a lantern") && !text.contains("{request}"));
+        // Text split across unknown arguments is joined back together.
+        let p = prompt(&json!({ "name": "build_prop", "arguments": { "request": "a red", "extra": "sports car" } })).unwrap();
+        assert!(p["messages"][0]["content"]["text"].as_str().unwrap().contains("a red sports car"));
         for (name, ..) in PROMPTS {
-            assert!(prompt(&json!({ "name": name })).is_ok());
+            assert!(!prompt(&json!({ "name": name })).unwrap()["messages"][0]["content"]["text"].as_str().unwrap().contains('{'));
         }
     }
 }
