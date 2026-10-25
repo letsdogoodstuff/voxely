@@ -1001,6 +1001,18 @@ impl Scene {
         true
     }
 
+    /// Replace the edited model's canvas with `volume`, whose cell 0 sits at
+    /// cell `at` of the current one, as one tree undo step: the voxels,
+    /// pivot, sockets and attached parts stay where they are in the world.
+    /// Callers reset the voxel editor. False outside edit mode.
+    pub fn recanvas(&mut self, volume: &Volume, at: IVec3) -> bool {
+        let Mode::Edit(id) = self.mode else { return false };
+        let origin = self.origin + at;
+        // Quiet: nothing moved, so no animation keys.
+        self.change_quiet(|w| w.checkin(id, volume, origin));
+        true
+    }
+
     /// Leave edit mode for the World view.
     pub fn world_mode(&mut self) {
         self.store();

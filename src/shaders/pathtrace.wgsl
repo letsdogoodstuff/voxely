@@ -149,8 +149,11 @@ fn hg_sample(wo: vec3<f32>, g: f32) -> vec3<f32> {
 }
 
 fn power_heuristic(a: f32, b: f32) -> f32 {
-    let a2 = a * a;
-    return a2 / max(a2 + b * b, 1e-20);
+    // Clamped so the squares stay finite: light pdfs grow with distance
+    // squared, and a grazing ray can hit the ground billions of voxels away.
+    let a2 = min(a * a, 1e36);
+    let b2 = min(b * b, 1e36);
+    return a2 / max(a2 + b2, 1e-20);
 }
 
 // ---------------------------------------------------------------- environment
@@ -987,7 +990,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     prim_hit = 0u;
     prim_t = BIG;
     alpha = 1.0;
-    let L = radiance(ro, rd);
+    var L = radiance(ro, rd);
+    // Drop a sample that went non-finite: one NaN would black out the
+    // pixel, and the denoiser would spread it over a whole block.
+    if !finite3(L) {
+        L = vec3<f32>(0.0);
+    }
     // w accumulates coverage; the sample count is `P.frame.x`.
     let c = vec4<f32>(L, alpha);
     let first = P.frame.x == 0u;
@@ -999,8 +1007,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let flags = P.aux.x;
     if (flags & FLAG_DENOISE) != 0u {
         let l = luminance(L / max(aov_a, vec3<f32>(DEMOD_EPS)));
-        let a = vec4<f32>(aov_a, l * l);
-        let n = vec4<f32>(aov_n, aov_t);
+        var a = vec4<f32>(aov_a, l * l);
+        var n = vec4<f32>(aov_n, aov_t);
+        if !finite4(a) || !finite4(n) {
+            a = vec4<f32>(1.0, 1.0, 1.0, 0.0);
+            n = vec4<f32>(0.0);
+        }
         if first {
             aov_albedo[idx] = a;
             aov_normal[idx] = n;

@@ -19,18 +19,29 @@ pub fn tools() -> Vec<Value> {
         "Fast image of the model in the editor's modeler view, plus a text summary (part, size, voxel count, bounds, top colors, views, last edit). \
          views: \"single\" (default: the current camera, as the window shows it), \"quad\" (2x2: front, right, top orthographic and a 3/4 perspective), \
          \"all\" (front, back, left, right, top, iso), or a list of names from current, front, back, left, right, top, bottom, iso, 3/4. \
-         Named views frame the part being edited (in World mode, the whole scene); the window's camera is never changed. \
+         scope \"scene\" (default when the project has more than one part) shows every visible part at full color, framed together, with rulers \
+         in world coordinates; scope \"part\" (default with one part) frames the part being edited with the other parts dimmed, rulers in the part's \
+         own coordinates (what the voxel tools use). Either way the window's mode and camera are left as they were. \
+         focus zooms named views onto a box {from, to} (inclusive cells, in the coordinates the rulers use) or onto a part or group by name, \
+         e.g. to inspect a face, a hand or a car's wheel. \
          With overlay (default on for named views) each tile gets a title, an x/y/z axis gizmo (red x, green y, blue z) and rulers labeled in voxel \
-         coordinates: on front/back/left/right/top/bottom along the image edges, otherwise along the canvas box edges. Ticks mark cell centers, \
-         in the part's own coordinates (what the voxel tools use), or world coordinates in World mode. highlight_last_edit marks the cells the last \
-         edit changed: magenta where they hold voxels, yellow where they're now empty, faint through other voxels.",
+         coordinates: on front/back/left/right/top/bottom along the image edges, otherwise along the framed box's edges. Ticks mark cell centers. \
+         highlight_last_edit marks the cells the last edit changed: magenta where they hold voxels, yellow where they're now empty, faint through other voxels.",
         json!({
             "width": { "type": "integer", "description": "Whole image width (default 800 for one view, 512 per tile otherwise)" },
             "height": { "type": "integer", "description": "Whole image height (default 600 for one view, 384 per tile otherwise)" },
             "views": { "type": ["string", "array"], "items": { "type": "string" }, "description": "\"single\", \"quad\", \"all\", one view name, or a list of view names" },
             "overlay": { "type": "boolean", "description": "Axis gizmo, rulers and titles (default: on unless the only view is the current camera)" },
             "grid_step": { "type": "integer", "description": "Voxels between labeled ruler ticks (default 8; widened if labels would crowd)" },
-            "fit": { "type": "string", "enum": ["canvas", "voxels"], "description": "What named views frame: the whole canvas (default) or just the solid voxels" },
+            "fit": { "type": "string", "enum": ["canvas", "voxels"], "description": "What named views frame: the whole canvas (default; in scene scope the box around all parts) or just the solid voxels" },
+            "scope": { "type": "string", "enum": ["scene", "part"], "description": "\"scene\": all parts, world coordinates; \"part\": the edited part, its own coordinates, others dimmed. Default: scene if there is more than one part" },
+            "focus": {
+                "description": "Zoom named views onto a part or group name, or a box {from: [x, y, z], to: [x, y, z]} in the rulers' coordinates (world in scene scope, the part's own in part scope)",
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "object", "properties": { "from": { "type": "array", "items": { "type": "integer" }, "minItems": 3, "maxItems": 3 }, "to": { "type": "array", "items": { "type": "integer" }, "minItems": 3, "maxItems": 3 } }, "required": ["from", "to"] },
+                ],
+            },
             "highlight_last_edit": { "type": "boolean", "description": "Mark the cells changed by the last edit, if it was to the part shown" },
         }),
         &[],
@@ -110,6 +121,7 @@ fn parse_views(v: Option<&Value>) -> Result<Vec<View>> {
     let one = |s: &str| -> Result<Vec<View>> {
         Ok(match s.to_ascii_lowercase().as_str() {
             "quad" => vec![View::Front, View::Right, View::Top, View::ThreeQuarter],
+            "turnaround" => vec![View::Front, View::Right, View::Back, View::Left],
             "all" => vec![View::Front, View::Back, View::Left, View::Right, View::Top, View::Iso],
             _ => vec![View::parse(s).ok_or_else(|| anyhow::anyhow!("unknown view {s:?}"))?],
         })
@@ -124,7 +136,7 @@ fn parse_views(v: Option<&Value>) -> Result<Vec<View>> {
             }
             Ok(out)
         }
-        _ => bail!("`views` is \"single\", \"quad\", \"all\", a view name, or a list of 1-16 view names"),
+        _ => bail!("`views` is \"single\", \"quad\", \"all\", \"turnaround\", a view name, or a list of 1-16 view names"),
     }
 }
 
@@ -167,6 +179,125 @@ fn frame_view(yaw: f32, pitch: f32, ortho: bool, lo: Vec3, hi: Vec3, fov: f32, w
     Shot { camera, projection: Projection::Orthographic, inner }
 }
 
+/// A camera at `yaw`/`pitch` (radians) fitting the box `lo..hi` in a `w` x
+/// `h` image, leaving `margin` of the image free on every side. Unlike
+/// `frame_view`'s bounding sphere, perspective fits the box's corners.
+fn fit_box(yaw: f32, pitch: f32, ortho: bool, lo: Vec3, hi: Vec3, fov: f32, w: f32, h: f32, margin: f32) -> Camera {
+    let center = (lo + hi) * 0.5;
+    let mut camera = Camera { target: center, yaw, pitch, dist: 1.0 };
+    let (fwd, right, up) = camera.basis();
+    let tan_half = (fov.to_radians() * 0.5).tan();
+    let (kx, ky) = (tan_half * w / h * (1.0 - 2.0 * margin), tan_half * (1.0 - 2.0 * margin));
+    let corners = (0..8).map(|i| {
+        Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z }) - center
+    });
+    if ortho {
+        // Half the image height in world units is dist * tan_half.
+        let half = corners.fold(0.5f32, |m, c| m.max(c.dot(right).abs() * tan_half / kx).max(c.dot(up).abs() * tan_half / ky));
+        camera.dist = half / tan_half;
+        return camera;
+    }
+    // A corner at depth dist + z projects to x / (dist + z).
+    camera.dist = corners.fold(1.0f32, |d, c| {
+        let z = c.dot(fwd);
+        d.max(c.dot(right).abs() / kx - z).max(c.dot(up).abs() / ky - z).max(1.0 - z)
+    });
+    camera
+}
+
+/// The path-traced voxels' box in camera coordinates (cell 0 of the edited
+/// volume at the origin), or None if there are none.
+fn traced_bounds(scene: &crate::scene::Scene) -> Option<(Vec3, Vec3)> {
+    let flat = scene.flat();
+    let (lo, hi) = super::bounds(&flat)?;
+    let off = scene.flat_offset();
+    Some(((lo + off).as_vec3(), (hi + off + IVec3::ONE).as_vec3()))
+}
+
+/// `render` with `views` or `frame`: path trace from cameras fitted to the
+/// whole scene and tile the images, labeled.
+pub fn render_framed(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
+    let views = match get(a, "views") {
+        Some(v) => parse_views(Some(v))?,
+        None => vec![View::Current],
+    };
+    let projection = match string(a, "projection") {
+        None => None,
+        Some("orthographic" | "ortho") => Some(Projection::Orthographic),
+        Some("perspective") => Some(Projection::Perspective),
+        Some(p) => bail!("unknown projection {p:?}; use \"orthographic\" or \"perspective\""),
+    };
+    let n = views.len() as u32;
+    let cols = if n <= 4 { n } else { (n as f32).sqrt().ceil() as u32 };
+    let rows = n.div_ceil(cols);
+    let (dw, dh) = if n == 1 { (960, 640) } else { (480 * cols, 600 * rows) };
+    let width = int(a, "width").map_or(dw, |v| v as u32).clamp(16 * cols, 8192);
+    let height = int(a, "height").map_or(dh, |v| v as u32).clamp(16 * rows, 8192);
+    let (tw, th) = (width / cols, height / rows);
+    let spp = int(a, "samples").unwrap_or(128).clamp(1, 65536) as u32;
+    let (lo, hi) = traced_bounds(ctx.scene).ok_or_else(|| anyhow::anyhow!("nothing to render: the scene has no voxels"))?;
+
+    let t = std::time::Instant::now();
+    let mut r = crate::gpu::Renderer::new(ctx.r.device.clone(), ctx.r.queue.clone(), ctx.scene, None, tw, th);
+    r.settings = ctx.r.settings.clone();
+    let fov = r.settings.fov;
+    let mut out = Canvas::new(tw * cols, th * rows, [0, 0, 0, 255].repeat((tw * cols * th * rows) as usize));
+    let mut cams = Vec::new();
+    for (i, &view) in views.iter().enumerate() {
+        let (yaw, pitch, ortho) = match view.orient() {
+            Some((y, p, o)) => (y.to_radians(), p.to_radians(), o),
+            None => (ctx.r.camera.yaw, ctx.r.camera.pitch, ctx.r.settings.projection == Projection::Orthographic),
+        };
+        let proj = projection.unwrap_or(if view == View::Current { ctx.r.settings.projection } else if ortho { Projection::Orthographic } else { Projection::Perspective });
+        let cam = fit_box(yaw, pitch, proj == Projection::Orthographic, lo, hi, fov, tw as f32, th as f32, 0.06);
+        r.settings.projection = proj;
+        r.set_camera(cam);
+        let mut tile = Canvas::new(tw, th, r.render_image(spp)?);
+        if n > 1 {
+            let sc = if tw.min(th) >= 280 { 2 } else { 1 };
+            tile.text(8, 8, view.name(), sc, WHITE);
+        }
+        out.blit(&tile, (i as u32 % cols * tw) as i32, (i as u32 / cols * th) as i32);
+        cams.push(format!(
+            "{}: yaw {:.0}, pitch {:.0}, distance {:.1}, target [{:.1}, {:.1}, {:.1}], {:?}",
+            if view == View::Current { "camera" } else { view.name() },
+            cam.yaw.to_degrees(),
+            cam.pitch.to_degrees(),
+            cam.dist,
+            cam.target.x,
+            cam.target.y,
+            cam.target.z,
+            proj
+        ));
+    }
+    for c in 1..cols {
+        out.rect((c * tw) as i32 - 1, 0, 2, out.h as i32, [0, 0, 0], 0.8);
+    }
+    for row in 1..rows {
+        out.rect(0, (row * th) as i32 - 1, out.w as i32, 2, [0, 0, 0], 0.8);
+    }
+    let o = ctx.scene.origin.as_vec3();
+    let mut note = format!(
+        "Rendered {n} view{} at {tw}x{th} each, {spp} spp, in {:.1?}, framed on the voxels [{:.0}, {:.0}, {:.0}]..[{:.0}, {:.0}, {:.0}] world (exclusive). \
+         Cameras (set_camera takes these to keep one; the window's camera is unchanged): {}.",
+        if n == 1 { "" } else { "s" },
+        t.elapsed(),
+        lo.x + o.x,
+        lo.y + o.y,
+        lo.z + o.z,
+        hi.x + o.x,
+        hi.y + o.y,
+        hi.z + o.z,
+        cams.join("; ")
+    );
+    if let Some(p) = string(a, "save_path") {
+        let path = std::path::Path::new(p);
+        crate::save_png(path, out.w, out.h, &out.px)?;
+        note.push_str(&format!(" Saved {}.", std::fs::canonicalize(path).unwrap_or(path.into()).display()));
+    }
+    Ok(vec![super::image(out.w, out.h, &out.px)?, text(note)])
+}
+
 fn axis_color(a: usize) -> Rgb {
     [RED, GREEN, BLUE][a]
 }
@@ -177,10 +308,47 @@ const AXIS: [&str; 3] = ["X", "Y", "Z"];
 struct Frame {
     lo: Vec3,
     hi: Vec3,
-    /// Added to cell indices for labels (World mode: the volume's origin).
+    /// Added to cell indices for labels (world coordinates: the drawn
+    /// volume's origin).
     offset: IVec3,
     step: i32,
     fov: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scope {
+    /// Every visible part, world coordinates.
+    Scene,
+    /// The edited part with the rest dimmed, its own coordinates.
+    Part,
+}
+
+fn parse_scope(ctx: &Ctx, a: &Value) -> Result<Scope> {
+    Ok(match string(a, "scope") {
+        None if ctx.scene.world.models().len() > 1 => Scope::Scene,
+        None | Some("part") => Scope::Part,
+        Some("scene") => Scope::Scene,
+        Some(s) => bail!("unknown scope {s:?}; use \"scene\" or \"part\""),
+    })
+}
+
+/// The `focus` box in drawn-volume cells (min, max exclusive). `world0` is
+/// the drawn volume's cell 0 in the world, `offset` what labels add.
+fn parse_focus(ctx: &Ctx, a: &Value, world0: IVec3, offset: IVec3) -> Result<Option<(Vec3, Vec3)>> {
+    let (lo, hi) = match get(a, "focus") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v @ Value::String(_)) => {
+            let id = super::find_part(ctx.scene, Some(v))?;
+            let (lo, size) = ctx.scene.synced_world().bounds(id).ok_or_else(|| anyhow::anyhow!("`{}` has no voxels to focus on", ctx.scene.world.label(id)))?;
+            (lo - world0, lo - world0 + size)
+        }
+        Some(v @ Value::Object(_)) => {
+            let (from, to) = (super::ivec3(v, "from")?, super::ivec3(v, "to")?);
+            (from.min(to) - offset, from.max(to) - offset + IVec3::ONE)
+        }
+        Some(_) => bail!("`focus` is a part name or {{from: [x, y, z], to: [x, y, z]}}"),
+    };
+    Ok(Some((lo.as_vec3(), hi.as_vec3())))
 }
 
 fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
@@ -200,14 +368,26 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         f => bail!("unknown fit {f:?}; use \"canvas\" or \"voxels\""),
     };
 
-    let vol = &ctx.scene.volume;
+    // Scene scope while a part is edited: draw every part flattened (World
+    // mode's view) instead of the part with the rest dimmed.
+    let scope = parse_scope(ctx, a)?;
+    let whole = if scope == Scope::Scene && ctx.scene.editing().is_some() { ctx.scene.synced_world().composite(None) } else { None };
+    let (vol, world0) = match &whole {
+        Some(c) => (&c.volume, c.origin),
+        None => (&ctx.scene.volume, ctx.scene.origin),
+    };
+    let offset = if whole.is_some() || ctx.scene.editing().is_none() { world0 } else { IVec3::ZERO };
     let solid = super::bounds(vol);
-    let (lo, hi) = match solid {
-        Some((l, h)) if fit_voxels => (l.as_vec3(), (h + IVec3::ONE).as_vec3()),
+    let focus = parse_focus(ctx, a, world0, offset)?;
+    let (lo, hi) = match (focus, solid) {
+        (Some(f), _) => f,
+        (None, Some((l, h))) if fit_voxels => (l.as_vec3(), (h + IVec3::ONE).as_vec3()),
         _ => (Vec3::ZERO, vol.dims.as_vec3()),
     };
-    let offset = if ctx.scene.editing().is_none() { ctx.scene.origin } else { IVec3::ZERO };
     let frame = Frame { lo, hi, offset, step, fov: ctx.r.settings.fov };
+    let dims = vol.dims;
+    // The edited part's cells in the drawn volume.
+    let part_at = ctx.scene.origin - world0;
 
     // Highlight the last edit if it was to what's shown.
     let mut notes = Vec::new();
@@ -217,9 +397,12 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             None => notes.push("No edit to highlight yet.".to_string()),
             Some(e) if e.part != ctx.scene.editing() => notes.push("The last edit was to another part; nothing highlighted.".to_string()),
             Some(e) if e.resized => notes.push("The last edit resized the canvas; nothing highlighted.".to_string()),
+            Some(_) if whole.is_some() && ctx.scene.editing().is_some_and(|id| ctx.scene.world.tilted(id)) => {
+                notes.push("The edited part is freely rotated, so its cells don't line up with the scene view; use scope \"part\" to highlight.".to_string())
+            }
             Some(e) => {
-                let cells: Vec<(IVec3, bool)> = e.cells.iter().map(|&p| (p, vol.get(p) != 0)).collect();
-                ctx.r.set_highlight(vol.dims, &cells);
+                let cells: Vec<(IVec3, bool)> = e.cells.iter().map(|&p| (p + part_at, vol.get(p + part_at) != 0)).collect();
+                ctx.r.set_highlight(dims, &cells);
                 highlighted = !cells.is_empty();
             }
         }
@@ -227,23 +410,27 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
 
     let mut out = Canvas::new(tw * cols, th * rows, [24, 24, 24, 255].repeat((tw * cols * th * rows) as usize));
     let mut names = Vec::new();
-    let dims = vol.dims;
+    if let Some(c) = &whole {
+        ctx.r.modeler_show(&c.volume, None, None);
+    }
     // World mode's pick highlight would tint the parts; agents see real colors.
     let result = super::unhighlighted(ctx, |ctx| -> Result<()> {
         for (i, &view) in views.iter().enumerate() {
             let (w, h) = (tw as f32, th as f32);
             let sc = if tw.min(th) >= 280 { 2 } else { 1 };
             let shot = match view.orient() {
-                None => Shot { camera: ctx.r.camera, projection: ctx.r.settings.projection, inner: (0.0, 0.0, w, h) },
+                None => {
+                    // The window's camera, moved with what's drawn (scene scope draws from another cell 0).
+                    let mut camera = ctx.r.camera;
+                    camera.target += part_at.as_vec3();
+                    Shot { camera, projection: ctx.r.settings.projection, inner: (0.0, 0.0, w, h) }
+                }
                 Some((yaw, pitch, ortho)) => {
                     let inner = if overlay { margins(&frame, sc, w, h) } else { (4.0, 4.0, w - 8.0, h - 8.0) };
                     frame_view(yaw, pitch, ortho, lo, hi, frame.fov, w, h, inner)
                 }
             };
-            let px = match view {
-                View::Current => ctx.r.modeler_image(tw, th)?,
-                _ => ctx.r.modeler_image_from(tw, th, &shot.camera, shot.projection)?,
-            };
+            let px = ctx.r.modeler_image_from(tw, th, &shot.camera, shot.projection)?;
             let mut tile = Canvas::new(tw, th, px);
             let title = if overlay { overlay_tile(&mut tile, &shot, view, &frame, sc) } else { view.name().to_string() };
             if !overlay && n > 1 {
@@ -257,6 +444,9 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     if highlighted {
         ctx.r.set_highlight(dims, &[]);
     }
+    if whole.is_some() {
+        ctx.r.modeler_show(&ctx.scene.volume, ctx.scene.context.as_ref(), ctx.ed.editor.selection());
+    }
     result?;
     // Tile borders.
     for c in 1..cols {
@@ -266,7 +456,8 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         out.rect(0, (r * th) as i32 - 1, out.w as i32, 2, [0, 0, 0], 0.8);
     }
 
-    let mut summary = summary(ctx, &names, &frame, fit_voxels && solid.is_some(), views != [View::Current], highlighted);
+    let what = Shown { volume: whole.as_ref().map_or(&ctx.scene.volume, |c| &c.volume), whole: whole.is_some(), focus: focus.is_some(), fit_voxels: fit_voxels && solid.is_some() };
+    let mut summary = summary(ctx, &what, &names, &frame, views != [View::Current], highlighted);
     for n in notes {
         summary.push('\n');
         summary.push_str(&n);
@@ -480,13 +671,33 @@ fn gizmo(t: &mut Canvas, fwd: Vec3, right: Vec3, up: Vec3, sc: i32) {
     }
 }
 
+/// What a screenshot drew, for its summary.
+struct Shown<'a> {
+    volume: &'a crate::scene::Volume,
+    /// Every part while one is edited (scene scope).
+    whole: bool,
+    focus: bool,
+    fit_voxels: bool,
+}
+
 /// A compact text description of what the screenshot shows.
-fn summary(ctx: &Ctx, names: &[String], f: &Frame, fit_voxels: bool, framed: bool, highlighted: bool) -> String {
+fn summary(ctx: &Ctx, what: &Shown, names: &[String], f: &Frame, framed: bool, highlighted: bool) -> String {
     let scene = &*ctx.scene;
-    let v = &scene.volume;
+    let v = what.volume;
     let d = v.dims;
     let mut lines = Vec::new();
     match scene.editing() {
+        Some(id) if what.whole => lines.push(format!(
+            "Scene view: every visible part ({}) at full color, spanning {}x{}x{} from {:?}. Coordinates below are world coordinates. \
+             The part being edited, `{}` (id {id}), starts at {:?} world (its own coordinates = world - that); scope \"part\" shows it alone.",
+            scene.world.models().len(),
+            d.x,
+            d.y,
+            d.z,
+            f.offset.to_array(),
+            scene.world.label(id),
+            scene.origin.to_array()
+        )),
         Some(id) => lines.push(format!(
             "Part `{}` (id {id}, {} parts in scene): size {}x{}x{}, at {:?} world. Coordinates below are the part's own (0..size-1).",
             scene.world.label(id),
@@ -523,8 +734,13 @@ fn summary(ctx: &Ctx, names: &[String], f: &Frame, fit_voxels: bool, framed: boo
     let cam = &ctx.r.camera;
     let views = names.join(" | ");
     let framing = if framed {
-        let what = if fit_voxels { "solid voxels" } else { "canvas" };
-        format!(" Named views frame the {what} {:?}..{:?}; ruler ticks every {} at cell centers.", (f.lo.as_ivec3() + o).to_array(), (f.hi.as_ivec3() + o).to_array(), f.step)
+        let framed = match (what.focus, what.fit_voxels, what.whole || scene.editing().is_none()) {
+            (true, _, _) => "focus box",
+            (false, true, _) => "solid voxels",
+            (false, false, true) => "box around all parts",
+            (false, false, false) => "canvas",
+        };
+        format!(" Named views frame the {framed} {:?}..{:?} (exclusive); ruler ticks every {} at cell centers.", (f.lo.as_ivec3() + o).to_array(), (f.hi.as_ivec3() + o).to_array(), f.step)
     } else {
         String::new()
     };
@@ -540,7 +756,7 @@ fn summary(ctx: &Ctx, names: &[String], f: &Frame, fit_voxels: bool, framed: boo
     ));
     if let Some(e) = &ctx.ed.tools.last_edit {
         let mut part = e.part.map_or("World".to_string(), |id| format!("`{}`", scene.world.label(id)));
-        if e.part != scene.editing() {
+        if e.part != scene.editing() || (what.whole && e.part.is_some()) {
             part.push_str(" (its own coordinates)");
         }
         let what = if e.resized {
@@ -597,6 +813,34 @@ mod tests {
         }
         // Centered in the inner rect.
         assert!(((a.0 + b.0) * 0.5 - 250.0).abs() < 0.5 && ((a.1 + b.1) * 0.5 - 180.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn turnaround_is_four_sides() {
+        assert_eq!(parse_views(Some(&json!("turnaround"))).unwrap(), vec![View::Front, View::Right, View::Back, View::Left]);
+    }
+
+    #[test]
+    fn fitted_cameras_keep_the_box_in_frame_snugly() {
+        let (lo, hi) = (Vec3::new(-3.0, 2.0, 0.0), Vec3::new(17.0, 12.0, 40.0));
+        let (w, h, margin) = (900.0, 1100.0, 0.06);
+        for ortho in [true, false] {
+            for (yaw, pitch) in [(225.0f32, 25.0f32), (-90.0, 0.0), (10.0, 60.0)] {
+                let cam = fit_box(yaw.to_radians(), pitch.to_radians(), ortho, lo, hi, 45.0, w, h, margin);
+                let proj = if ortho { Projection::Orthographic } else { Projection::Perspective };
+                let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                for i in 0..8 {
+                    let c = Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z });
+                    let (x, y) = project_point(&cam, 45.0, proj, w, h, c).expect("in front of the camera");
+                    (min, max) = (min.min(Vec3::new(x, y, 0.0)), max.max(Vec3::new(x, y, 0.0)));
+                }
+                let (mx, my) = (w * margin - 0.5, h * margin - 0.5);
+                assert!(min.x >= mx && min.y >= my && max.x <= w - mx && max.y <= h - my, "{ortho} {yaw} {pitch}: {min} {max}");
+                // Touching the margin on at least one side, not lost in the middle.
+                let slack = (min.x - w * margin).min(min.y - h * margin).min(w - w * margin - max.x).min(h - h * margin - max.y);
+                assert!(slack < 2.0, "{ortho} {yaw} {pitch}: slack {slack}");
+            }
+        }
     }
 
     #[test]

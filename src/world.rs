@@ -456,6 +456,8 @@ impl World {
     pub fn checkin(&mut self, id: usize, volume: &Volume, origin: IVec3) {
         let Some(n) = self.node(id) else { return };
         let before = self.frame(id);
+        let old_half = n.volume().map_or(IVec3::ZERO, |v| v.dims / 2);
+        let default_pivot = (n.tilted() && n.pivot.is_none()).then(|| n.volume().map_or(Vec3::ZERO, |v| v.dims.as_vec3() * 0.5));
         let parent = n.parent.map_or(Place::IDENTITY, |p| self.frame(p));
         let rot = parent.rot.mul(&n.rot);
         let size = rot.inverse().extent(volume.dims);
@@ -476,14 +478,24 @@ impl World {
             n.kind = Kind::Model(local);
         }
         // Resizing can move the voxel space's origin; keep attached parts,
-        // sockets and the pivot where they were.
+        // sockets, the pivot (a free rotation turns about it) and other
+        // frames' keys where they were.
         let after = self.frame(id);
         let shift = after.rot.inverse().apply(before.t - after.t);
+        let half = size / 2;
+        if let Some(n) = self.node_mut(id) {
+            if shift != IVec3::ZERO || half != old_half {
+                n.pivot = n.pivot.or(default_pivot);
+            }
+            let d = half - old_half - shift;
+            n.keys.iter_mut().for_each(|k| k.t += k.rot.apply(d));
+        }
         if shift != IVec3::ZERO {
             let children = self.node(id).map(|n| n.children.clone()).unwrap_or_default();
             for c in children {
                 if let Some(cn) = self.node_mut(c) {
                     cn.t += shift;
+                    cn.keys.iter_mut().for_each(|k| k.t += shift);
                 }
             }
             if let Some(n) = self.node_mut(id) {
@@ -1196,5 +1208,66 @@ mod tests {
         assert_eq!(solid(&back), solid(&w));
         assert!(w.detach(sword) && w.node(sword).unwrap().parent == Some(ROOT));
         assert!((w.socket_world(sword, "grip").unwrap() - before).length() < 1e-4);
+    }
+
+    /// Crop a part's canvas the way `Scene::recanvas` does (edit view, new
+    /// origin at the crop corner).
+    fn crop_part(w: &mut World, id: usize) {
+        let (v, origin) = w.checkout(id).unwrap();
+        let (cropped, lo) = crate::ops::crop(&v).unwrap();
+        w.checkin(id, &cropped, origin + lo);
+    }
+
+    #[test]
+    fn cropping_a_part_keeps_everything_in_place() {
+        // A 12^3 part at [10, 5, 0] with voxels in the middle, a pivot, a
+        // socket, and a part attached at the socket.
+        let mut body = Volume::new(IVec3::splat(12));
+        for p in [IVec3::new(4, 5, 3), IVec3::new(7, 6, 8), IVec3::new(5, 4, 6)] {
+            body.set(p, 1);
+        }
+        let mut w = World::single(Volume::new(IVec3::ONE));
+        let first = w.models()[0];
+        w.delete(first);
+        let id = w.add_model(ROOT, "body", body, IVec3::new(10, 5, 0));
+        w.node_mut(id).unwrap().pivot = Some(Vec3::new(6.0, 5.0, 4.0));
+        w.node_mut(id).unwrap().sockets.push(Socket { name: "hand".into(), pos: Vec3::new(7.5, 6.5, 9.0) });
+        let arm = w.add_model(ROOT, "arm", vol(IVec3::new(1, 1, 3), &[(IVec3::ZERO, 2), (IVec3::new(0, 0, 2), 2)]), IVec3::new(30, 0, 0));
+        assert!(w.attach_to(arm, id, Some("hand"), None));
+
+        let check = |w: &mut World, label: &str| {
+            let (voxels, pivot, socket, arm_at) = (solid(w), w.pivot_world(id), w.socket_world(id, "hand").unwrap(), w.bounds(arm).unwrap());
+            crop_part(w, id);
+            assert_eq!(w.node(id).unwrap().volume().unwrap().dims, IVec3::new(4, 3, 6), "{label}");
+            assert_eq!(solid(w), voxels, "{label}: voxels moved");
+            assert!((w.pivot_world(id) - pivot).length() < 1e-4, "{label}: pivot moved");
+            assert!((w.socket_world(id, "hand").unwrap() - socket).length() < 1e-4, "{label}: socket moved");
+            assert_eq!(w.bounds(arm).unwrap(), arm_at, "{label}: attached part moved");
+        };
+        let snapshot = w.clone();
+        check(&mut w, "plain");
+        assert_eq!(w.bounds(id).unwrap().0, IVec3::new(14, 9, 3));
+
+        // Turned, flipped and freely rotated parts stay put too.
+        for (label, rot, tilt) in [
+            ("turned", Rot::turn(2, 1), Vec3::ZERO),
+            ("flipped", Rot::flip(0).mul(&Rot::turn(0, 3)), Vec3::ZERO),
+            ("tilted", Rot::IDENTITY, Vec3::new(0.0, 20.0, 35.0)),
+        ] {
+            let mut w = snapshot.clone();
+            w.reorient(id, rot);
+            w.set_tilt(id, tilt);
+            let before = w.affine(id).transform_point3(Vec3::new(4.5, 5.5, 3.5));
+            check(&mut w, label);
+            let after = w.affine(id).inverse().transform_point3(before);
+            assert_eq!(w.node(id).unwrap().volume().unwrap().get(after.floor().as_ivec3()), 1, "{label}");
+        }
+
+        // Without an explicit pivot, a freely rotated part gets one so its
+        // turn center doesn't shift with the new canvas size.
+        let mut w = snapshot.clone();
+        w.node_mut(id).unwrap().pivot = None;
+        w.set_tilt(id, Vec3::new(10.0, 0.0, 40.0));
+        check(&mut w, "tilted, default pivot");
     }
 }

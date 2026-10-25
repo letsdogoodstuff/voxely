@@ -255,10 +255,18 @@ fn base_tools() -> Value {
             "edges": { "type": "boolean" }, "grid": { "type": "boolean" },
             "aperture": { "type": "number", "minimum": 0, "description": "Depth of field, 0 = off" },
         }), &[]),
-        tool("render", "Path-traced image from the current camera and render settings.", json!({
-            "width": { "type": "integer" }, "height": { "type": "integer" },
+        tool("render", "Path-traced image with the current render settings. By default from the window's camera exactly as it is. \
+            frame: true keeps the camera's yaw and pitch but fits distance and target to all the voxels with a margin (a good default for a first look). \
+            views path traces several auto-framed views tiled side by side with labels, same lighting: \"turnaround\" (front, right, back, left), \
+            \"quad\", \"all\", or a list of front, back, left, right, top, bottom, iso, 3/4. Named views are orthographic except 3/4 unless projection says otherwise. \
+            Neither changes the window's camera; the result lists the cameras used.", json!({
+            "width": { "type": "integer", "description": "Whole image width (default 960; with views 480 per tile)" },
+            "height": { "type": "integer", "description": "Whole image height (default 640; with views 600 per tile)" },
             "samples": { "type": "integer", "description": "Samples per pixel (default 128; more is smoother and slower)" },
-            "save_path": { "type": "string", "description": "Also save the PNG here" },
+            "frame": { "type": "boolean", "description": "Fit the camera to the whole scene from its current angle" },
+            "views": { "type": ["string", "array"], "items": { "type": "string" }, "description": "\"turnaround\", \"quad\", \"all\", a view name, or a list of view names" },
+            "projection": { "type": "string", "enum": ["orthographic", "perspective"], "description": "For frame/views (default: each view's own; frame keeps the current projection)" },
+            "save_path": { "type": "string", "description": "Also save the PNG here (the whole tiled image with views)" },
         }), &[]),
         tool("export", "Export the model: gltf (.glb, best for game engines), or MagicaVoxel's formats: obj/ply/mc/cube meshes, xraw/slab/qb/vox volumes, iso/2d/slice sprite images, point clouds.", json!({
             "format": { "type": "string", "enum": ["gltf", "obj", "ply", "mc", "xraw", "slab", "qb", "vox", "iso", "2d", "slice", "point", "cube"],
@@ -517,6 +525,38 @@ pub(crate) fn apply(ctx: &mut Ctx, new: Volume) -> bool {
         inspect::after_commit(ctx);
     }
     changed
+}
+
+/// Replace the edited part's canvas with `new` (cell 0 at old cell `at`)
+/// without moving anything in the world; one undo step.
+fn recanvas(ctx: &mut Ctx, new: Volume, at: IVec3) {
+    let edit = LastEdit { part: ctx.scene.editing(), resized: true, ..Default::default() };
+    ctx.scene.recanvas(&new, at);
+    tree_changed(ctx);
+    ctx.ed.tools.last_edit = Some(edit);
+    inspect::after_commit(ctx);
+}
+
+/// edit_model fit: crop the canvas to the voxels, keeping them in place.
+fn fit_part(ctx: &mut Ctx) -> Result<Vec<Value>> {
+    let (new, lo) = ops::crop(&ctx.scene.volume).ok_or_else(|| anyhow!("fit isn't possible here: the part is empty"))?;
+    if new.dims == ctx.scene.volume.dims {
+        return Ok(edited(ctx, false, "Applied fit"));
+    }
+    let new = build::before_commit(ctx, new);
+    let before = ctx.scene.origin;
+    recanvas(ctx, new, lo);
+    let d = ctx.scene.volume.dims;
+    let note = format!(
+        "Applied fit: canvas is now {}x{}x{}; its position moved {:?} -> {:?} so the voxels stay where they were (part coordinates shifted by {:?}; pivot and sockets follow)",
+        d.x,
+        d.y,
+        d.z,
+        before.to_array(),
+        ctx.scene.origin.to_array(),
+        (-lo).to_array()
+    );
+    Ok(edited(ctx, true, &note))
 }
 
 fn refresh_selection(ctx: &mut Ctx) {
@@ -1419,6 +1459,9 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "perlin" => Op::Perlin,
                 other => bail!("unknown op {other:?}"),
             };
+            if let Op::Fit = op {
+                return fit_part(ctx);
+            }
             let new = app::apply_op(op, ctx.scene, &ctx.ed.editor).ok_or_else(|| anyhow!("{op_name} isn't possible here (empty model, or the canvas would exceed {})", ops::MAX_DIM))?;
             let changed = apply(ctx, new);
             Ok(edited(ctx, changed, &format!("Applied {op_name}")))
@@ -1433,14 +1476,28 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             };
             let text_args = string(a, "args").context("missing `args`, e.g. \"xyz 2\"")?;
             let new = app::transform(kind, text_args, &ctx.scene.volume).ok_or_else(|| anyhow!("couldn't apply {text_args:?}: expected axes then values, within size limits"))?;
+            let old = ctx.scene.volume.dims;
+            if matches!(kind, TransformKind::Rotate) && new.dims != old {
+                // The turn is about the canvas center; keep that center in place.
+                let new = build::before_commit(ctx, new);
+                let at = -(new.dims - old).div_euclid(IVec3::splat(2));
+                recanvas(ctx, new, at);
+                return Ok(edited(ctx, true, &format!("Applied {text_args}; the canvas grew to {:?} around the same center", ctx.scene.volume.dims.to_array())));
+            }
             let changed = apply(ctx, new);
             Ok(edited(ctx, changed, &format!("Applied {text_args}")))
         }
         "resize_canvas" => {
             let size = ivec3(a, "size")?;
+            let old = ctx.scene.volume.dims;
             let new = ops::resize(&ctx.scene.volume, size);
-            let changed = apply(ctx, new);
-            Ok(edited(ctx, changed, "Resized canvas"))
+            if new.dims == old {
+                let changed = apply(ctx, new);
+                return Ok(edited(ctx, changed, "Resized canvas"));
+            }
+            let new = build::before_commit(ctx, new);
+            recanvas(ctx, new, -ops::resize_shift(old, size));
+            Ok(edited(ctx, true, &format!("Resized canvas to {:?}; the part's world position moved by {:?} so its voxels stay put", ctx.scene.volume.dims.to_array(), (-ops::resize_shift(old, size)).to_array())))
         }
         "list_shaders" => {
             let mut out = Vec::new();
@@ -1773,6 +1830,9 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         // "screenshot" lives in view.rs.
         "render" => {
+            if get(a, "views").is_some() || boolean(a, "frame").unwrap_or(false) {
+                return view::render_framed(ctx, a);
+            }
             let (w, h) = (int(a, "width").unwrap_or(960).clamp(16, 8192) as u32, int(a, "height").unwrap_or(640).clamp(16, 8192) as u32);
             let spp = int(a, "samples").unwrap_or(128).clamp(1, 65536) as u32;
             let t = std::time::Instant::now();

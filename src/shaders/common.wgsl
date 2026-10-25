@@ -40,6 +40,15 @@ const BG_TRANSPARENT: u32 = 2u;
 // Floor on albedo when dividing it out of radiance for denoising.
 const DEMOD_EPS: f32 = 0.02;
 
+// NaN/Inf tests on the bits, which fast math can't optimize away.
+fn finite3(v: vec3<f32>) -> bool {
+    return all((bitcast<vec3<u32>>(v) & vec3<u32>(0x7f800000u)) != vec3<u32>(0x7f800000u));
+}
+
+fn finite4(v: vec4<f32>) -> bool {
+    return all((bitcast<vec4<u32>>(v) & vec4<u32>(0x7f800000u)) != vec4<u32>(0x7f800000u));
+}
+
 fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }

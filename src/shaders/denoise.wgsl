@@ -33,7 +33,8 @@ fn denoise_init(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d = accum[i].rgb * ic / albedo_at(i);
     let l = luminance(d);
     let var_mean = max(aov_albedo[i].w * ic - l * l, 0.0) * ic;
-    dst[i] = vec4<f32>(d, var_mean);
+    // A non-finite input would spread over every pass's footprint.
+    dst[i] = select(vec4<f32>(0.0), vec4<f32>(d, var_mean), finite4(vec4<f32>(d, var_mean)));
 }
 
 fn depth_at(p: vec2<i32>) -> f32 {
@@ -85,6 +86,9 @@ fn denoise_atrous(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             let j = u32(q.y) * P.frame.y + u32(q.x);
             let s = src[j];
+            if !finite4(s) {
+                continue;
+            }
             var w = kernel[abs(dx)] * kernel[abs(dy)];
             if dx != 0 || dy != 0 {
                 let nq = aov_normal[j] * ic;
@@ -99,9 +103,12 @@ fn denoise_atrous(@builtin(global_invocation_id) gid: vec3<u32>) {
             wsum += w;
         }
     }
-    var c = csum / wsum;
-    if pass_info.y == 1u {
-        c *= a_p;
+    var out = vec4<f32>(0.0);
+    if wsum > 0.0 {
+        out = vec4<f32>(csum / wsum, vsum / (wsum * wsum));
     }
-    dst[i] = vec4<f32>(c, vsum / (wsum * wsum));
+    if pass_info.y == 1u {
+        out = vec4<f32>(out.rgb * a_p, out.w);
+    }
+    dst[i] = select(vec4<f32>(0.0), out, finite4(out));
 }
