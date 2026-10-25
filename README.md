@@ -88,7 +88,16 @@ Name the file `.gltf` instead to get readable JSON with the data embedded.
 - Materials: one per distinct voxely material, on glTF's metal/roughness model:
   metal maps to metallic/roughness, emit to emissive (`KHR_materials_emissive_strength`),
   glass to `KHR_materials_transmission` + `KHR_materials_ior`.
-  Cloud materials have no glTF equivalent and become rough transmissive surfaces.
-- Structure: a root node named after the project, with the model as a child node.
+- Clouds: glTF can't describe volumetric scattering, so cloud materials degrade in layers:
+  - Everywhere: alpha blending, with opacity from the cloud's density over its average
+    thickness (`1 - e^(-density x 4V/S)`), so clouds read as soft see-through puffs.
+  - Where supported: `KHR_materials_diffuse_transmission` and `KHR_materials_volume`
+    for light diffusing through and fading with the same density.
+  - For engine fog: each cloud color is its own node (`<project>_cloud`) whose `extras` hold
+    `"voxely_material": "cloud"`, `palette_index`, `color`, `density` (extinction per voxel,
+    1 voxel = 0.1 m), `phase` and `opacity`. Find that node on import and swap in Godot's
+    FogVolume, Unity/Unreal volumetric fog, or a custom shader.
+- Structure: a root node named after the project, with the model and each cloud as child nodes.
 
-Exports pass the Khronos glTF Validator with no errors or warnings.
+Exports pass the Khronos glTF Validator with no errors or warnings (it can't yet check
+`KHR_materials_diffuse_transmission`, which is newer than the validator).

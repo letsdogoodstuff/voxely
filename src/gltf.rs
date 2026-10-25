@@ -10,8 +10,14 @@
 //! - Materials: one primitive per distinct voxely material, mapped onto
 //!   glTF's metallic-roughness model plus KHR_materials_emissive_strength
 //!   (emit), KHR_materials_transmission and KHR_materials_ior (glass).
-//! - Structure: a root node named after the project with one child node per
-//!   model, ready for multi-part scenes.
+//! - Clouds: glTF has no volumetric scattering, so each cloud material gets
+//!   its own node (tagged in `extras` with `voxely_material: "cloud"`,
+//!   density, phase and color, so engines can swap in their own fog) and a
+//!   material that degrades gracefully: alpha blending with opacity from the
+//!   density works everywhere, and KHR_materials_diffuse_transmission plus
+//!   KHR_materials_volume give a softer look where supported.
+//! - Structure: a root node named after the project with a child node for
+//!   the model and one per cloud.
 
 use std::path::Path;
 
@@ -52,14 +58,59 @@ fn look(m: &GpuMaterial) -> Look {
         Look { emissive: m.emit.max(0.0), ..plain }
     } else if kind == MaterialKind::Blend as u32 {
         Look { metallic: m.metal, roughness: m.rough, transmission: m.trans, ior: m.ior, ..plain }
-    } else if kind == MaterialKind::Media as u32 {
-        // Clouds have no glTF equivalent; a rough, fully transmissive
-        // surface is the closest stand-in.
-        Look { transmission: 1.0, ior: 1.0, ..plain }
     } else {
         plain
     };
     Look { metallic: q(l.metallic), roughness: q(l.roughness), emissive: q(l.emissive), transmission: q(l.transmission), ior: q(l.ior) }
+}
+
+/// A cloud (participating media) color and how it is approximated.
+#[derive(Clone, Copy, Debug)]
+struct Cloud {
+    color: u8,
+    /// Extinction per voxel, as the path tracer uses it.
+    density: f32,
+    /// Henyey-Greenstein phase asymmetry.
+    phase: f32,
+    /// Mean distance through the cloud in voxels: 4 V / S.
+    chord: f32,
+}
+
+impl Cloud {
+    /// Coverage of one look through the cloud: 1 - transmittance over the
+    /// mean chord, kept away from fully clear or fully solid.
+    fn opacity(&self) -> f32 {
+        (1.0 - (-self.density * self.chord).exp()).clamp(0.05, 0.95)
+    }
+}
+
+/// What a group of faces becomes: a regular surface or a cloud.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    Surface(Look),
+    Cloud(Cloud),
+}
+
+/// Mean chord (4 V / S, in voxels) of the voxels of each color.
+fn chords(v: &crate::scene::Volume) -> [f32; 256] {
+    let (mut vol, mut area) = ([0u32; 256], [0u32; 256]);
+    for (i, &c) in v.cells.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        vol[c as usize] += 1;
+        let p = v.position(i);
+        for n in 0..6 {
+            if v.get(p + dir(n)) != c {
+                area[c as usize] += 1;
+            }
+        }
+    }
+    std::array::from_fn(|c| if area[c] == 0 { 1.0 } else { 4.0 * vol[c] as f32 / area[c] as f32 })
+}
+
+fn hex(c: [u8; 4]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
 }
 
 /// Vertex data for one primitive.
@@ -122,17 +173,28 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
         [q.x, q.z, -q.y]
     };
 
-    // Group faces by material.
-    let mut looks: Vec<Look> = Vec::new();
+    // Group faces: surfaces by material, clouds by color.
+    let chord = chords(v);
+    let mut kinds: Vec<Kind> = Vec::new();
     let mut prims: Vec<Prim> = Vec::new();
     for q in greedy_quads(v) {
-        let l = look(&scene.materials[q.color as usize]);
-        let k = match looks.iter().position(|x| *x == l) {
+        let m = &scene.materials[q.color as usize];
+        let kind = if m.kind == MaterialKind::Media as u32 {
+            Kind::Cloud(Cloud { color: q.color, density: m.density, phase: m.g, chord: chord[q.color as usize] })
+        } else {
+            Kind::Surface(look(m))
+        };
+        let same = |k: &Kind| match (k, &kind) {
+            (Kind::Surface(a), Kind::Surface(b)) => a == b,
+            (Kind::Cloud(a), Kind::Cloud(b)) => a.color == b.color,
+            _ => false,
+        };
+        let k = match kinds.iter().position(same) {
             Some(k) => k,
             None => {
-                looks.push(l);
+                kinds.push(kind);
                 prims.push(Prim::default());
-                looks.len() - 1
+                kinds.len() - 1
             }
         };
         let p = &mut prims[k];
@@ -149,7 +211,9 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
     }
 
     let mut bin = Bin::default();
-    let mut primitives = Vec::new();
+    // Surfaces share one mesh; each cloud gets its own.
+    let mut surface_prims = Vec::new();
+    let mut cloud_meshes: Vec<(Cloud, Value)> = Vec::new();
     for (k, p) in prims.iter().enumerate() {
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for q in &p.positions {
@@ -162,11 +226,15 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
         let nrm = bin.accessor(bytes(&p.normals), ARRAY_BUFFER, FLOAT, p.normals.len(), "VEC3", None);
         let uv = bin.accessor(bytes(&p.uvs), ARRAY_BUFFER, FLOAT, p.uvs.len(), "VEC2", None);
         let idx = bin.accessor(bytes(&p.indices), ELEMENT_ARRAY_BUFFER, UNSIGNED_INT, p.indices.len(), "SCALAR", None);
-        primitives.push(json!({
+        let prim = json!({
             "attributes": { "POSITION": pos, "NORMAL": nrm, "TEXCOORD_0": uv },
             "indices": idx,
             "material": k,
-        }));
+        });
+        match kinds[k] {
+            Kind::Surface(_) => surface_prims.push(prim),
+            Kind::Cloud(c) => cloud_meshes.push((c, prim)),
+        }
     }
 
     // Palette texture.
@@ -181,30 +249,65 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
     let image = bin.view(&png, None);
 
     let mut used = std::collections::BTreeSet::new();
-    let materials: Vec<Value> = looks
+    let materials: Vec<Value> = kinds
         .iter()
         .enumerate()
-        .map(|(k, l)| {
-            let mut m = json!({
-                "name": format!("voxel_{k}"),
-                "pbrMetallicRoughness": {
-                    "baseColorTexture": { "index": 0 },
-                    "metallicFactor": l.metallic,
-                    "roughnessFactor": l.roughness,
-                },
-            });
+        .map(|(k, kind)| {
             let mut ext = serde_json::Map::new();
-            if l.emissive > 0.0 {
-                m["emissiveTexture"] = json!({ "index": 0 });
-                m["emissiveFactor"] = json!([1.0, 1.0, 1.0]);
-                if l.emissive > 1.0 {
-                    ext.insert("KHR_materials_emissive_strength".into(), json!({ "emissiveStrength": l.emissive }));
+            let mut m = match kind {
+                Kind::Surface(l) => {
+                    let mut m = json!({
+                        "name": format!("voxel_{k}"),
+                        "pbrMetallicRoughness": {
+                            "baseColorTexture": { "index": 0 },
+                            "metallicFactor": l.metallic,
+                            "roughnessFactor": l.roughness,
+                        },
+                    });
+                    if l.emissive > 0.0 {
+                        m["emissiveTexture"] = json!({ "index": 0 });
+                        m["emissiveFactor"] = json!([1.0, 1.0, 1.0]);
+                        if l.emissive > 1.0 {
+                            ext.insert("KHR_materials_emissive_strength".into(), json!({ "emissiveStrength": l.emissive }));
+                        }
+                    }
+                    if l.transmission > 0.0 {
+                        ext.insert("KHR_materials_transmission".into(), json!({ "transmissionFactor": l.transmission }));
+                        ext.insert("KHR_materials_ior".into(), json!({ "ior": l.ior }));
+                    }
+                    m
                 }
-            }
-            if l.transmission > 0.0 {
-                ext.insert("KHR_materials_transmission".into(), json!({ "transmissionFactor": l.transmission }));
-                ext.insert("KHR_materials_ior".into(), json!({ "ior": l.ior }));
-            }
+                Kind::Cloud(c) => {
+                    let rgb = scene.materials[c.color as usize].color;
+                    // Everywhere: alpha blending at the cloud's opacity.
+                    let m = json!({
+                        "name": format!("cloud_{}", c.color),
+                        "alphaMode": "BLEND",
+                        "pbrMetallicRoughness": {
+                            "baseColorTexture": { "index": 0 },
+                            "baseColorFactor": [1.0, 1.0, 1.0, c.opacity()],
+                            "metallicFactor": 0.0,
+                            "roughnessFactor": 1.0,
+                        },
+                        "extras": cloud_extras(scene, c),
+                    });
+                    // Where supported: light diffusing through, absorbed
+                    // over distance like the cloud's density.
+                    ext.insert(
+                        "KHR_materials_diffuse_transmission".into(),
+                        json!({ "diffuseTransmissionFactor": 1.0, "diffuseTransmissionColorFactor": [rgb[0], rgb[1], rgb[2]] }),
+                    );
+                    ext.insert(
+                        "KHR_materials_volume".into(),
+                        json!({
+                            "thicknessFactor": c.chord * SCALE,
+                            "attenuationDistance": SCALE / c.density.max(1e-3),
+                            "attenuationColor": [rgb[0], rgb[1], rgb[2]],
+                        }),
+                    );
+                    m
+                }
+            };
             if !ext.is_empty() {
                 used.extend(ext.keys().cloned());
                 m["extensions"] = Value::Object(ext);
@@ -212,6 +315,23 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
             m
         })
         .collect();
+
+    // Nodes: the root, the surface model, then one node per cloud.
+    let mut meshes = Vec::new();
+    let mut nodes = vec![json!({ "name": name })];
+    if !surface_prims.is_empty() {
+        meshes.push(json!({ "name": format!("{name}_mesh"), "primitives": surface_prims }));
+        nodes.push(json!({ "name": format!("{name}_model"), "mesh": meshes.len() - 1 }));
+    }
+    let single = cloud_meshes.len() == 1;
+    for (c, prim) in cloud_meshes {
+        let node = if single { format!("{name}_cloud") } else { format!("{name}_cloud_{}", c.color) };
+        meshes.push(json!({ "name": format!("{node}_mesh"), "primitives": [prim] }));
+        nodes.push(json!({ "name": node, "mesh": meshes.len() - 1, "extras": cloud_extras(scene, &c) }));
+    }
+    if nodes.len() > 1 {
+        nodes[0]["children"] = json!((1..nodes.len()).collect::<Vec<_>>());
+    }
 
     let mut buffer = json!({ "byteLength": bin.data.len() });
     if embedded {
@@ -222,11 +342,8 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
         "asset": { "version": "2.0", "generator": concat!("voxely ", env!("CARGO_PKG_VERSION")) },
         "scene": 0,
         "scenes": [{ "name": name, "nodes": [0] }],
-        "nodes": [
-            { "name": name, "children": [1] },
-            { "name": format!("{name}_model"), "mesh": 0 },
-        ],
-        "meshes": [{ "name": format!("{name}_mesh"), "primitives": primitives }],
+        "nodes": nodes,
+        "meshes": meshes,
         "materials": materials,
         "textures": [{ "sampler": 0, "source": 0 }],
         "samplers": [{ "magFilter": NEAREST, "minFilter": NEAREST, "wrapS": CLAMP_TO_EDGE, "wrapT": CLAMP_TO_EDGE }],
@@ -235,12 +352,11 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
         "bufferViews": bin.views,
         "buffers": [buffer],
     });
-    if primitives_empty(&doc) {
+    if kinds.is_empty() {
         // An empty model: a valid file with an empty scene.
         for key in ["meshes", "materials"] {
             doc.as_object_mut().unwrap().remove(key);
         }
-        doc["nodes"] = json!([{ "name": name }]);
     }
     if !used.is_empty() {
         doc["extensionsUsed"] = json!(used.into_iter().collect::<Vec<_>>());
@@ -254,8 +370,17 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
     std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))
 }
 
-fn primitives_empty(doc: &Value) -> bool {
-    doc["meshes"][0]["primitives"].as_array().is_none_or(|p| p.is_empty())
+/// Metadata so engines can find clouds and replace them with real fog.
+fn cloud_extras(scene: &Scene, c: &Cloud) -> Value {
+    json!({
+        "voxely_material": "cloud",
+        "palette_index": c.color,
+        "color": hex(scene.palette[c.color as usize]),
+        "density": c.density,
+        "density_units": "extinction per voxel; 1 voxel = 0.1 m",
+        "phase": c.phase,
+        "opacity": c.opacity(),
+    })
 }
 
 /// Pack JSON and binary chunks into a GLB container.
@@ -343,6 +468,45 @@ mod tests {
         let doc: Value = serde_json::from_slice(&std::fs::read(&gltf).unwrap()).unwrap();
         assert!(doc["buffers"][0]["uri"].as_str().unwrap().starts_with("data:application/octet-stream;base64,"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clouds_get_their_own_node_and_blended_material() {
+        let mut s = Scene::empty(IVec3::new(8, 8, 8));
+        for z in 0..3 {
+            for y in 0..3 {
+                for x in 0..3 {
+                    s.volume.set(IVec3::new(x, y, z), 7);
+                }
+            }
+        }
+        s.volume.set(IVec3::new(6, 6, 0), 2);
+        s.materials[7].kind = MaterialKind::Media as u32;
+        s.materials[7].density = 0.5;
+        let path = std::env::temp_dir().join("voxely-gltf-cloud.glb");
+        write(&s, &path).unwrap();
+        let (doc, _) = read_glb(&path);
+        std::fs::remove_file(&path).ok();
+
+        // Root, model, cloud.
+        let nodes = doc["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0]["children"], json!([1, 2]));
+        let cloud = &nodes[2];
+        assert_eq!(cloud["name"].as_str().unwrap(), "voxely-gltf-cloud_cloud");
+        assert_eq!(cloud["extras"]["voxely_material"], json!("cloud"));
+        assert_eq!(cloud["extras"]["palette_index"], json!(7));
+
+        let mesh = &doc["meshes"][cloud["mesh"].as_u64().unwrap() as usize];
+        let mat = &doc["materials"][mesh["primitives"][0]["material"].as_u64().unwrap() as usize];
+        assert_eq!(mat["alphaMode"], json!("BLEND"));
+        // 3x3x3 block: chord 4*27/54 = 2 voxels; opacity 1 - e^-1.
+        let alpha = mat["pbrMetallicRoughness"]["baseColorFactor"][3].as_f64().unwrap();
+        assert!((alpha - (1.0 - (-1.0f64).exp())).abs() < 1e-3, "{alpha}");
+        assert!(mat["extensions"]["KHR_materials_diffuse_transmission"].is_object());
+        assert!(mat["extensions"]["KHR_materials_volume"]["thicknessFactor"].as_f64().unwrap() > 0.0);
+        let used: Vec<&str> = doc["extensionsUsed"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(used.contains(&"KHR_materials_volume") && used.contains(&"KHR_materials_diffuse_transmission"));
     }
 
     #[test]
