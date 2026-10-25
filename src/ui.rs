@@ -82,6 +82,8 @@ pub enum Command {
     PaletteSort,
     /// Recolor voxels randomly with the selected palette colors.
     PaletteRandom,
+    /// Export in one of MagicaVoxel's formats (asks where to save).
+    Export(crate::export::Format),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -940,9 +942,32 @@ pub fn project_panel(
     current: &Path,
     pattern: Option<&str>,
     shaders: &mut ShaderState,
+    export_status: Option<&str>,
     cmds: &mut Vec<Command>,
 ) {
     heading(ui, "Project");
+    // MagicaVoxel's Export box, docked at the bottom of the column.
+    egui::Panel::bottom("export").resizable(false).show(ui, |ui| {
+        ui.spacing_mut().indent = 6.0;
+        ui.spacing_mut().button_padding = egui::vec2(2.0, 1.0);
+        CollapsingHeader::new("Export").default_open(true).show(ui, |ui| {
+            // Three buttons per row, sized to fit the column.
+            let w = ((ui.available_width() - 8.0) / 3.0).floor();
+            egui::Grid::new("export_formats").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
+                for (k, f) in crate::export::Format::ALL.into_iter().enumerate() {
+                    if ui.add_sized([w, 20.0], egui::Button::new(f.name())).on_hover_text(f.hint()).clicked() {
+                        cmds.push(Command::Export(f));
+                    }
+                    if k % 3 == 2 {
+                        ui.end_row();
+                    }
+                }
+            });
+            if let Some(status) = export_status {
+                ui.add(egui::Label::new(egui::RichText::new(status).weak().small()).wrap());
+            }
+        });
+    });
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         ui.selectable_value(tab, ProjectTab::Project, "Proj").on_hover_text("Project list");

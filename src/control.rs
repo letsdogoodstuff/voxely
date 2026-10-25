@@ -169,6 +169,10 @@ pub fn tools() -> Value {
             "samples": { "type": "integer", "description": "Samples per pixel (default 128; more is smoother and slower)" },
             "save_path": { "type": "string", "description": "Also save the PNG here" },
         }), &[]),
+        tool("export", "Export in one of MagicaVoxel's formats: obj/ply/mc/cube meshes, xraw/slab/qb/vox volumes, iso/2d/slice sprite images, point clouds.", json!({
+            "format": { "type": "string", "enum": ["obj", "ply", "mc", "xraw", "slab", "qb", "vox", "iso", "2d", "slice", "point", "cube"] },
+            "path": { "type": "string", "description": "Output file (default: <workspace>/export/<project>.<ext>)" },
+        }), &["format"]),
         tool("set_view_mode", "Show the modeler or the live path tracer in the window.", json!({
             "mode": { "type": "string", "enum": ["model", "render"] },
         }), &["mode"]),
@@ -1014,6 +1018,26 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 note.push_str(&format!("; saved {}", std::fs::canonicalize(path).unwrap_or(path.into()).display()));
             }
             out.push(text(note));
+            Ok(out)
+        }
+        "export" => {
+            let name = string(a, "format").context("missing `format`")?;
+            let format = crate::export::Format::from_name(name).ok_or_else(|| anyhow!("unknown format {name:?}"))?;
+            let path = match string(a, "path") {
+                Some(p) => PathBuf::from(p),
+                None => app::workspace_dir().join("export").join(app::export_file_name(&ctx.ed.name(), format)),
+            };
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
+            let files = crate::export::export(format, ctx.scene, &path)?;
+            ctx.ed.export_status = Some(app::export_summary(&files));
+            let mut out = vec![text(app::export_summary(&files))];
+            // Image formats come back as images too, so the agent can look.
+            if let Some(png) = files.iter().find(|f| f.extension().is_some_and(|e| e == "png") && matches!(format, crate::export::Format::Iso | crate::export::Format::TwoD | crate::export::Format::Slice)) {
+                let data = std::fs::read(png)?;
+                out.push(json!({ "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(data), "mimeType": "image/png" }));
+            }
             Ok(out)
         }
         "set_view_mode" => {

@@ -50,6 +50,8 @@ pub struct EditState {
     pub matter_tab: ui::MatterTab,
     pub material_clipboard: Option<crate::scene::GpuMaterial>,
     pub image: ui::ImageSettings,
+    /// Result of the last export, shown under the Export buttons.
+    pub export_status: Option<String>,
     pub transform_text: ui::TransformText,
     pub palette: ui::PaletteState,
     /// Canvas size being typed into the Canvas panel.
@@ -74,6 +76,7 @@ impl EditState {
             matter_tab: ui::MatterTab::default(),
             material_clipboard: None,
             image: ui::ImageSettings::default(),
+            export_status: None,
             transform_text: ui::TransformText::default(),
             palette: ui::PaletteState::default(),
             shaders: ui::ShaderState { files: list_shaders(source.as_deref()), current: None, values: Vec::new(), error: None },
@@ -271,6 +274,24 @@ pub fn default_save_path(source: Option<&Path>) -> PathBuf {
     }
     // A new project: the first free "project", "project-2", ...
     (1..).map(|k| if k == 1 { project_path(&stem) } else { project_path(&format!("{stem}-{k}")) }).find(|p| !p.exists()).unwrap()
+}
+
+/// Default file name for an export, e.g. `castle.obj`. Formats that share
+/// an extension get a suffix so they don't overwrite each other.
+pub fn export_file_name(project: &str, format: crate::export::Format) -> String {
+    use crate::export::Format;
+    match format {
+        Format::Obj | Format::Xraw | Format::Qb | Format::Vox | Format::Ply => format!("{project}.{}", format.extension()),
+        _ => format!("{project}-{}.{}", format.name(), format.extension()),
+    }
+}
+
+pub fn export_summary(files: &[PathBuf]) -> String {
+    let names: Vec<String> = files.iter().filter_map(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+    match files.first().and_then(|f| f.parent()) {
+        Some(dir) => format!("Exported {} to {}", names.join(", "), dir.display()),
+        None => "Exported".into(),
+    }
 }
 
 /// Save to `path` and make it the current project.
@@ -591,6 +612,22 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             let new = crate::palette_ops::random_colors(&scene.volume, ed.editor.selection(), &colors, seed());
             ed.editor.commit(&mut scene.volume, new)
         }
+        Command::Export(format) => {
+            let dir = workspace_dir().join("export");
+            let _ = std::fs::create_dir_all(&dir);
+            let dialog = rfd::FileDialog::new()
+                .add_filter(format.name(), &[format.extension()])
+                .set_directory(&dir)
+                .set_file_name(export_file_name(&ed.name(), format));
+            if let Some(path) = dialog.save_file() {
+                ed.export_status = Some(match crate::export::export(format, scene, &path) {
+                    Ok(files) => export_summary(&files),
+                    Err(e) => format!("{} export failed: {e:#}", format.name()),
+                });
+                eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
+            }
+            false
+        }
         Command::RenderImage => {
             render_final(r, scene, ed.image);
             false
@@ -784,11 +821,11 @@ pub fn build_ui(
             });
         });
         // The Project column shows in both modes, like MagicaVoxel.
-        egui::Panel::right("project").exact_size(150.0).resizable(false).show(ui, |ui| {
+        egui::Panel::right("project").exact_size(165.0).resizable(false).show(ui, |ui| {
             let current = ed.source.clone().unwrap_or_default();
             let pattern = ed.editor.pattern.as_ref().map(|p| p.name.clone());
             ed.rescan_if_stale();
-            ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &ed.samples, &current, pattern.as_deref(), &mut ed.shaders, cmds);
+            ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &ed.samples, &current, pattern.as_deref(), &mut ed.shaders, ed.export_status.as_deref(), cmds);
         });
         if r.modeling {
             egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
