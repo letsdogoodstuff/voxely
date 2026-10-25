@@ -177,11 +177,10 @@ pub fn erode(v: &Volume) -> Volume {
     })
 }
 
-/// Change the canvas size, keeping the model centered in x and y and on
-/// the floor.
+/// Change the canvas size (see `resize_shift` for where the model goes).
 pub fn resize(v: &Volume, dims: IVec3) -> Volume {
-    let shift = resize_shift(v.dims, dims);
     let dims = dims.clamp(IVec3::ONE, IVec3::splat(MAX_DIM));
+    let shift = resize_shift(v, dims);
     let mut out = Volume::new(dims);
     for (i, &c) in v.cells.iter().enumerate() {
         if c != 0 {
@@ -191,10 +190,25 @@ pub fn resize(v: &Volume, dims: IVec3) -> Volume {
     out
 }
 
-/// Where `resize` puts the old cell 0 in the new canvas.
-pub fn resize_shift(old: IVec3, dims: IVec3) -> IVec3 {
+/// Where `resize` puts the old cell 0 in the new canvas: the old canvas
+/// centered in x and y, on the same floor. Along an axis where that would
+/// cut voxels off, the model is centered instead (x, y) or set on the
+/// floor (z).
+pub fn resize_shift(v: &Volume, dims: IVec3) -> IVec3 {
     let dims = dims.clamp(IVec3::ONE, IVec3::splat(MAX_DIM));
-    IVec3::new((dims.x - old.x) / 2, (dims.y - old.y) / 2, 0)
+    let mut shift = IVec3::new((dims.x - v.dims.x) / 2, (dims.y - v.dims.y) / 2, 0);
+    let mut b: Option<(IVec3, IVec3)> = None;
+    for (p, _) in v.filled() {
+        b = Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))));
+    }
+    if let Some((lo, hi)) = b {
+        for k in 0..3 {
+            if lo[k] + shift[k] < 0 || hi[k] + shift[k] >= dims[k] {
+                shift[k] = if k == 2 { -lo[k] } else { (dims[k] - (hi[k] - lo[k] + 1)).div_euclid(2) - lo[k] };
+            }
+        }
+    }
+    shift
 }
 
 /// Shrink the canvas to the model's bounds (MagicaVoxel's crop/fit).
@@ -754,7 +768,11 @@ mod tests {
         assert_eq!(count(&dilate(&v)), 27 + 6 * 9);
         let r = resize(&v, IVec3::new(9, 9, 4));
         assert_eq!(r.dims, IVec3::new(9, 9, 4));
-        assert_eq!(count(&r), 18);
+        // Kept on the old floor its top would be cut, so it moves down.
+        assert_eq!(count(&r), 27);
+        // Too small for the model: centered on it, the rest cut off.
+        let r = resize(&v, IVec3::new(1, 9, 9));
+        assert_eq!((count(&r), r.get(IVec3::new(0, 3, 2))), (9, 1));
     }
 
     #[test]

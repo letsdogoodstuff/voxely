@@ -258,15 +258,17 @@ pub fn render_framed(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             tile.text(8, 8, view.name(), sc, WHITE);
         }
         out.blit(&tile, (i as u32 % cols * tw) as i32, (i as u32 / cols * th) as i32);
+        // In world coordinates, as set_camera takes them.
+        let t = cam.target + ctx.scene.origin.as_vec3();
         cams.push(format!(
             "{}: yaw {:.0}, pitch {:.0}, distance {:.1}, target [{:.1}, {:.1}, {:.1}], {:?}",
             if view == View::Current { "camera" } else { view.name() },
             cam.yaw.to_degrees(),
             cam.pitch.to_degrees(),
             cam.dist,
-            cam.target.x,
-            cam.target.y,
-            cam.target.z,
+            t.x,
+            t.y,
+            t.z,
             proj
         ));
     }
@@ -732,6 +734,7 @@ fn summary(ctx: &Ctx, what: &Shown, names: &[String], f: &Frame, framed: bool, h
         lines.push(format!("Colors: {}{more}.", top.join(", ")));
     }
     let cam = &ctx.r.camera;
+    let target = cam.target + scene.origin.as_vec3();
     let views = names.join(" | ");
     let framing = if framed {
         let framed = match (what.focus, what.fit_voxels, what.whole || scene.editing().is_none()) {
@@ -745,13 +748,13 @@ fn summary(ctx: &Ctx, what: &Shown, names: &[String], f: &Frame, framed: bool, h
         String::new()
     };
     lines.push(format!(
-        "Views: {views}.{framing} Window camera (unchanged): yaw {:.0}, pitch {:.0}, distance {:.1}, target [{:.1}, {:.1}, {:.1}], {:?}.",
+        "Views: {views}.{framing} Window camera (unchanged): yaw {:.0}, pitch {:.0}, distance {:.1}, target [{:.1}, {:.1}, {:.1}] world, {:?}.",
         cam.yaw.to_degrees(),
         cam.pitch.to_degrees(),
         cam.dist,
-        cam.target.x,
-        cam.target.y,
-        cam.target.z,
+        target.x,
+        target.y,
+        target.z,
         ctx.r.settings.projection
     ));
     if let Some(e) = &ctx.ed.tools.last_edit {

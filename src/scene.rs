@@ -963,6 +963,26 @@ impl Scene {
         }
     }
 
+    /// Write the edited model back as one tree undo step per voxel edit:
+    /// `past` holds the model before each edit, oldest first (see
+    /// `Editor::take_history`), so undo after a tree change still steps
+    /// back one edit at a time.
+    pub fn keep_steps(&mut self, past: Vec<Volume>) {
+        let Mode::Edit(id) = self.mode else { return };
+        let mut last = self.world.checkout(id).filter(|(_, o)| *o == self.origin).map(|(v, _)| v);
+        for v in past {
+            if last.as_ref().is_none_or(|l| l.dims != v.dims || l.cells != v.cells) {
+                self.remember();
+                self.world.checkin(id, &v, self.origin);
+            }
+            last = Some(v);
+        }
+        self.store();
+    }
+
+    /// Most voxel edits `keep_steps` turns into tree steps.
+    pub const KEPT_STEPS: usize = HISTORY - 1;
+
     fn remember(&mut self) {
         self.history.push(self.world.clone());
         if self.history.len() > HISTORY {
@@ -1514,5 +1534,110 @@ mod tests {
         assert_eq!(s.volume.cells, before.cells);
         assert!(s.undo_tree(true));
         assert_eq!(s.volume.get(lo - s.origin), 200);
+    }
+
+    /// One undo (or redo) step as the window and MCP take it: voxel edits
+    /// first, then tree steps (see `app::history_step`).
+    fn step(s: &mut Scene, e: &mut crate::edit::Editor, forward: bool) -> bool {
+        if s.editing().is_some() && (if forward { e.can_redo() } else { e.can_undo() }) {
+            return if forward { e.redo(&mut s.volume) } else { e.undo(&mut s.volume) };
+        }
+        let done = s.undo_tree(forward);
+        if done {
+            e.reset();
+        }
+        done
+    }
+
+    fn set(s: &mut Scene, e: &mut crate::edit::Editor, p: IVec3, c: u8) {
+        let mut new = s.volume.clone();
+        new.set(p, c);
+        assert!(e.commit(&mut s.volume, new));
+    }
+
+    fn solid(s: &Scene) -> (IVec3, Vec<(IVec3, u8)>) {
+        (s.volume.dims, s.volume.filled_sorted())
+    }
+
+    #[test]
+    fn voxel_edits_before_a_tree_change_undo_one_at_a_time() {
+        let mut s = Scene::empty(IVec3::splat(8));
+        let mut e = crate::edit::Editor::new(1);
+        let mut states = vec![solid(&s)];
+        for x in 0..3 {
+            set(&mut s, &mut e, IVec3::new(x, 0, 0), x as u8 + 1);
+            states.push(solid(&s));
+        }
+        // resize_canvas: a tree change that resets the voxel editor.
+        crate::app::keep_history(&mut s, &mut e);
+        let bigger = crate::ops::resize(&s.volume, IVec3::splat(10));
+        assert!(s.recanvas(&bigger, -crate::ops::resize_shift(&s.volume, IVec3::splat(10))));
+        e.reset();
+        states.push(solid(&s));
+        for want in states.iter().rev().skip(1) {
+            assert!(step(&mut s, &mut e, false));
+            assert_eq!(&solid(&s), want);
+        }
+        assert!(!step(&mut s, &mut e, false), "nothing left to undo");
+        for want in states.iter().skip(1) {
+            assert!(step(&mut s, &mut e, true));
+            assert_eq!(&solid(&s), want);
+        }
+    }
+
+    #[test]
+    fn switching_parts_keeps_each_voxel_edit() {
+        let mut w = World::single(Volume::new(IVec3::splat(4)));
+        let b = w.add_model(crate::world::ROOT, "b", Volume::new(IVec3::splat(4)), IVec3::new(10, 0, 0));
+        let mut s = Scene::from_world(w, crate::vox::default_palette());
+        let a = s.world.models()[0];
+        let mut e = crate::edit::Editor::new(1);
+        assert!(s.edit(a));
+        set(&mut s, &mut e, IVec3::ZERO, 1);
+        set(&mut s, &mut e, IVec3::X, 2);
+        crate::app::keep_history(&mut s, &mut e);
+        assert!(s.edit(b));
+        e.reset();
+        set(&mut s, &mut e, IVec3::ZERO, 3);
+        let count = |s: &Scene| s.synced_world().models().iter().map(|&m| s.synced_world().node(m).unwrap().volume().unwrap().count()).sum::<usize>();
+        let mut seen = vec![count(&s)];
+        while step(&mut s, &mut e, false) {
+            seen.push(count(&s));
+        }
+        assert_eq!(seen, vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn a_script_over_two_parts_is_one_step_after_earlier_edits() {
+        let mut w = World::single(Volume::new(IVec3::splat(4)));
+        let b = w.add_model(crate::world::ROOT, "b", Volume::new(IVec3::splat(4)), IVec3::new(10, 0, 0));
+        let mut s = Scene::from_world(w, crate::vox::default_palette());
+        let a = s.world.models()[0];
+        let mut e = crate::edit::Editor::new(1);
+        assert!(s.edit(a));
+        set(&mut s, &mut e, IVec3::ZERO, 1);
+        set(&mut s, &mut e, IVec3::X, 2);
+        // run_script: earlier edits move into the tree first, then the
+        // script edits a, switches to b, edits it, and is squashed.
+        crate::app::keep_history(&mut s, &mut e);
+        let (steps, before) = (s.tree_steps(), s.synced_world().into_owned());
+        set(&mut s, &mut e, IVec3::Y, 3);
+        crate::app::keep_history(&mut s, &mut e);
+        assert!(s.edit(b));
+        e.reset();
+        set(&mut s, &mut e, IVec3::ZERO, 4);
+        s.squash_tree(steps, before);
+        e.reset();
+        let colors = |s: &Scene| {
+            let w = s.synced_world();
+            let mut c: Vec<u8> = w.models().iter().flat_map(|&m| w.node(m).unwrap().volume().unwrap().filled().map(|(_, c)| c).collect::<Vec<_>>()).collect();
+            c.sort();
+            c
+        };
+        let mut seen = vec![colors(&s)];
+        while step(&mut s, &mut e, false) {
+            seen.push(colors(&s));
+        }
+        assert_eq!(seen, vec![vec![1, 2, 3, 4], vec![1, 2], vec![1], vec![]]);
     }
 }

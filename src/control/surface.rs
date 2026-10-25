@@ -561,14 +561,19 @@ fn paint_faces(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         d => dirs.extend(direction(d.as_str().context("direction is a string like \"top\"")?)?),
     }
     dirs.dedup();
+    ensure!(!dirs.is_empty(), "`direction` is empty; give one or more of the directions");
     let c = super::color_arg(ctx.scene, a, "color")?;
     ensure!(c != 0, "color 0 is empty space; use edit_model clear to erase");
     let only = opt_colors(ctx.scene, a, "only_color")?;
-    let coverage = num(a, "coverage").unwrap_or(1.0).clamp(0.0, 1.0);
+    ensure!(only.as_ref().is_none_or(|o| !o.is_empty()), "`only_color` is empty; leave it out to paint every color");
+    let coverage = num(a, "coverage").unwrap_or(1.0);
+    ensure!((0.0..=1.0).contains(&coverage), "`coverage` must be 0-1, not {coverage}");
+    let depth = int(a, "depth").unwrap_or(1);
+    ensure!((1..=256).contains(&depth), "`depth` must be 1-256 voxels, not {depth}");
     let p = Paint {
         dirs,
         color: c,
-        depth: int(a, "depth").unwrap_or(1).clamp(1, 256) as i32,
+        depth: depth as i32,
         vary_depth: boolean(a, "vary_depth").unwrap_or(false),
         coverage,
         pattern: pattern_arg(a, Pattern::Noise)?,

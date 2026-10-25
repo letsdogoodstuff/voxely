@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use glam::{IVec3, Mat3, Vec2, Vec3};
+use glam::{DVec3, IVec3, Mat3, Vec2, Vec3};
 use serde_json::{Value, json};
 
 use super::{Ctx, NEIGHBORS, apply, arr, boolean, color, color_arg, color_schema, count, edited, get, ivec3, num, opt_ivec3, string, text, tool, xyz};
@@ -19,6 +19,16 @@ pub struct State {
     tool: Option<String>,
     /// The axes the last committed edit was mirrored across.
     mirrored: [bool; 3],
+    /// Mirror copies of that edit that fell off the canvas.
+    mirror_lost: usize,
+}
+
+impl State {
+    /// Forget moved symmetry planes (another scene was loaded; its part ids
+    /// mean other parts).
+    pub fn scene_changed(&mut self) {
+        self.centers.clear();
+    }
 }
 
 pub const PART_TOOLS: &[&str] = &["draw_tube", "extrude_polygon", "place_stamp"];
@@ -88,6 +98,11 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Va
             let c = color_arg(ctx.scene, a, "color")?;
             let r0 = num(a, "radius").unwrap_or(1.0);
             let r1 = num(a, "end_radius").unwrap_or(r0);
+            for (key, r) in [("radius", r0), ("end_radius", r1)] {
+                if !(0.5..=256.0).contains(&r) {
+                    bail!("`{key}` must be 0.5-256 voxels (0.5 is one voxel thick), not {r}");
+                }
+            }
             let curve = string(a, "curve").unwrap_or("smooth");
             let path = sample_curve(&pts, curve, boolean(a, "closed").unwrap_or(false))?;
             let len = path.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>();
@@ -145,7 +160,9 @@ pub fn before_commit(ctx: &mut Ctx, new: Volume) -> Volume {
     }
     ctx.ed.tools.build.mirrored = axes;
     let planes = planes(ctx, id);
-    mirror_edit(&ctx.scene.volume, new, axes, planes)
+    let (out, lost) = mirror_edit(&ctx.scene.volume, new, axes, planes);
+    ctx.ed.tools.build.mirror_lost = lost;
+    out
 }
 
 /// Twice each axis's mirror plane coordinate for part `id`.
@@ -159,10 +176,11 @@ fn planes(ctx: &Ctx, id: usize) -> IVec3 {
 /// the planes (given doubled: cell p mirrors to `planes - p`) on `axes`.
 /// When several cells of one mirror set changed differently, the highest
 /// color wins, so adding beats erasing.
-pub fn mirror_edit(old: &Volume, new: Volume, axes: [bool; 3], planes: IVec3) -> Volume {
+pub fn mirror_edit(old: &Volume, new: Volume, axes: [bool; 3], planes: IVec3) -> (Volume, usize) {
     if old.dims != new.dims {
-        return new;
+        return (new, 0);
     }
+    let mut lost = 0;
     let mut out = new.clone();
     let mut changed: Vec<usize> = old.cells.diff(&new.cells).into_iter().map(|c| c.0).collect();
     changed.sort_unstable();
@@ -183,7 +201,9 @@ pub fn mirror_edit(old: &Volume, new: Volume, axes: [bool; 3], planes: IVec3) ->
                 }
             }
         }
+        let n = orbit.len();
         orbit.retain(|&p| new.contains(p));
+        lost += n - orbit.len();
         let idx: Vec<usize> = orbit.iter().map(|&p| new.index(p)).collect();
         let c = idx.iter().filter(|&&j| old.cells[j] != new.cells[j]).map(|&j| new.cells[j]).max().unwrap_or(0);
         for j in idx {
@@ -191,7 +211,7 @@ pub fn mirror_edit(old: &Volume, new: Volume, axes: [bool; 3], planes: IVec3) ->
             out.set_index(j, c);
         }
     }
-    out
+    (out, lost)
 }
 
 /// " (mirrored xz)" when the edit just made was mirrored, else "".
@@ -201,7 +221,11 @@ pub(super) fn mirrored_note(ctx: &Ctx) -> String {
         return String::new();
     }
     let axes: String = ["x", "y", "z"].iter().zip(m).filter(|(_, on)| *on).map(|(n, _)| *n).collect();
-    format!(" (mirrored {axes})")
+    match ctx.ed.tools.build.mirror_lost {
+        0 => format!(" (mirrored {axes})"),
+        1 => format!(" (mirrored {axes}; 1 mirror copy fell outside the canvas, so that edit isn't symmetric there)"),
+        n => format!(" (mirrored {axes}; {n} mirror copies fell outside the canvas, so that edit isn't symmetric there)"),
+    }
 }
 
 fn set_symmetry(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
@@ -320,7 +344,10 @@ impl Solid {
             "wedge" => (Kind::Wedge, 1.0),
             _ => bail!("unknown shape {shape:?}; one of {}", SHAPES.join(", ")),
         };
-        let top = num(args, "top_scale").unwrap_or(top).max(0.0);
+        let top = num(args, "top_scale").unwrap_or(top);
+        if top < 0.0 {
+            bail!("`top_scale` must be 0 or more, not {top}");
+        }
         let up = super::axis_named(args, "up")?;
         // A wedge rises toward +axis; with no axis given, along x (or y if up is x).
         let axis = if kind == Kind::Wedge && get(args, "axis").is_none() { if up == 0 { 1 } else { 0 } } else { axis };
@@ -331,10 +358,17 @@ impl Solid {
         let center = (lo.as_vec3() + hi.as_vec3() + 1.0) * 0.5;
         let half = (hi - lo + IVec3::ONE).as_vec3() * 0.5;
         let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
-        let radius = match kind {
-            Kind::Torus => num(args, "radius").unwrap_or(half[axis]).clamp(0.5, (half[u] + half[w]) * 0.5),
-            Kind::RoundedBox => num(args, "radius").unwrap_or((half.min_element() * 0.5).max(1.0)).clamp(0.0, half.min_element()),
-            _ => 0.0,
+        // An explicit radius must fit the box; the defaults are fitted.
+        let (min, max, default) = match kind {
+            Kind::Torus => (0.5, (half[u] + half[w]) * 0.5, half[axis]),
+            Kind::RoundedBox => (0.0, half.min_element(), (half.min_element() * 0.5).max(1.0)),
+            _ if get(args, "radius").is_some() => bail!("`radius` is for rounded_box (corner radius) and torus (tube radius) only"),
+            _ => (0.0, 0.0, 0.0),
+        };
+        let radius = match num(args, "radius") {
+            Some(r) if !(min..=max).contains(&r) => bail!("`radius` must be {min}-{max} for a {shape} this size, not {r}"),
+            Some(r) => r,
+            None => default.clamp(min, max),
         };
         let mut s = Solid { kind, axis, up, center, half, radius, top, inv: None, lo, hi };
         if let Some(r) = get(args, "rotation") {
@@ -425,6 +459,64 @@ pub fn fill_solid(v: &Volume, s: &Solid, c: u8, hollow: bool) -> Volume {
 }
 
 // ---------------------------------------------------------------- tubes
+
+/// draw_line's brush: a ball `thick` voxels across, centered on a cell
+/// when odd and between cells (toward +x+y+z) when even.
+pub(super) fn line_brush(thick: i32) -> Vec<IVec3> {
+    let lo = -(thick - 1) / 2;
+    let center = Vec3::splat(if thick % 2 == 0 { 0.5 } else { 0.0 });
+    let r = thick as f32 * 0.5 + 1e-3;
+    let mut out = Vec::new();
+    for z in lo..lo + thick {
+        for y in lo..lo + thick {
+            for x in lo..lo + thick {
+                let o = IVec3::new(x, y, z);
+                if (o.as_vec3() - center).length() <= r {
+                    out.push(o);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The part of the segment `a`..`b` inside the box `lo`..`hi`, or None.
+fn clip_segment(a: DVec3, b: DVec3, lo: DVec3, hi: DVec3) -> Option<(DVec3, DVec3)> {
+    let d = b - a;
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for k in 0..3 {
+        if d[k] == 0.0 {
+            if a[k] < lo[k] || a[k] > hi[k] {
+                return None;
+            }
+            continue;
+        }
+        let (mut u, mut v) = ((lo[k] - a[k]) / d[k], (hi[k] - a[k]) / d[k]);
+        if u > v {
+            std::mem::swap(&mut u, &mut v);
+        }
+        (t0, t1) = (t0.max(u), t1.min(v));
+        if t0 > t1 {
+            return None;
+        }
+    }
+    Some((a + d * t0, a + d * t1))
+}
+
+/// The cells draw_line paints from `from` to `to`: `brush` stepped one
+/// cell at a time (no gaps) along the line, first clipped to the box
+/// `lo`..=`hi` (plus the brush's reach). Cells may repeat.
+pub(super) fn line_cells(lo: IVec3, hi: IVec3, from: IVec3, to: IVec3, brush: &[IVec3], mut f: impl FnMut(IVec3)) {
+    let reach = brush.iter().map(|o| o.abs().max_element()).max().unwrap_or(0) as f64;
+    let (lo, hi) = (lo.as_dvec3() - reach, hi.as_dvec3() + reach);
+    let Some((a, b)) = clip_segment(from.as_dvec3(), to.as_dvec3(), lo, hi) else { return };
+    let d = b - a;
+    let steps = d.abs().max_element().ceil().max(1.0) as i64;
+    for i in 0..=steps {
+        let p = (a + d * (i as f64 / steps as f64)).round().as_ivec3();
+        brush.iter().for_each(|&o| f(p + o));
+    }
+}
 
 fn points3(a: &Value) -> Result<Vec<Vec3>> {
     let list = get(a, "points").and_then(Value::as_array).context("`points` must be [[x, y, z], ...]")?;
@@ -643,6 +735,12 @@ fn save_stamp(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         (None, None) => super::bounds(&src).with_context(|| format!("`{label}` has no voxels"))?,
         _ => bail!("give both `from` and `to`, or neither"),
     };
+    // The box on the canvas: placing the stamp at its min corner puts the
+    // voxels back where they were.
+    let (lo, hi) = (lo.max(IVec3::ZERO), hi.min(src.dims - 1));
+    if lo.cmpgt(hi).any() {
+        bail!("the box lies outside `{label}`'s canvas; coordinates run [0, 0, 0]..{:?}", arr(src.dims - 1));
+    }
     let v = crop(&src, lo, hi);
     let n = count(&v);
     if n == 0 {
@@ -653,9 +751,9 @@ fn save_stamp(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     write_stamp(&path, &v, &ctx.scene.palette)?;
     let d = v.dims;
     Ok(vec![text(format!(
-        "{} stamp {name:?}: {n} voxels, {}x{}x{}, from {:?} of `{label}`. Saved at {}",
+        "{} stamp {name:?}: {n} voxels, {}x{}x{}, from {:?}..{:?} of `{label}` (place_stamp at {:?} puts it back). Saved at {}",
         if existed { "Replaced" } else { "Saved" },
-        d.x, d.y, d.z, arr(lo), path.display()
+        d.x, d.y, d.z, arr(lo), arr(hi), arr(lo), path.display()
     ))])
 }
 
@@ -784,6 +882,49 @@ fn place_stamp(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
 mod tests {
     use super::*;
 
+    fn line(dims: IVec3, from: IVec3, to: IVec3, thick: i32) -> Volume {
+        let mut v = Volume::new(dims);
+        line_cells(IVec3::ZERO, dims - 1, from, to, &line_brush(thick), |p| v.set(p, 1));
+        v
+    }
+
+    #[test]
+    fn line_thickness_is_its_width() {
+        let dims = IVec3::splat(20);
+        for t in 1..=4 {
+            let v = line(dims, IVec3::new(0, 10, 10), IVec3::new(19, 10, 10), t);
+            let across = (0..20).filter(|&y| v.get(IVec3::new(5, y, 10)) != 0).count();
+            let up = (0..20).filter(|&z| v.get(IVec3::new(5, 10, z)) != 0).count();
+            assert_eq!((across, up), (t as usize, t as usize), "thickness {t}");
+        }
+    }
+
+    #[test]
+    fn huge_lines_are_clipped_without_gaps() {
+        let dims = IVec3::splat(20);
+        let t = std::time::Instant::now();
+        let v = line(dims, IVec3::new(-1_000_000_000, 3, 0), IVec3::new(1_000_000_000, 3, 0), 1);
+        assert!(t.elapsed().as_secs_f32() < 0.5);
+        assert_eq!(n(&v), 20);
+        // A steep diagonal from far away still steps one cell at a time.
+        let v = line(dims, IVec3::new(-50, -50, 0), IVec3::new(50, 50, 0), 1);
+        assert_eq!(n(&v), 20);
+        assert!((0..20).all(|k| v.get(IVec3::new(k, k, 0)) != 0));
+        assert_eq!(n(&line(dims, IVec3::new(30, 30, 30), IVec3::new(40, 40, 40), 3)), 0);
+    }
+
+    #[test]
+    fn mirror_copies_off_the_canvas_are_counted() {
+        let old = Volume::new(IVec3::new(10, 4, 4));
+        let mut new = old.clone();
+        new.set(IVec3::new(1, 0, 0), 2);
+        // Plane at x = 2 (twice: 4): x 1 mirrors to 3, on the canvas.
+        assert_eq!(mirror_edit(&old, new.clone(), [true, false, false], IVec3::new(4, 0, 0)).1, 0);
+        new.set(IVec3::new(8, 0, 0), 2);
+        // x 8 mirrors to -4.
+        assert_eq!(mirror_edit(&old, new, [true, false, false], IVec3::new(4, 0, 0)).1, 1);
+    }
+
     fn n(v: &Volume) -> usize {
         count(v)
     }
@@ -839,17 +980,17 @@ mod tests {
         let old = Volume::new(IVec3::new(10, 6, 4));
         let mut new = old.clone();
         new.set(IVec3::new(1, 2, 3), 5);
-        let m = mirror_edit(&old, new, [true, false, false], IVec3::new(9, 5, 3));
+        let (m, _) = mirror_edit(&old, new, [true, false, false], IVec3::new(9, 5, 3));
         assert_eq!(m.get(IVec3::new(8, 2, 3)), 5);
         assert_eq!(n(&m), 2);
         // Two axes: four copies; an off-center plane at x = 3.
         let mut new = old.clone();
         new.set(IVec3::new(1, 0, 0), 7);
-        let m = mirror_edit(&old, new, [true, true, false], IVec3::new(6, 5, 3));
+        let (m, _) = mirror_edit(&old, new, [true, true, false], IVec3::new(6, 5, 3));
         assert_eq!(n(&m), 4);
         assert_eq!(m.get(IVec3::new(5, 5, 0)), 7);
         // Erasing mirrors too.
-        let erased = mirror_edit(&m, Volume::from_cells(m.dims, { let mut c = m.cells.to_vec(); c[m.index(IVec3::new(1, 0, 0))] = 0; c }), [true, true, false], IVec3::new(6, 5, 3));
+        let (erased, _) = mirror_edit(&m, Volume::from_cells(m.dims, { let mut c = m.cells.to_vec(); c[m.index(IVec3::new(1, 0, 0))] = 0; c }), [true, true, false], IVec3::new(6, 5, 3));
         assert_eq!(n(&erased), 0);
     }
 

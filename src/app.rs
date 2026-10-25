@@ -405,6 +405,8 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
         }
         _ => {}
     }
+    keep_history(scene, &mut ed.editor);
+    let w = &scene.world;
     match op {
         TreeOp::New => {
             let near = picked.first().copied().unwrap_or(ROOT);
@@ -549,6 +551,16 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
     true
 }
 
+/// Before a change that resets the voxel editor (tree changes, switching
+/// part or frame): move this edit session's voxel edits into the tree's
+/// history, one undo step each, so none get merged.
+pub(crate) fn keep_history(scene: &mut Scene, editor: &mut Editor) {
+    if scene.editing().is_some() && editor.can_undo() {
+        let past = editor.take_history(&scene.volume, Scene::KEPT_STEPS);
+        scene.keep_steps(past);
+    }
+}
+
 /// Undo (or redo) one step: voxel edits in this edit session first, then
 /// whole-part changes.
 pub(crate) fn history_step(scene: &mut Scene, ed: &mut EditState, forward: bool) -> bool {
@@ -571,6 +583,7 @@ pub(crate) fn rig_colors(palette: &[[u8; 4]]) -> crate::rig::Colors {
 
 /// Switch between editing a model and the World view.
 pub(crate) fn set_mode(scene: &mut Scene, ed: &mut EditState, edit: Option<usize>) -> bool {
+    keep_history(scene, &mut ed.editor);
     let ok = match edit {
         Some(id) => scene.edit(id),
         None => {
@@ -648,6 +661,7 @@ pub(crate) fn import_file(path: &Path, how: &crate::import::How, new_project: bo
         loaded(r, scene, ed);
         Ok(format!("Imported {} as {} ({what}); Ctrl+S saves it", path.display(), ed.name()))
     } else {
+        keep_history(scene, &mut ed.editor);
         let (top, written) = crate::import::add_to_scene(scene, &models, &stem, add_colors)?;
         ed.editor.reset();
         ed.world_drag = None;
@@ -735,6 +749,7 @@ pub(crate) fn loaded(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     ed.palette.look = vec![None; 256];
     ed.palette.previewing = None;
     ed.hover = None;
+    ed.tools.build.scene_changed();
     r.load_scene(scene);
     ed.editor.sel_dirty = false;
     ed.timeline.play(false);
@@ -908,6 +923,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         }
         Command::ImportAnimation(Some((path, k))) => {
             let rig = scene.picked.first().copied();
+            keep_history(scene, &mut ed.editor);
             let res = crate::gltf_import::Gltf::load(&path).and_then(|g| scene.change_quiet(|w| crate::gltf_import::import(w, &g, Some(&k.to_string()), rig, true)));
             match res {
                 Ok(done) => eprintln!("imported {} ({} frames, {} parts)", done.clip, done.frames, done.bones.len()),
@@ -1001,6 +1017,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             if f == scene.world.frame {
                 false
             } else {
+                keep_history(scene, &mut ed.editor);
                 scene.set_frame(f);
                 ed.editor.reset();
                 true

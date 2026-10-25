@@ -247,12 +247,36 @@ pub(super) fn shape_report(ctx: &Ctx, changed: bool, what: &str, shape: &str, a:
         let n = if sp.exact { format!("{} cells", thousands(sp.outside)) } else { "Part of the shape".into() };
         notes.push(format!("{n} fell outside the canvas ({}); resize_canvas or move the shape.", sides(dims, sp.sides)));
     }
+    // Judged from the cells drawn, not the shape's box (a hollow ball
+    // around the canvas misses it).
+    let misses = !changed && spill.as_ref().is_some_and(|sp| !sp.touches || (shape != "line" && !lands(dims, shape, a)));
     let why = (!changed).then(|| match &spill {
-        Some(sp) if !sp.touches => format!("it lies entirely outside the canvas {}x{}x{}; coordinates run 0..{}", dims.x, dims.y, dims.z, fmt_max(dims)),
+        Some(_) if misses => format!("it lies entirely outside the canvas {}x{}x{}; coordinates run 0..{}", dims.x, dims.y, dims.z, fmt_max(dims)),
         _ if color == 0 => "that area was already empty".into(),
         _ => format!("every cell it covers already has color {color}"),
     });
     report(ctx, changed, what, why, notes)
+}
+
+/// Whether any cell of a fill_box / draw_shape shape lies on the canvas.
+fn lands(dims: IVec3, shape: &str, a: &Value) -> bool {
+    let (Ok(from), Ok(to), Ok(axis)) = (super::ivec3(a, "from"), super::ivec3(a, "to"), super::axis(a)) else { return true };
+    let Ok(solid) = super::build::Solid::build(shape, axis, from, to, a) else { return true };
+    let hollow = boolean(a, "hollow").unwrap_or(false);
+    let inside = |p: IVec3| solid.has_cell(p);
+    let (lo, hi) = solid.bounds();
+    let (lo, hi) = (lo.max(IVec3::ZERO), hi.min(dims - IVec3::ONE));
+    for z in lo.z..=hi.z {
+        for y in lo.y..=hi.y {
+            for x in lo.x..=hi.x {
+                let p = IVec3::new(x, y, z);
+                if inside(p) && (!hollow || super::NEIGHBORS.iter().any(|&n| !inside(p + n))) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn fmt_max(dims: IVec3) -> String {
@@ -298,34 +322,28 @@ fn spill(dims: IVec3, shape: &str, a: &Value) -> Option<Spill> {
     let mut sp = Spill { outside: 0, sides: [[false; 2]; 3], exact: true, touches: false };
     let canvas = |p: IVec3| p.cmpge(IVec3::ZERO).all() && p.cmplt(dims).all();
     if shape == "line" {
-        // Mirrors draw_line's rasterization.
+        // draw_line's own cells; when there are too many to count, only
+        // whether any land on the canvas.
         let thick = int(a, "thickness").unwrap_or(1).clamp(1, 64) as i32;
-        let d = to - from;
-        let steps = d.abs().max_element().max(1);
-        let k = (thick - 1) / 2 + 1;
-        if steps as u64 * ((2 * k + 1) as u64).pow(3) > SPILL_WORK {
-            return None;
-        }
-        let r = thick as f32 * 0.5;
+        let brush = super::build::line_brush(thick);
+        let steps = (to - from).abs().max_element().max(1);
+        let (lo, hi) = if steps as u64 * brush.len() as u64 > SPILL_WORK {
+            sp.exact = false;
+            mark(dims, &mut sp.sides, from);
+            mark(dims, &mut sp.sides, to);
+            sp.outside = 1;
+            (IVec3::ZERO, dims - IVec3::ONE)
+        } else {
+            (from.min(to), from.max(to))
+        };
         let mut cells = HashSet::new();
-        for i in 0..=steps {
-            let p = (from.as_vec3() + d.as_vec3() * (i as f32 / steps as f32)).round().as_ivec3();
-            for z in -k..=k {
-                for y in -k..=k {
-                    for x in -k..=k {
-                        let o = IVec3::new(x, y, z);
-                        if thick == 1 && o != IVec3::ZERO || o.as_vec3().length() > r {
-                            continue;
-                        }
-                        cells.insert(p + o);
-                    }
-                }
-            }
-        }
+        super::build::line_cells(lo, hi, from, to, &brush, |p| {
+            cells.insert(p);
+        });
         for p in cells {
             if canvas(p) {
                 sp.touches = true;
-            } else {
+            } else if sp.exact {
                 sp.outside += 1;
                 mark(dims, &mut sp.sides, p);
             }
@@ -396,9 +414,13 @@ fn crop(v: &Volume, a: &Value) -> Result<(IVec3, IVec3)> {
 }
 
 /// Downsampling step so a `nu` x `nw` map fits `max_cells`.
-fn step(a: &Value, nu: i32, nw: i32) -> i32 {
-    let cap = int(a, "max_cells").unwrap_or(MAP_CELLS).clamp(8, 1024) as i32;
-    ((nu.max(nw) + cap - 1) / cap).max(1)
+fn step(a: &Value, nu: i32, nw: i32) -> Result<i32> {
+    let cap = int(a, "max_cells").unwrap_or(MAP_CELLS);
+    if !(8..=1024).contains(&cap) {
+        bail!("`max_cells` must be 8-1024, not {cap}");
+    }
+    let cap = cap as i32;
+    Ok(((nu.max(nw) + cap - 1) / cap).max(1))
 }
 
 /// Cell width for numbers up to `max` (3 keeps the classic slice layout).
@@ -469,7 +491,7 @@ pub(super) fn slice(v: &Volume, palette: &[[u8; 4]], a: &Value) -> Result<String
     let (mut lo, mut hi) = crop(v, a)?;
     let cropped = lo[u] != 0 || lo[w] != 0 || hi[u] != v.dims[u] - 1 || hi[w] != v.dims[w] - 1;
     (lo[ax], hi[ax]) = (first, last);
-    let step = step(a, hi[u] - lo[u] + 1, hi[w] - lo[w] + 1);
+    let step = step(a, hi[u] - lo[u] + 1, hi[w] - lo[w] + 1)?;
     // Colors in range, for the cell width and to spot empty layers.
     let mut layer_used = vec![false; (last - first + 1) as usize];
     let mut max_color = 0u32;
@@ -589,7 +611,7 @@ pub(super) fn projection(v: &Volume, palette: &[[u8; 4]], a: &Value) -> Result<S
             }
         }
     }
-    let step = step(a, nu, nw);
+    let step = step(a, nu, nw)?;
     // Per block: the nearest hit to the viewer.
     let block = |bu: i32, bw: i32| -> Option<(i32, u8)> {
         let mut best: Option<(i32, u8)> = None;
@@ -786,6 +808,19 @@ mod tests {
         let sp = spill(dims, "line", &args(json!({ "from": [5, 0, 0], "to": [-5, 0, 0] }))).unwrap();
         assert_eq!(sp.outside, 5);
         assert_eq!(sides(dims, sp.sides), "x < 0");
+    }
+
+    #[test]
+    fn a_shape_misses_the_canvas_by_its_cells_not_its_box() {
+        let dims = IVec3::splat(20);
+        // A hollow ball around the canvas: its box covers it, its shell doesn't.
+        assert!(!lands(dims, "ellipsoid", &json!({ "from": [-100, -100, -100], "to": [100, 100, 100], "hollow": true })));
+        assert!(lands(dims, "ellipsoid", &json!({ "from": [-100, -100, -100], "to": [100, 100, 100] })));
+        // A huge line through the canvas lands without counting every cell.
+        let sp = spill(dims, "line", &json!({ "from": [-1000000000, 0, 0], "to": [1000000000, 0, 0] })).unwrap();
+        assert!(sp.touches && !sp.exact);
+        let sp = spill(dims, "line", &json!({ "from": [-1000000000, -5, 0], "to": [1000000000, -5, 0] })).unwrap();
+        assert!(!sp.touches);
     }
 
     #[test]

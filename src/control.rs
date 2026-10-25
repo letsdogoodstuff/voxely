@@ -172,7 +172,7 @@ fn base_tools() -> Value {
         }), &["shape", "from", "to", "color"]),
         tool("draw_line", "Draw a straight line of voxels between two points.", json!({
             "from": xyz(XYZ), "to": xyz(XYZ), "color": color_schema(),
-            "thickness": { "type": "integer", "description": "Diameter in voxels (default 1)" },
+            "thickness": { "type": "integer", "description": "Width in voxels, 1-64 (default 1): a round brush this many voxels across swept along the line" },
         }), &["from", "to", "color"]),
         tool("get_voxels", "List solid voxels, optionally within a box.", json!({
             "from": xyz(XYZ), "to": xyz(XYZ), "limit": { "type": "integer", "description": "Max voxels returned (default 5000)" },
@@ -189,19 +189,19 @@ fn base_tools() -> Value {
                 "description": "full: fill empty space; fill: recolor voxels; reverse: swap empty/solid; double/half: scale 2x/0.5x; flip/rotate(90 deg)/mirror(make symmetric)/diagonal/loop(shift 1 with wrap) need `axis`; fit: shrink canvas to model; hull: remove hidden voxels; flood: fill enclosed space; dilate/erode: grow/shrink 1; maze/perlin: generate" },
             "axis": axis.clone(),
             "direction": { "type": "integer", "description": "loop: -1 or 1" },
-            "color": color_schema(),
+            "color": { "type": ["integer", "string"], "description": "full/fill/reverse/flood/maze/perlin: the color for this op only (1-255 or \"#rrggbb\"); default: the current color" },
         }), &["op"]),
         tool("transform_model", "Scale, shear, rotate by any angle, or repeat the model. The canvas grows to fit.", json!({
             "kind": { "type": "string", "enum": ["scale", "shear", "rotate", "repeat"] },
             "args": { "type": "string", "description": "Axes then values, like MagicaVoxel: scale \"xyz 2\", shear \"z 0.2 0.2\", rotate \"z 45\", repeat \"xy 2\"" },
         }), &["kind", "args"]),
-        tool("resize_canvas", "Change the canvas size, keeping the model centered in x/y and on the floor.", json!({ "size": size3("New size") }), &["size"]),
+        tool("resize_canvas", "Change the canvas size (1-1024 per axis). Voxels stay where they are in the world (the part's position shifts to make up for it). The canvas stays centered in x/y on the same floor, or centered on the model where it wouldn't fit; voxels that still don't fit are cut off and the reply says how many.", json!({ "size": size3("New size") }), &["size"]),
         tool("list_shaders", "MagicaVoxel voxel shaders available to run_shader, with their arguments.", json!({}), &[]),
         tool("run_shader", "Run a MagicaVoxel voxel shader (GLSL `float map(vec3 v)` returning a color index) over the model, or the selection.", json!({
             "name": { "type": "string", "description": "A shader from list_shaders" },
             "source": { "type": "string", "description": "Or inline GLSL defining float map(vec3 v); built-ins: i_volume_size, i_color_index, voxel(v), palette(i), color_sel(k)" },
             "args": { "type": ["array", "object"], "items": { "type": "number" }, "description": "Argument values: an array in order, or an object by arg var name" },
-            "color": color_schema(),
+            "color": { "type": ["integer", "string"], "description": "The shader's i_color_index for this run (1-255 or \"#rrggbb\"); default: the current color" },
         }), &[]),
         tool("get_palette", "Palette colors as hex with their materials. Default: only colors in use.", json!({ "all": { "type": "boolean" } }), &[]),
         tool("set_palette_colors", "Set exact palette colors.", json!({
@@ -218,7 +218,7 @@ fn base_tools() -> Value {
             "by": { "type": "string", "enum": ["hue", "saturation", "value"] },
             "name": { "type": "string" }, "row": { "type": "integer", "minimum": 0, "maximum": 31 },
         }), &["action"]),
-        tool("set_material", "Set the render material of a palette color.", json!({
+        tool("set_material", "Set the render material of a palette color. Each type takes its own parameters: metal: roughness, metallic, ior; glass: roughness, ior, transparency; blend: roughness, metallic, ior, transparency; emit: emission; cloud: density; diffuse: none. A parameter the type doesn't use is an error. get_palette reads them back.", json!({
             "color": color_schema(),
             "type": { "type": "string", "enum": ["diffuse", "metal", "glass", "emit", "blend", "cloud"] },
             "roughness": { "type": "number", "minimum": 0, "maximum": 1, "description": "0 mirror-smooth, 1 matte; metal looks good at 0.2-0.5" },
@@ -240,11 +240,11 @@ fn base_tools() -> Value {
         tool("set_camera", "Aim the camera (used by screenshot, render and the window). Angles in degrees.", json!({
             "frame": { "type": "boolean", "description": "Reset to a three-quarter view of the whole canvas first" },
             "yaw": { "type": "number", "description": "Orbit angle around z in degrees; 35-45 gives a three-quarter view" },
-            "pitch": { "type": "number", "minimum": -89, "maximum": 89, "description": "Elevation in degrees; 25-35 shows the top and two sides" },
+            "pitch": { "type": "number", "minimum": -90, "maximum": 90, "description": "Elevation in degrees; 25-35 shows the top and two sides, 90 looks straight down" },
             "distance": { "type": "number", "exclusiveMinimum": 0, "description": "From the target, in voxels" },
-            "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] world point to orbit around" },
+            "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] world point to orbit around (the same coordinates render, screenshot and get_scene_info report)" },
             "projection": { "type": "string", "enum": ["perspective", "orthographic", "isometric", "stereographic", "panorama"] },
-            "fov": { "type": "number", "minimum": 1, "maximum": 179, "description": "Field of view in degrees" },
+            "fov": { "type": "number", "minimum": 1, "maximum": 170, "description": "Field of view in degrees" },
         }), &[]),
         tool("set_render_settings", "Lighting, sky, film and display settings for render. Colors are \"#rrggbb\".", json!({
             "sun_pitch": { "type": "number", "minimum": -90, "maximum": 90, "description": "Sun elevation in degrees; 30-50 gives readable shadows" },
@@ -254,7 +254,7 @@ fn base_tools() -> Value {
             "sun_color": { "type": "string" },
             "sky": { "type": "string", "enum": ["uniform", "atmosphere", "image"] },
             "sky_intensity": { "type": "number", "minimum": 0 }, "sky_color": { "type": "string" },
-            "exposure": { "type": "number", "description": "Brightness multiplier, 1 = neutral" },
+            "exposure": { "type": "number", "minimum": 0, "description": "Brightness multiplier, 1 = neutral" },
             "gamma": { "type": "number", "exclusiveMinimum": 0, "description": "Usually 2.2" },
             "aces": { "type": "boolean", "description": "Filmic tone mapping" },
             "bloom": { "type": "boolean" }, "denoise": { "type": "boolean" },
@@ -792,8 +792,22 @@ pub(crate) fn focus_part(ctx: &mut Ctx, part: Option<&Value>) -> Result<()> {
     Ok(())
 }
 
+/// Tools that only edit the part's voxels through the voxel editor (or
+/// don't edit at all). Any other tool may change the tree, so the voxel
+/// edits so far move into the tree's history first, one step each.
+const KEEPS_VOXEL_HISTORY: [&str; 36] = [
+    "set_voxels", "fill_box", "draw_shape", "draw_line", "draw_tube", "extrude_polygon", "place_stamp", "paint_faces", "vary_colors",
+    "shade_edges", "select", "move_selection", "undo", "redo", "get_scene_info", "get_voxels", "get_slice", "get_projection", "get_palette",
+    "list_parts", "list_projects", "list_shaders", "list_stamps", "list_palette_presets", "list_references", "render", "screenshot",
+    "set_camera", "set_render_settings", "set_view_mode", "set_symmetry", "save_stamp", "save_file", "set_material", "set_palette_colors",
+    "checkpoint",
+];
+
 fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
     let a = args;
+    if !KEEPS_VOXEL_HISTORY.contains(&name) {
+        app::keep_history(ctx.scene, &mut ctx.ed.editor);
+    }
     if is_part_tool(name) {
         focus_part(ctx, get(a, "part"))?;
     }
@@ -1285,7 +1299,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "part_position": arr(ctx.scene.origin),
                 "parts": ctx.scene.world.models().len(),
                 "animation": { "frames": ctx.scene.world.anim.frames, "frame": ctx.scene.world.frame, "fps": ctx.scene.world.anim.fps, "loop": ctx.scene.world.anim.looping, "smooth": ctx.scene.world.anim.smooth },
-                "camera": { "yaw": cam.yaw.to_degrees(), "pitch": cam.pitch.to_degrees(), "distance": cam.dist, "target": cam.target.to_array() },
+                "camera": { "yaw": cam.yaw.to_degrees(), "pitch": cam.pitch.to_degrees(), "distance": cam.dist, "target": (cam.target + ctx.scene.origin.as_vec3()).to_array() },
             });
             Ok(vec![text(serde_json::to_string_pretty(&info)?)])
         }
@@ -1368,7 +1382,13 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let mut sides = (IVec3::ZERO, new.dims - IVec3::ONE);
             for item in list {
                 let v = item.as_array().filter(|v| v.len() == 4).context("each voxel is [x, y, z, color]")?;
-                let n = |i: usize| v[i].as_f64().map(|f| f.round() as i32).context("voxel coordinates must be numbers");
+                let n = |i: usize| -> Result<i32> {
+                    let f = v[i].as_f64().context("voxel coordinates must be numbers")?;
+                    if f.fract() != 0.0 || f.abs() > i32::MAX as f64 {
+                        bail!("voxel coordinates must be whole numbers, not {f} (in {item})");
+                    }
+                    Ok(f as i32)
+                };
                 let p = IVec3::new(n(0)?, n(1)?, n(2)?);
                 let c = color(ctx.scene, &v[3])?;
                 if new.contains(p) {
@@ -1416,26 +1436,13 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "draw_line" => {
             let (from, to) = (ivec3(a, "from")?, ivec3(a, "to")?);
             let c = color_arg(ctx.scene, a, "color")?;
-            let thick = int(a, "thickness").unwrap_or(1).clamp(1, 64) as i32;
-            let mut new = ctx.scene.volume.clone();
-            let d = to - from;
-            let steps = d.abs().max_element().max(1);
-            let r = thick as f32 * 0.5;
-            let k = (thick - 1) / 2 + 1;
-            for i in 0..=steps {
-                let p = (from.as_vec3() + d.as_vec3() * (i as f32 / steps as f32)).round().as_ivec3();
-                for z in -k..=k {
-                    for y in -k..=k {
-                        for x in -k..=k {
-                            let o = IVec3::new(x, y, z);
-                            if thick == 1 && o != IVec3::ZERO || o.as_vec3().length() > r {
-                                continue;
-                            }
-                            new.set(p + o, c);
-                        }
-                    }
-                }
+            let thick = int(a, "thickness").unwrap_or(1);
+            if !(1..=64).contains(&thick) {
+                bail!("`thickness` must be 1-64 voxels, not {thick}");
             }
+            let mut new = ctx.scene.volume.clone();
+            let brush = build::line_brush(thick as i32);
+            build::line_cells(IVec3::ZERO, new.dims - IVec3::ONE, from, to, &brush, |p| new.set(p, c));
             let changed = apply(ctx, new);
             Ok(edited_shape(ctx, changed, "Drew line", "line", a))
         }
@@ -1448,7 +1455,11 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if hi.cmplt(IVec3::ZERO).any() || lo.cmpgt(max).any() {
                 bail!("the box {:?}..{:?} lies outside the canvas; coordinates run [0, 0, 0]..{:?}", arr(lo), arr(hi), arr(max));
             }
-            let limit = int(a, "limit").unwrap_or(5000).max(1) as usize;
+            let limit = int(a, "limit").unwrap_or(5000);
+            if limit < 1 {
+                bail!("`limit` must be 1 or more, not {limit}");
+            }
+            let limit = limit as usize;
             let mut list = Vec::new();
             let mut total = 0;
             for (p, c) in v.filled_sorted() {
@@ -1468,10 +1479,22 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "get_slice" => Ok(vec![text(inspect::slice(&ctx.scene.volume, &ctx.scene.palette, a)?)]),
         "edit_model" => {
             let op_name = string(a, "op").context("missing `op`")?;
-            if let Some(c) = get(a, "color") {
-                ctx.ed.editor.color = color(ctx.scene, c)?;
+            let paint = get(a, "color").map(|c| color(ctx.scene, c)).transpose()?;
+            if paint.is_some() && !matches!(op_name, "full" | "fill" | "reverse" | "flood" | "maze" | "perlin") {
+                bail!("op {op_name} doesn't use a color (full, fill, reverse, flood, maze and perlin do)");
+            }
+            if paint == Some(0) {
+                bail!("color 0 is empty space; use op clear to erase");
+            }
+            if matches!(op_name, "flip" | "rotate" | "mirror" | "diagonal" | "loop") && get(a, "axis").is_none() {
+                bail!("op {op_name} needs `axis` (x, y or z)");
             }
             let ax = axis(a)?;
+            let dir = match int(a, "direction") {
+                None | Some(1) => 1,
+                Some(-1) => -1,
+                Some(d) => bail!("`direction` must be 1 or -1, not {d}"),
+            };
             let op = match op_name {
                 "full" => Op::Full,
                 "fill" => Op::Fill,
@@ -1482,7 +1505,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "flip" => Op::Flip(ax),
                 "rotate" => Op::Rotate(ax),
                 "fit" => Op::Fit,
-                "loop" => Op::Loop(ax, if int(a, "direction").unwrap_or(1) < 0 { -1 } else { 1 }),
+                "loop" => Op::Loop(ax, dir),
                 "mirror" => Op::Mirror(ax),
                 "diagonal" => Op::Diagonal(ax),
                 "hull" => Op::Hull,
@@ -1496,7 +1519,12 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if let Op::Fit = op {
                 return fit_part(ctx);
             }
-            let new = app::apply_op(op, ctx.scene, &ctx.ed.editor).ok_or_else(|| anyhow!("{op_name} isn't possible here (empty model, or the canvas would exceed {})", ops::MAX_DIM))?;
+            // `color` is for this op only; the current color stays.
+            let current = ctx.ed.editor.color;
+            ctx.ed.editor.color = paint.unwrap_or(current);
+            let new = app::apply_op(op, ctx.scene, &ctx.ed.editor);
+            ctx.ed.editor.color = current;
+            let new = new.ok_or_else(|| anyhow!("{op_name} isn't possible here (empty model, or the canvas would exceed {})", ops::MAX_DIM))?;
             let changed = apply(ctx, new);
             Ok(edited(ctx, changed, &format!("Applied {op_name}")))
         }
@@ -1523,15 +1551,22 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "resize_canvas" => {
             let size = ivec3(a, "size")?;
+            if size.cmplt(IVec3::ONE).any() || size.cmpgt(IVec3::splat(ops::MAX_DIM)).any() {
+                bail!("size must be 1..={} per axis", ops::MAX_DIM);
+            }
             let old = ctx.scene.volume.dims;
+            let before = count(&ctx.scene.volume);
+            let shift = ops::resize_shift(&ctx.scene.volume, size);
             let new = ops::resize(&ctx.scene.volume, size);
+            let cut = before.saturating_sub(count(&new));
+            let cut = if cut > 0 { format!("; {cut} voxels outside the new canvas were cut off (undo brings them back)") } else { String::new() };
             if new.dims == old {
                 let changed = apply(ctx, new);
-                return Ok(edited(ctx, changed, "Resized canvas"));
+                return Ok(edited(ctx, changed, &format!("Resized canvas{cut}")));
             }
             let new = build::before_commit(ctx, new);
-            recanvas(ctx, new, -ops::resize_shift(old, size));
-            Ok(edited(ctx, true, &format!("Resized canvas to {:?}; the part's world position moved by {:?} so its voxels stay put", ctx.scene.volume.dims.to_array(), (-ops::resize_shift(old, size)).to_array())))
+            recanvas(ctx, new, -shift);
+            Ok(edited(ctx, true, &format!("Resized canvas to {:?}; the part's world position moved by {:?} so its voxels stay where they are in the world{cut}", ctx.scene.volume.dims.to_array(), (-shift).to_array())))
         }
         "list_shaders" => {
             let mut out = Vec::new();
@@ -1567,11 +1602,16 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 }
                 _ => {}
             }
-            if let Some(c) = get(a, "color") {
-                ctx.ed.editor.color = color(ctx.scene, c)?;
+            // `color` (the shader's i_color_index) is for this run only.
+            let paint = match get(a, "color") {
+                Some(c) => color(ctx.scene, c)?,
+                None => ctx.ed.editor.color,
+            };
+            if paint == 0 {
+                bail!("color 0 is empty space; pass a palette color 1-255");
             }
             let sels: Vec<u8> = (1..256).filter(|&i| ctx.ed.palette.selected[i]).map(|i| i as u8).collect();
-            let out = crate::xs::run(&ctx.r.device, &ctx.r.queue, &shader, &values, &ctx.scene.volume, &ctx.scene.palette, ctx.ed.editor.color, &sels)?;
+            let out = crate::xs::run(&ctx.r.device, &ctx.r.queue, &shader, &values, &ctx.scene.volume, &ctx.scene.palette, paint, &sels)?;
             let new = match ctx.ed.editor.selection() {
                 Some(sel) => Volume::from_cells(
                     out.dims,
@@ -1584,16 +1624,34 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "get_palette" => {
             let all = boolean(a, "all").unwrap_or(false);
-            let mut used = [false; 256];
-            for (_, c) in ctx.scene.volume.cells.filled() {
-                used[c as usize] = true;
-            }
+            // Every part and drawing, not just the one being edited.
+            let used = ctx.scene.used_colors();
             let kinds = ["diffuse", "metal", "glass", "emit", "blend", "cloud"];
             let list: Vec<Value> = (1..256)
                 .filter(|&i| all || used[i])
                 .map(|i| {
                     let m = &ctx.scene.materials[i];
                     let mut e = json!({ "index": i, "color": hex(ctx.scene.palette[i]), "material": kinds.get(m.kind as usize).copied().unwrap_or("?"), "in_use": used[i] });
+                    // The parameters set_material takes for this type.
+                    let round = |v: f32| (v as f64 * 1000.0).round() / 1000.0;
+                    let k = m.kind;
+                    let has = |kinds: &[MaterialKind]| kinds.iter().any(|x| *x as u32 == k);
+                    if has(&[MaterialKind::Metal, MaterialKind::Glass, MaterialKind::Blend]) {
+                        e["roughness"] = json!(round(m.rough));
+                        e["ior"] = json!(round(m.ior));
+                    }
+                    if has(&[MaterialKind::Metal, MaterialKind::Blend]) {
+                        e["metallic"] = json!(round(m.metal));
+                    }
+                    if has(&[MaterialKind::Glass, MaterialKind::Blend]) {
+                        e["transparency"] = json!(round(m.trans));
+                    }
+                    if has(&[MaterialKind::Emit]) {
+                        e["emission"] = json!(round(m.emit));
+                    }
+                    if has(&[MaterialKind::Media]) {
+                        e["density"] = json!(round(m.density));
+                    }
                     if let Some(n) = ctx.scene.notes.get((i - 1) / 8).filter(|n| !n.is_empty()) {
                         e["ramp"] = json!(n);
                     }
@@ -1627,7 +1685,13 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "edit_palette" => {
             use crate::palette_lib::Cmd;
             let action = string(a, "action").context("give an `action`")?;
-            let idx = |k: &str| int(a, k).map(|v| v as usize).with_context(|| format!("{action} needs `{k}`"));
+            let idx = |k: &str| -> Result<usize> {
+                let v = int(a, k).with_context(|| format!("{action} needs `{k}`"))?;
+                if !(1..=255).contains(&v) {
+                    bail!("`{k}` must be a palette index 1-255, not {v}");
+                }
+                Ok(v as usize)
+            };
             let cmd = match action {
                 "swap" => Cmd::Swap(idx("from")?, idx("to")?),
                 "move" => Cmd::Move(idx("from")?, idx("to")?),
@@ -1656,42 +1720,49 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if i == 0 {
                 bail!("color 0 is empty space");
             }
+            let kinds = ["diffuse", "metal", "glass", "emit", "blend", "cloud"];
+            let kind = match string(a, "type") {
+                Some(t) => kinds.iter().position(|k| *k == t).with_context(|| format!("unknown material type {t:?}; one of {}", kinds.join(", ")))? as u32,
+                None => ctx.scene.materials[i].kind,
+            };
+            let kind_name = kinds.get(kind as usize).copied().unwrap_or("?");
+            // Check every value before changing anything.
+            let params: [(&str, f32, f32, &[MaterialKind]); 6] = [
+                ("roughness", 0.0, 1.0, &[MaterialKind::Metal, MaterialKind::Glass, MaterialKind::Blend]),
+                ("metallic", 0.0, 1.0, &[MaterialKind::Metal, MaterialKind::Blend]),
+                ("ior", 1.0, 3.0, &[MaterialKind::Metal, MaterialKind::Glass, MaterialKind::Blend]),
+                ("transparency", 0.0, 1.0, &[MaterialKind::Glass, MaterialKind::Blend]),
+                ("emission", 0.0, f32::INFINITY, &[MaterialKind::Emit]),
+                ("density", 0.0, f32::INFINITY, &[MaterialKind::Media]),
+            ];
+            let mut values = [None; 6];
+            for (k, (key, lo, hi, applies)) in params.iter().enumerate() {
+                let Some(v) = get(a, key) else { continue };
+                let v = v.as_f64().with_context(|| format!("`{key}` must be a number"))? as f32;
+                if !(v >= *lo && v <= *hi) {
+                    bail!("`{key}` must be {}, not {v}", if hi.is_finite() { format!("{lo}-{hi}") } else { format!("{lo} or more") });
+                }
+                if !applies.iter().any(|m| *m as u32 == kind) {
+                    let names: Vec<&str> = applies.iter().map(|m| kinds[*m as usize]).collect();
+                    bail!("`{key}` only affects {} materials; color {i} is {kind_name} (pass `type` to change it)", names.join(" and "));
+                }
+                values[k] = Some(v);
+            }
             let m = &mut ctx.scene.materials[i];
-            if let Some(t) = string(a, "type") {
-                m.kind = match t {
-                    "diffuse" => MaterialKind::Diffuse,
-                    "metal" => MaterialKind::Metal,
-                    "glass" => MaterialKind::Glass,
-                    "emit" => MaterialKind::Emit,
-                    "blend" => MaterialKind::Blend,
-                    "cloud" => MaterialKind::Media,
-                    t => bail!("unknown material type {t:?}"),
-                } as u32;
-                if m.kind == MaterialKind::Emit as u32 && m.emit <= 0.0 {
-                    m.emit = 1.0;
-                }
-                if m.kind == MaterialKind::Glass as u32 && m.trans <= 0.0 {
-                    m.trans = 1.0;
-                }
+            m.kind = kind;
+            if m.kind == MaterialKind::Emit as u32 && m.emit <= 0.0 {
+                m.emit = 1.0;
             }
-            if let Some(v) = num(a, "roughness") {
-                m.rough = v.clamp(0.0, 1.0);
+            if m.kind == MaterialKind::Glass as u32 && m.trans <= 0.0 {
+                m.trans = 1.0;
             }
-            if let Some(v) = num(a, "metallic") {
-                m.metal = v.clamp(0.0, 1.0);
-            }
-            if let Some(v) = num(a, "ior") {
-                m.ior = v.max(1.0);
-            }
-            if let Some(v) = num(a, "transparency") {
-                m.trans = v.clamp(0.0, 1.0);
-            }
-            if let Some(v) = num(a, "emission") {
-                m.emit = v.max(0.0);
-            }
-            if let Some(v) = num(a, "density") {
-                m.density = v.max(0.0);
-            }
+            let [rough, metal, ior, trans, emit, density] = values;
+            m.rough = rough.unwrap_or(m.rough);
+            m.metal = metal.unwrap_or(m.metal);
+            m.ior = ior.unwrap_or(m.ior);
+            m.trans = trans.unwrap_or(m.trans);
+            m.emit = emit.unwrap_or(m.emit);
+            m.density = density.unwrap_or(m.density);
             materials_changed(ctx);
             Ok(vec![text(format!("Set material of color {i}"))])
         }
@@ -1764,7 +1835,10 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             Ok(out)
         }
         "undo" | "redo" => {
-            let steps = int(a, "steps").unwrap_or(1).max(1);
+            let steps = int(a, "steps").unwrap_or(1);
+            if steps < 1 {
+                bail!("`steps` must be 1 or more, not {steps}");
+            }
             let mut done = 0;
             for _ in 0..steps {
                 let ok = app::history_step(ctx.scene, ctx.ed, name == "redo");
@@ -1779,55 +1853,87 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             Ok(edited(ctx, done > 0, &format!("{name} x{done}")))
         }
         "set_camera" => {
+            // Check everything before changing anything.
+            let range = |key: &str, lo: f32, hi: f32| -> Result<Option<f32>> {
+                let Some(v) = get(a, key) else { return Ok(None) };
+                let v = v.as_f64().with_context(|| format!("`{key}` must be a number"))? as f32;
+                if !(v >= lo && v <= hi) {
+                    bail!("`{key}` must be {lo} to {hi}, not {v}");
+                }
+                Ok(Some(v))
+            };
+            let yaw = range("yaw", f32::MIN, f32::MAX)?;
+            let pitch = range("pitch", -90.0, 90.0)?;
+            let fov = range("fov", 1.0, 170.0)?;
+            let dist = range("distance", 0.0, f32::MAX)?;
+            if dist == Some(0.0) {
+                bail!("`distance` must be more than 0");
+            }
+            let target = match get(a, "target") {
+                Some(t) => Some(vec3_value(t).context("`target` must be [x, y, z] numbers")?),
+                None => None,
+            };
+            let projection = match string(a, "projection") {
+                None => None,
+                Some(p @ ("perspective" | "orthographic" | "isometric" | "stereographic" | "panorama")) => Some(p),
+                Some(p) => bail!("unknown projection {p:?}; one of perspective, orthographic, isometric, stereographic, panorama"),
+            };
+            let origin = ctx.scene.origin.as_vec3();
             let r = &mut *ctx.r;
             if boolean(a, "frame").unwrap_or(false) {
                 r.frame(ctx.scene.volume.dims.as_vec3());
             }
             let mut cam: Camera = r.camera;
-            if let Some(v) = num(a, "yaw") {
+            if let Some(v) = yaw {
                 cam.yaw = v.to_radians();
             }
-            if let Some(v) = num(a, "pitch") {
-                cam.pitch = v.clamp(-89.0, 89.0).to_radians();
+            if let Some(v) = pitch {
+                // Exactly ±90 would make the camera basis degenerate.
+                cam.pitch = v.clamp(-89.99, 89.99).to_radians();
             }
-            if let Some(v) = num(a, "distance") {
-                cam.dist = v.max(0.5);
+            if let Some(v) = dist {
+                cam.dist = v;
             }
-            if let Some(t) = get(a, "target").and_then(Value::as_array).filter(|t| t.len() == 3) {
-                let f = |i: usize| t[i].as_f64().unwrap_or(0.0) as f32;
-                cam.target = Vec3::new(f(0), f(1), f(2));
+            if let Some(t) = target {
+                // The renderer's camera works in the edited volume's cells.
+                cam.target = t - origin;
             }
             r.set_camera(cam);
-            if let Some(v) = num(a, "fov") {
-                r.settings.fov = v.clamp(1.0, 170.0);
+            if let Some(v) = fov {
+                r.settings.fov = v;
             }
-            match string(a, "projection") {
+            match projection {
                 Some("perspective") => r.settings.projection = Projection::Perspective,
                 Some("orthographic") => r.settings.projection = Projection::Orthographic,
                 Some("isometric") => app::iso_camera(r),
                 Some("stereographic") => r.settings.projection = Projection::Stereographic,
                 Some("panorama") => r.settings.projection = Projection::Panorama,
-                Some(p) => bail!("unknown projection {p:?}"),
-                None => {}
+                _ => {}
             }
             r.reset();
             let cam = &r.camera;
+            let t = cam.target + origin;
             Ok(vec![text(format!(
-                "Camera yaw {:.1}, pitch {:.1}, distance {:.1}, target [{:.1}, {:.1}, {:.1}]",
+                "Camera yaw {:.1}, pitch {:.1}, distance {:.1}, target [{:.1}, {:.1}, {:.1}] world",
                 cam.yaw.to_degrees(),
                 cam.pitch.to_degrees(),
                 cam.dist,
-                cam.target.x,
-                cam.target.y,
-                cam.target.z
+                t.x,
+                t.y,
+                t.z
             ))])
         }
         "set_render_settings" => {
-            let s = &mut ctx.r.settings;
+            // Work on a copy so a bad value leaves every setting as it was.
+            let mut s = ctx.r.settings.clone();
             let mut set = Vec::new();
             macro_rules! f32_field {
-                ($key:literal, $field:ident) => {
-                    if let Some(v) = num(a, $key) {
+                ($key:literal, $field:ident, $ok:expr, $range:literal) => {
+                    if let Some(v) = get(a, $key) {
+                        let v = v.as_f64().context(concat!("`", $key, "` must be a number"))? as f32;
+                        if !($ok)(v) {
+                            bail!("`{}` must be {}, not {v}", $key, $range);
+                        }
                         s.$field = v;
                         set.push($key);
                     }
@@ -1844,37 +1950,39 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             macro_rules! color_field {
                 ($key:literal, $field:ident) => {
                     if let Some(v) = string(a, $key) {
-                        s.$field = hex_linear(v)?;
+                        s.$field = hex_linear(v).with_context(|| format!("`{}`", $key))?;
                         set.push($key);
                     }
                 };
             }
-            f32_field!("sun_pitch", sun_pitch);
-            f32_field!("sun_yaw", sun_yaw);
-            f32_field!("sun_intensity", sun_intensity);
-            f32_field!("sun_area", sun_area);
+            let any = |v: f32| v.is_finite();
+            let not_negative = |v: f32| v >= 0.0 && v.is_finite();
+            f32_field!("sun_pitch", sun_pitch, |v: f32| (-90.0..=90.0).contains(&v), "-90 to 90");
+            f32_field!("sun_yaw", sun_yaw, any, "a number");
+            f32_field!("sun_intensity", sun_intensity, not_negative, "0 or more");
+            f32_field!("sun_area", sun_area, not_negative, "0 or more");
             color_field!("sun_color", sun_color);
-            f32_field!("sky_intensity", sky_intensity);
+            f32_field!("sky_intensity", sky_intensity, not_negative, "0 or more");
             color_field!("sky_color", sky_color);
-            f32_field!("exposure", exposure);
-            f32_field!("gamma", gamma);
+            f32_field!("exposure", exposure, not_negative, "0 or more");
+            f32_field!("gamma", gamma, |v: f32| v > 0.0 && v.is_finite(), "more than 0 (usually 2.2)");
             bool_field!("aces", aces);
             bool_field!("bloom", bloom);
             bool_field!("denoise", denoise);
-            f32_field!("fog_density", fog_density);
+            f32_field!("fog_density", fog_density, not_negative, "0 or more");
             color_field!("fog_color", fog_color);
             bool_field!("ground", ground);
             color_field!("ground_color", ground_color);
             color_field!("background_color", bg_color);
             bool_field!("edges", show_edges);
             bool_field!("grid", show_grid);
-            f32_field!("aperture", aperture);
+            f32_field!("aperture", aperture, not_negative, "0 or more");
             if let Some(v) = string(a, "sky") {
                 s.env_mode = match v {
                     "uniform" => crate::env::EnvMode::Uniform,
                     "atmosphere" => crate::env::EnvMode::Atmosphere,
                     "image" => crate::env::EnvMode::Image,
-                    v => bail!("unknown sky {v:?}"),
+                    v => bail!("unknown sky {v:?}; uniform, atmosphere or image"),
                 };
                 set.push("sky");
             }
@@ -1883,10 +1991,11 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                     "sky" => BgMode::Sky,
                     "color" => BgMode::Color,
                     "transparent" => BgMode::Transparent,
-                    v => bail!("unknown background {v:?}"),
+                    v => bail!("unknown background {v:?}; sky, color or transparent"),
                 };
                 set.push("background");
             }
+            ctx.r.settings = s;
             ctx.r.reset();
             Ok(vec![text(if set.is_empty() { "No settings given".to_string() } else { format!("Set {}", set.join(", ")) })])
         }

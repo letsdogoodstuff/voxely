@@ -1021,6 +1021,25 @@ impl Editor {
         }
     }
 
+    /// Take the undo history as the volume before each of the last `max`
+    /// edits, oldest first (`v` is the volume now), so it can move into the
+    /// tree's history; the redo history is dropped.
+    pub fn take_history(&mut self, v: &Volume, max: usize) -> Vec<Volume> {
+        let mut cur = v.clone();
+        let mut past: Vec<Volume> = std::mem::take(&mut self.undo)
+            .into_iter()
+            .rev()
+            .take(max)
+            .map(|e| {
+                Self::step(&mut cur, e, false);
+                cur.clone()
+            })
+            .collect();
+        self.redo.clear();
+        past.reverse();
+        past
+    }
+
     /// Fold the edits made since the history had `len` entries into one,
     /// given the volume as it was then.
     pub fn squash(&mut self, v: &mut Volume, len: usize, before: Volume) {
