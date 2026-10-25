@@ -169,8 +169,9 @@ pub fn tools() -> Value {
             "samples": { "type": "integer", "description": "Samples per pixel (default 128; more is smoother and slower)" },
             "save_path": { "type": "string", "description": "Also save the PNG here" },
         }), &[]),
-        tool("export", "Export in one of MagicaVoxel's formats: obj/ply/mc/cube meshes, xraw/slab/qb/vox volumes, iso/2d/slice sprite images, point clouds.", json!({
-            "format": { "type": "string", "enum": ["obj", "ply", "mc", "xraw", "slab", "qb", "vox", "iso", "2d", "slice", "point", "cube"] },
+        tool("export", "Export the model: gltf (.glb, best for game engines), or MagicaVoxel's formats: obj/ply/mc/cube meshes, xraw/slab/qb/vox volumes, iso/2d/slice sprite images, point clouds.", json!({
+            "format": { "type": "string", "enum": ["gltf", "obj", "ply", "mc", "xraw", "slab", "qb", "vox", "iso", "2d", "slice", "point", "cube"],
+                "description": "gltf: a .glb for game engines (Godot, Unity, Unreal, Three.js, Bevy) with metal/roughness, emission and glass materials; use a .gltf path for JSON" },
             "path": { "type": "string", "description": "Output file (default: <workspace>/export/<project>.<ext>)" },
         }), &["format"]),
         tool("set_view_mode", "Show the modeler or the live path tracer in the window.", json!({

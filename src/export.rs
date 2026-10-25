@@ -43,6 +43,8 @@ pub enum Format {
     Slice,
     Point,
     Cube,
+    /// glTF 2.0 for game engines (voxely's own; not in MagicaVoxel).
+    Gltf,
 }
 
 impl Format {
@@ -76,6 +78,7 @@ impl Format {
             Format::Slice => "slice",
             Format::Point => "point",
             Format::Cube => "cube",
+            Format::Gltf => "gltf",
         }
     }
 
@@ -89,6 +92,7 @@ impl Format {
             Format::Slab | Format::Vox => "vox",
             Format::Qb => "qb",
             Format::Iso | Format::TwoD | Format::Slice => "png",
+            Format::Gltf => "glb",
         }
     }
 
@@ -107,6 +111,7 @@ impl Format {
             Format::Slice => "slice : Export slices",
             Format::Point => "point : Export point clouds",
             Format::Cube => "cube : Export cubes",
+            Format::Gltf => "glTF : Export for game engines (Godot, Unity, Unreal, Three.js, Bevy); .glb, or .gltf if the file name ends in .gltf",
         }
     }
 
@@ -116,6 +121,9 @@ impl Format {
         if s == "pcl" {
             return Some(Format::Point);
         }
+        if s == "gltf" || s == "glb" {
+            return Some(Format::Gltf);
+        }
         Format::ALL.into_iter().find(|f| f.name() == s)
     }
 }
@@ -123,7 +131,9 @@ impl Format {
 /// Write `scene` in `format` to `path` (extension is replaced by the
 /// format's). Returns every file written (e.g. obj+mtl+png).
 pub fn export(format: Format, scene: &Scene, path: &Path) -> Result<Vec<PathBuf>> {
-    let path = path.with_extension(format.extension());
+    // glTF keeps a `.gltf` name (JSON) and otherwise writes `.glb`.
+    let keep = format == Format::Gltf && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gltf"));
+    let path = if keep { path.to_path_buf() } else { path.with_extension(format.extension()) };
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -146,6 +156,7 @@ pub fn export(format: Format, scene: &Scene, path: &Path) -> Result<Vec<PathBuf>
         Format::Slice => save_image(&path, &slices(v, pal))?,
         Format::Point => write_file(&path, points(v, pal).as_bytes())?,
         Format::Cube => write_file(&path, cubes(v, pal).as_bytes())?,
+        Format::Gltf => crate::gltf::write(scene, &path)?,
     }
     Ok(files)
 }
@@ -175,7 +186,7 @@ const SPRITE_SHADOW: bool = true;
 // ---------------------------------------------------------------- helpers
 
 /// The six face directions: +x, -x, +y, -y, +z, -z.
-fn dir(n: usize) -> IVec3 {
+pub(crate) fn dir(n: usize) -> IVec3 {
     let mut d = IVec3::ZERO;
     d[n / 2] = if n % 2 == 0 { 1 } else { -1 };
     d
@@ -221,16 +232,16 @@ fn ply_vertex(out: &mut String, p: [f64; 3], c: [u8; 3]) {
 
 /// A rectangle of exposed voxel faces of one color, corners counter-clockwise
 /// seen from outside, in voxel units.
-struct Quad {
+pub(crate) struct Quad {
     /// Index into `dir`.
-    normal: usize,
-    color: u8,
-    corners: [IVec3; 4],
+    pub normal: usize,
+    pub color: u8,
+    pub corners: [IVec3; 4],
 }
 
 /// Exposed faces merged into maximal rectangles per color, plane and
 /// direction (io_obj `merge 1`).
-fn greedy_quads(v: &Volume) -> Vec<Quad> {
+pub(crate) fn greedy_quads(v: &Volume) -> Vec<Quad> {
     let d = v.dims;
     let mut quads = Vec::new();
     for n in 0..6 {

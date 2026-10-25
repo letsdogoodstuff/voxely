@@ -69,10 +69,26 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Selection | `select`, `move_selection` |
 | History | `undo`, `redo` |
 | Viewing | `set_camera`, `screenshot` (fast modeler image), `set_render_settings`, `render` (path traced), `set_view_mode` |
-| Export | `export`: MagicaVoxel's formats: obj, ply, mc, cube (meshes), xraw, slab, qb, vox (volumes), iso, 2d, slice (sprite images), point (point cloud) |
+| Export | `export`: **gltf** (`.glb` for game engines), plus MagicaVoxel's formats: obj, ply, mc, cube (meshes), xraw, slab, qb, vox (volumes), iso, 2d, slice (sprite images), point (point cloud) |
 
 Conventions:
 - Coordinates are voxel cells `[x, y, z]`, with z up.
 - Colors are palette indices 1–255, or `"#rrggbb"`, which picks the nearest palette color.
   Use `set_palette_colors` for exact colors.
 - `screenshot` and `render` return PNG images that the agent can see.
+
+## glTF export
+
+The Export box's **glTF (.glb)** button (and the `export` tool with `format: "gltf"`) writes one
+self-contained `.glb` that Godot, Unity (glTFast), Unreal, Three.js, Babylon and Bevy import directly.
+Name the file `.gltf` instead to get readable JSON with the data embedded.
+
+- Mesh: same-color faces merged, 1 voxel = 0.1 m, Y up, centered, front facing +Z.
+- Colors: the palette as a 256x1 texture with nearest filtering, so colors stay crisp.
+- Materials: one per distinct voxely material, on glTF's metal/roughness model:
+  metal maps to metallic/roughness, emit to emissive (`KHR_materials_emissive_strength`),
+  glass to `KHR_materials_transmission` + `KHR_materials_ior`.
+  Cloud materials have no glTF equivalent and become rough transmissive surfaces.
+- Structure: a root node named after the project, with the model as a child node.
+
+Exports pass the Khronos glTF Validator with no errors or warnings.

@@ -3,6 +3,7 @@ mod control;
 mod edit;
 mod env;
 mod export;
+mod gltf;
 mod gpu;
 mod mcp;
 mod modeler;

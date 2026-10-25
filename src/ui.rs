@@ -951,7 +951,12 @@ pub fn project_panel(
         ui.spacing_mut().indent = 6.0;
         ui.spacing_mut().button_padding = egui::vec2(2.0, 1.0);
         CollapsingHeader::new("Export").default_open(true).show(ui, |ui| {
-            // Three buttons per row, sized to fit the column.
+            // glTF first: voxely's format for game engines.
+            let gltf = crate::export::Format::Gltf;
+            if ui.add_sized([ui.available_width(), 20.0], egui::Button::new("glTF (.glb)")).on_hover_text(gltf.hint()).clicked() {
+                cmds.push(Command::Export(gltf));
+            }
+            // MagicaVoxel's formats, three per row, sized to fit the column.
             let w = ((ui.available_width() - 8.0) / 3.0).floor();
             egui::Grid::new("export_formats").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
                 for (k, f) in crate::export::Format::ALL.into_iter().enumerate() {
