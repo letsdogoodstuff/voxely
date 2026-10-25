@@ -1213,8 +1213,8 @@ pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, text: &mut Tr
     heading(ui, "Edit");
     ui.horizontal(|ui| {
         ui.selectable_value(&mut text.tab, EditTab::All, "All").on_hover_text("Show All Options");
-        ui.selectable_value(&mut text.tab, EditTab::Transform, "Transform").on_hover_text("Show Transform Options");
-        ui.selectable_value(&mut text.tab, EditTab::Modify, "Modify").on_hover_text("Show Modification Options");
+        ui.selectable_value(&mut text.tab, EditTab::Transform, "Trans").on_hover_text("Show Transform Options");
+        ui.selectable_value(&mut text.tab, EditTab::Modify, "Mod").on_hover_text("Show Modification Options");
     });
     let tab = text.tab;
     egui::ScrollArea::vertical().show(ui, |ui| {
