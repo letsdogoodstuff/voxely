@@ -1021,7 +1021,138 @@ pub(crate) fn apply_op(op: Op, scene: &Scene, editor: &Editor) -> Option<crate::
         Op::Flood => ops::flood(v, c),
         Op::Dilate => ops::dilate(v),
         Op::Erode => ops::erode(v),
+        Op::Fractal | Op::Mask | Op::Tex => return apply_edit(op, scene, editor).ok().map(|(v, _)| v),
     })
+}
+
+/// An Edit panel button, done the way MagicaVoxel does it: the new volume,
+/// and the new selection when the edit worked on the selected voxels (None
+/// keeps the selection as it is). Errs with a message to show.
+pub(crate) fn apply_edit(op: Op, scene: &Scene, editor: &Editor) -> Result<(crate::scene::Volume, Option<Mask>), String> {
+    use crate::scene::Volume;
+    let v = &scene.volume;
+    let (sel, c) = (editor.selection(), editor.color);
+    let too_big = || format!("the canvas would exceed {} voxels per side", ops::MAX_DIM);
+    // Edits on the selected voxels as a layer the size of the canvas.
+    let layered = |f: &dyn Fn(&Volume) -> Volume| match sel {
+        None => (f(v), None),
+        Some(s) => {
+            let (new, mask) = ops::merge(v, s, &f(&ops::layer(v, s)));
+            (new, Some(mask))
+        }
+    };
+    // Edits on the selected voxels' box, put back centered.
+    let lifted = |f: &dyn Fn(&Volume) -> Option<Volume>| match sel {
+        None => f(v).map(|n| (n, None)).ok_or_else(too_big),
+        Some(s) => ops::on_lifted(v, s, f).map(|(n, m)| (n, Some(m))).ok_or_else(too_big),
+    };
+    let pattern = || editor.pattern.as_ref().map(|p| &p.volume).ok_or_else(|| "pick a pattern first (the Patt tab)".to_string());
+    Ok(match op {
+        Op::Full => layered(&|l| ops::full_volume(l, c)),
+        Op::Fill => (ops::fill(v, sel, c), None),
+        Op::Clear => (ops::clear(v, sel), None),
+        Op::Reverse => layered(&|l| ops::reverse(l, c)),
+        Op::Double => lifted(&ops::double)?,
+        Op::Half => lifted(&|s| Some(ops::half(s)))?,
+        Op::Flip(a) => lifted(&|s| Some(ops::flip(s, a)))?,
+        Op::Rotate(a) => lifted(&|s| Some(ops::rotate(s, a)))?,
+        Op::Fit => (ops::fit(v).ok_or("the model is empty")?, None),
+        Op::Loop(a, d) => layered(&|l| ops::loop_shift(l, None, a, d)),
+        Op::Mirror(a) => match sel {
+            None => (ops::mirror_half(v, a), None),
+            Some(s) => {
+                let (sub, lo) = ops::lift(v, s).ok_or("nothing selected")?;
+                let (new, mask) = ops::place(v, s, &ops::mirror_extend(&sub, a).ok_or_else(too_big)?, lo);
+                (new, Some(mask))
+            }
+        },
+        Op::Diagonal(a) => match sel {
+            None => (ops::diagonal_half(v, a), None),
+            Some(s) => {
+                // The canvas squares up as it would without a selection.
+                let dims = ops::diagonal_half(&Volume::new(v.dims), a).dims;
+                let (mut sq, mut sq_sel) = (Volume::new(dims), Mask::new(dims));
+                for (i, &cell) in v.cells.iter().enumerate() {
+                    let j = sq.index(v.position(i));
+                    sq.set_index(j, cell);
+                    sq_sel.set(j, s[i]);
+                }
+                let (new, mask) = ops::on_lifted(&sq, &sq_sel, |l| Some(ops::diagonal_half(l, a))).ok_or("nothing selected")?;
+                (new, Some(mask))
+            }
+        },
+        // Generators replace the model (or the selection).
+        Op::Shape(k) => layered(&|l| ops::shape(&Volume::new(l.dims), k, c)),
+        Op::Maze => layered(&|l| ops::maze(&Volume::new(l.dims), c, 4)),
+        Op::Perlin => {
+            let seed = seed();
+            layered(&|l| ops::perlin(&Volume::new(l.dims), c, seed))
+        }
+        Op::Hull => layered(&ops::hull),
+        Op::Flood => layered(&|l| ops::flood(l, c)),
+        Op::Dilate => layered(&|l| ops::dilate_box(l, c)),
+        Op::Erode => layered(&ops::erode_box),
+        Op::Fractal => {
+            let p = pattern()?;
+            lifted(&|s| ops::fractal(s, p))?
+        }
+        Op::Mask => {
+            let p = pattern()?;
+            layered(&|l| ops::mask_pattern(l, p))
+        }
+        Op::Tex => {
+            let p = pattern()?;
+            layered(&|l| ops::texture(l, p))
+        }
+    })
+}
+
+/// A Scale / Shear / Rotate / Repeat field of the Edit panel, done the way
+/// MagicaVoxel does it (see `apply_edit`).
+pub(crate) fn transform_edit(kind: ui::TransformKind, text: &str, v: &crate::scene::Volume, sel: Option<&Mask>) -> Result<(crate::scene::Volume, Option<Mask>), String> {
+    let bad = || format!("Expected [axes] [values], e.g. \"xyz 2\", got {text:?}");
+    let (axes, nums) = ops::parse_axes_args(text).ok_or_else(bad)?;
+    let first = axes.iter().position(|&a| a).ok_or_else(bad)?;
+    let n = |k: usize| nums.get(k).copied();
+    let limit = || format!("{text:?} would make an edge 0 or over {} voxels", ops::MAX_DIM);
+    let lifted = |f: &dyn Fn(&crate::scene::Volume) -> Option<crate::scene::Volume>| match sel {
+        Some(s) => ops::on_lifted(v, s, f).map(|(n, m)| (n, Some(m))).ok_or_else(limit),
+        None => {
+            let all = ops::layer_mask(v);
+            ops::on_lifted(v, &all, f).map(|(n, _)| (n, None)).ok_or_else(limit)
+        }
+    };
+    match kind {
+        ui::TransformKind::Scale => {
+            let f = n(0).ok_or_else(bad)?;
+            match sel {
+                None => ops::scale_content(v, axes, f).map(|n| (n, None)).ok_or_else(limit),
+                Some(_) => lifted(&|s| ops::scale_floor(s, axes, f)),
+            }
+        }
+        ui::TransformKind::Shear => {
+            let a = n(0).ok_or_else(bad)?;
+            let b = n(1).unwrap_or(a);
+            Ok(match sel {
+                None => (ops::shear_clip(v, None, first, a, b), None),
+                Some(s) => {
+                    let (new, mask) = ops::merge(v, s, &ops::shear_clip(&ops::layer(v, s), None, first, a, b));
+                    (new, Some(mask))
+                }
+            })
+        }
+        ui::TransformKind::Rotate => {
+            let deg = n(0).ok_or_else(bad)?;
+            lifted(&|s| Some(ops::rotate_angle(s, first, deg)))
+        }
+        ui::TransformKind::Repeat => {
+            let count = n(0).ok_or_else(bad)?.max(1.0) as u32;
+            match sel {
+                None => ops::repeat(v, axes, count).map(|n| (n, None)).ok_or_else(limit),
+                Some(_) => lifted(&|s| ops::repeat(s, axes, count)),
+            }
+        }
+    }
 }
 
 /// A seed that changes every call, for Perlin and Rand.
@@ -1324,12 +1455,10 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             }
         }
         Command::Tree(op) => tree_op(op, scene, ed),
-        Command::Op(op) => match apply_op(op, scene, &ed.editor) {
-            Some(new) => ed.editor.commit(&mut scene.volume, new),
-            None => {
-                if op == Op::Double {
-                    ed.fail(format!("2X: the canvas would exceed {} voxels per side", ops::MAX_DIM));
-                }
+        Command::Op(op) => match apply_edit(op, scene, &ed.editor) {
+            Ok((new, sel)) => ed.editor.commit_select(&mut scene.volume, new, sel),
+            Err(e) => {
+                ed.fail(format!("{}: {e}", op.name()));
                 false
             }
         },
@@ -1427,10 +1556,10 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             set_material(r, scene, i, crate::scene::material(i as u32, scene.palette[i as usize], None));
             false
         }
-        Command::Transform(kind, text) => match transform(kind, &text, &scene.volume) {
-            Some(new) => ed.editor.commit(&mut scene.volume, new),
-            None => {
-                ed.fail(format!("Expected [axes] [values], e.g. \"xyz 2\", got {text:?}"));
+        Command::Transform(kind, text) => match transform_edit(kind, &text, &scene.volume, ed.editor.selection()) {
+            Ok((new, sel)) => ed.editor.commit_select(&mut scene.volume, new, sel),
+            Err(e) => {
+                ed.fail(e);
                 false
             }
         },

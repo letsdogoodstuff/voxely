@@ -448,6 +448,16 @@ impl Editor {
         true
     }
 
+    /// `commit`, then make `sel` the selection when given (an edit that
+    /// worked on the selected voxels selects its result).
+    pub fn commit_select(&mut self, v: &mut Volume, new: Volume, sel: Option<Mask>) -> bool {
+        let changed = self.commit(v, new);
+        if let Some(mask) = sel.filter(|m| m.dims() == v.dims) {
+            self.set_selection(v, mask);
+        }
+        changed
+    }
+
     /// Drop the selection if it no longer matches the volume.
     fn fit_selection(&mut self, v: &Volume) {
         if self.sel_count > 0 {

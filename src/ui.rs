@@ -37,6 +37,41 @@ pub enum Op {
     Flood,
     Dilate,
     Erode,
+    /// Pattern edits: each voxel becomes the pattern / keep the voxels under
+    /// the tiled pattern / color them by it.
+    Fractal,
+    Mask,
+    Tex,
+}
+
+impl Op {
+    /// The button's name, for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Op::Full => "Full",
+            Op::Fill => "Fill",
+            Op::Clear => "Clear",
+            Op::Reverse => "Rev",
+            Op::Double => "2X",
+            Op::Half => "1/2",
+            Op::Flip(_) => "Flip",
+            Op::Rotate(_) => "Rot",
+            Op::Fit => "Fit",
+            Op::Loop(..) => "Loop",
+            Op::Mirror(_) => "Mirror",
+            Op::Diagonal(_) => "Diagonal",
+            Op::Shape(_) => "Shape",
+            Op::Maze => "Maze",
+            Op::Perlin => "Perlin",
+            Op::Hull => "Hull",
+            Op::Flood => "Flood",
+            Op::Dilate => "Dilate",
+            Op::Erode => "Erode",
+            Op::Fractal => "Fractal",
+            Op::Mask => "Mask",
+            Op::Tex => "Tex",
+        }
+    }
 }
 
 /// Something a button or hotkey asks the app to do.
@@ -136,11 +171,12 @@ pub struct TransformText {
     pub shear: String,
     pub rotate: String,
     pub repeat: String,
+    pub tab: EditTab,
 }
 
 impl Default for TransformText {
     fn default() -> Self {
-        TransformText { scale: "xyz 2".into(), shear: "z 0.2 0.2".into(), rotate: "z 45".into(), repeat: "xy 2".into() }
+        TransformText { scale: "xyz 2".into(), shear: "z 0.2 0.2".into(), rotate: "z 45".into(), repeat: "xy 2".into(), tab: EditTab::All }
     }
 }
 
@@ -1116,110 +1152,188 @@ pub fn brush_panel(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
     }
 }
 
-fn axis_row(ui: &mut Ui, cmds: &mut Vec<Command>, op: fn(usize) -> Op) {
+fn axis_row(ui: &mut Ui, cmds: &mut Vec<Command>, hint: &str, held: bool, op: fn(usize) -> Op) {
     ui.horizontal(|ui| {
         for (axis, n) in ["X", "Y", "Z"].iter().enumerate() {
-            command(ui, cmds, n, "", Command::Op(op(axis)));
+            if held {
+                command_repeat(ui, cmds, n, hint, Command::Op(op(axis)));
+            } else {
+                command(ui, cmds, n, hint, Command::Op(op(axis)));
+            }
         }
     });
 }
 
-/// Right column in the modeler: MagicaVoxel's Edit panel.
+/// A button that repeats while held, like MagicaVoxel's Loop, Mirror,
+/// Diagonal, Dilate and Erode buttons.
+fn command_repeat(ui: &mut Ui, cmds: &mut Vec<Command>, label: &str, hint: &str, cmd: Command) {
+    const DELAY: f64 = 0.4;
+    const EVERY: f64 = 0.1;
+    let b = ui.button(label);
+    let b = if hint.is_empty() { b } else { b.on_hover_text(hint) };
+    let id = b.id.with("repeat");
+    let now = ui.input(|i| i.time);
+    let state: Option<(f64, u32)> = ui.data(|d| d.get_temp(id));
+    if b.is_pointer_button_down_on() {
+        let (start, fired) = state.unwrap_or((now, 0));
+        let due = ((now - start - DELAY) / EVERY).floor() as i64 + 1;
+        let fired = if due > fired as i64 {
+            cmds.push(cmd);
+            fired + 1
+        } else {
+            fired
+        };
+        ui.data_mut(|d| d.insert_temp(id, (start, fired)));
+        ui.ctx().request_repaint();
+    } else {
+        if state.is_some() {
+            ui.data_mut(|d| d.remove::<(f64, u32)>(id));
+        }
+        // A plain click; a hold already fired.
+        if b.clicked() && state.is_none_or(|(_, fired)| fired == 0) {
+            cmds.push(cmd);
+        }
+    }
+}
+
+/// Which sections the Edit panel shows (MagicaVoxel's All / Transform /
+/// Modify tabs).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum EditTab {
+    #[default]
+    All,
+    Transform,
+    Modify,
+}
+
+/// Right column in the modeler: MagicaVoxel's Edit panel. With a
+/// selection, the edits act on the selected voxels (see `app::apply_edit`).
 pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, text: &mut TransformText, cmds: &mut Vec<Command>) {
     use crate::ops::Shape;
     heading(ui, "Edit");
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut text.tab, EditTab::All, "All").on_hover_text("Show All Options");
+        ui.selectable_value(&mut text.tab, EditTab::Transform, "Transform").on_hover_text("Show Transform Options");
+        ui.selectable_value(&mut text.tab, EditTab::Modify, "Modify").on_hover_text("Show Modification Options");
+    });
+    let tab = text.tab;
     egui::ScrollArea::vertical().show(ui, |ui| {
-        CollapsingHeader::new("Tool").default_open(true).show(ui, |ui| {
-            egui::Grid::new("tool_ops").num_columns(2).show(ui, |ui| {
-                command(ui, cmds, "Full", "Fill the whole canvas [U]", Command::Op(Op::Full));
-                command(ui, cmds, "Fill", "Recolor voxels with the current color [I]", Command::Op(Op::Fill));
-                ui.end_row();
-                command(ui, cmds, "Clear", "Delete voxels [Delete]", Command::Op(Op::Clear));
-                command(ui, cmds, "Rev", "Swap empty and solid space", Command::Op(Op::Reverse));
-                ui.end_row();
-                command(ui, cmds, "2X", "Double size", Command::Op(Op::Double));
-                command(ui, cmds, "1/2", "Half size", Command::Op(Op::Half));
-                ui.end_row();
+        if tab == EditTab::All {
+            CollapsingHeader::new("Tool").default_open(true).show(ui, |ui| {
+                egui::Grid::new("tool_ops").num_columns(2).show(ui, |ui| {
+                    command(ui, cmds, "Full", "Full Volume [U]", Command::Op(Op::Full));
+                    command(ui, cmds, "Fill", "Fill Voxels with Same Color [I]", Command::Op(Op::Fill));
+                    ui.end_row();
+                    command(ui, cmds, "Clear", "Clear Voxels [Backspace/Delete]", Command::Op(Op::Clear));
+                    command(ui, cmds, "Rev", "Reverse Empty Space", Command::Op(Op::Reverse));
+                    ui.end_row();
+                    command(ui, cmds, "2X", "Double Size", Command::Op(Op::Double));
+                    command(ui, cmds, "1/2", "Half Size", Command::Op(Op::Half));
+                    ui.end_row();
+                });
             });
-        });
-        CollapsingHeader::new("Select").default_open(true).show(ui, |ui| {
-            ui.weak(match e.selected_count() {
-                0 => "nothing selected".to_string(),
-                n => format!("{n} selected"),
+            CollapsingHeader::new("Select").default_open(true).show(ui, |ui| {
+                ui.weak(match e.selected_count() {
+                    0 => "nothing selected".to_string(),
+                    n => format!("{n} selected"),
+                });
+                egui::Grid::new("select_ops").num_columns(2).show(ui, |ui| {
+                    command(ui, cmds, "All", "Select All [Ctrl+A]", Command::SelectAll);
+                    command(ui, cmds, "Inv", "Select Inverse [Ctrl+I]", Command::SelectInvert);
+                    ui.end_row();
+                    command(ui, cmds, "None", "Select None [Ctrl+D]", Command::SelectNone);
+                    ui.end_row();
+                    command(ui, cmds, "Copy", "Copy Voxels [Ctrl+C]", Command::Copy);
+                    command(ui, cmds, "Cut", "Cut Voxels [Ctrl+X]", Command::Cut);
+                    ui.end_row();
+                    if ui.add_enabled(e.has_clipboard(), egui::Button::new("Paste")).on_hover_text("Paste Voxels [Ctrl+V]").clicked() {
+                        cmds.push(Command::Paste);
+                    }
+                    ui.end_row();
+                });
             });
-            egui::Grid::new("select_ops").num_columns(2).show(ui, |ui| {
-                command(ui, cmds, "All", "Ctrl+A", Command::SelectAll);
-                command(ui, cmds, "Inv", "Ctrl+I", Command::SelectInvert);
-                ui.end_row();
-                command(ui, cmds, "None", "Ctrl+D", Command::SelectNone);
-                ui.end_row();
-                command(ui, cmds, "Copy", "Ctrl+C", Command::Copy);
-                command(ui, cmds, "Cut", "Ctrl+X", Command::Cut);
-                ui.end_row();
-                if ui.add_enabled(e.has_clipboard(), egui::Button::new("Paste")).on_hover_text("Ctrl+V").clicked() {
-                    cmds.push(Command::Paste);
+            ui.separator();
+        }
+        if tab != EditTab::Modify {
+            CollapsingHeader::new("Rot").show(ui, |ui| axis_row(ui, cmds, "Rot : Rotate Model 90 Degrees", false, Op::Rotate));
+            CollapsingHeader::new("Flip").show(ui, |ui| axis_row(ui, cmds, "Flip : Flip Model", false, Op::Flip));
+            CollapsingHeader::new("Loop").show(ui, |ui| {
+                for dir in [1, -1] {
+                    ui.horizontal(|ui| {
+                        for (axis, n) in ["X", "Y", "Z"].iter().enumerate() {
+                            let label = format!("{}{n}", if dir > 0 { "+" } else { "-" });
+                            command_repeat(ui, cmds, &label, "Loop : Move Model", Command::Op(Op::Loop(axis, dir)));
+                        }
+                    });
                 }
-                ui.end_row();
             });
-        });
-        CollapsingHeader::new("Rot").show(ui, |ui| axis_row(ui, cmds, Op::Rotate));
-        CollapsingHeader::new("Flip").show(ui, |ui| axis_row(ui, cmds, Op::Flip));
-        CollapsingHeader::new("Loop").show(ui, |ui| {
-            for (axis, n) in ["X", "Y", "Z"].iter().enumerate() {
-                ui.horizontal(|ui| {
-                    command(ui, cmds, &format!("-{n}"), "", Command::Op(Op::Loop(axis, -1)));
-                    command(ui, cmds, &format!("+{n}"), "", Command::Op(Op::Loop(axis, 1)));
+            for (label, hint, kind) in [
+                ("Scale", "Scale Model : [Axis] [Scale]", TransformKind::Scale),
+                ("Shear", "Shear Model : [Axis] [Scale]", TransformKind::Shear),
+                ("Rotate", "Rotate Model : [Axis] [Angle]", TransformKind::Rotate),
+                ("Repeat", "Repeat Model : [Axis] [Scale]", TransformKind::Repeat),
+            ] {
+                let field = match kind {
+                    TransformKind::Scale => &mut text.scale,
+                    TransformKind::Shear => &mut text.shear,
+                    TransformKind::Rotate => &mut text.rotate,
+                    TransformKind::Repeat => &mut text.repeat,
+                };
+                CollapsingHeader::new(label).show(ui, |ui| {
+                    let r = ui.add(egui::TextEdit::singleline(field).desired_width(110.0)).on_hover_text(format!("{hint} : apply [Enter]"));
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        cmds.push(Command::Transform(kind, field.clone()));
+                    }
                 });
             }
-        });
-        for (label, hint, kind, field) in [
-            ("Scale", "Scale model : [axis] [scale], e.g. xyz 2", TransformKind::Scale, &mut text.scale),
-            ("Shear", "Shear model : [axis] [scale], e.g. z 0.2 0.2", TransformKind::Shear, &mut text.shear),
-            ("Rotate", "Rotate model : [axis] [angle], e.g. z 45", TransformKind::Rotate, &mut text.rotate),
-            ("Repeat", "Repeat model : [axis] [count], e.g. xy 2", TransformKind::Repeat, &mut text.repeat),
-        ] {
-            CollapsingHeader::new(label).show(ui, |ui| {
-                let r = ui.add(egui::TextEdit::singleline(field).desired_width(110.0)).on_hover_text(format!("{hint} : apply [Enter]"));
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    cmds.push(Command::Transform(kind, field.clone()));
-                }
+        }
+        if tab == EditTab::All {
+            ui.separator();
+        }
+        if tab != EditTab::Transform {
+            CollapsingHeader::new("Mirror").show(ui, |ui| axis_row(ui, cmds, "Mirror", true, Op::Mirror));
+            CollapsingHeader::new("Diagonal").show(ui, |ui| axis_row(ui, cmds, "Diagonal", true, Op::Diagonal));
+            CollapsingHeader::new("Shape").show(ui, |ui| {
+                egui::Grid::new("shape_ops").num_columns(2).show(ui, |ui| {
+                    command(ui, cmds, "Elli", "Elli : Ellipsoid", Command::Op(Op::Shape(Shape::Ellipsoid)));
+                    command(ui, cmds, "Cyli", "Cyli : Cylinder", Command::Op(Op::Shape(Shape::Cylinder)));
+                    ui.end_row();
+                    command(ui, cmds, "Pyra", "Pyra : Pyramid", Command::Op(Op::Shape(Shape::Pyramid)));
+                    command(ui, cmds, "Cone", "Cone : Cone", Command::Op(Op::Shape(Shape::Cone)));
+                    ui.end_row();
+                    command(ui, cmds, "Maze", "Maze : Maze", Command::Op(Op::Maze));
+                    command(ui, cmds, "Perlin", "Perlin : Perlin Noise", Command::Op(Op::Perlin));
+                    ui.end_row();
+                    command(ui, cmds, "Fractal", "Fractal : Fractal Model with Patterns", Command::Op(Op::Fractal));
+                    ui.end_row();
+                });
+            });
+            CollapsingHeader::new("Modify").show(ui, |ui| {
+                egui::Grid::new("modify_ops").num_columns(2).show(ui, |ui| {
+                    command(ui, cmds, "Hull", "Hull : Remove All Invisible Voxels", Command::Op(Op::Hull));
+                    command(ui, cmds, "Flood", "Flood : Flood Fill All Invisible Space", Command::Op(Op::Flood));
+                    ui.end_row();
+                    command(ui, cmds, "Mask", "Mask : Mask Model with Patterns", Command::Op(Op::Mask));
+                    command(ui, cmds, "Tex", "Tex : Texture Model with Patterns", Command::Op(Op::Tex));
+                    ui.end_row();
+                    command_repeat(ui, cmds, "Dilate", "Dilat : Dilation", Command::Op(Op::Dilate));
+                    command_repeat(ui, cmds, "Erode", "Erode : Erosion", Command::Op(Op::Erode));
+                    ui.end_row();
+                });
             });
         }
-        CollapsingHeader::new("Mirror").show(ui, |ui| axis_row(ui, cmds, Op::Mirror));
-        CollapsingHeader::new("Diagonal").show(ui, |ui| axis_row(ui, cmds, Op::Diagonal));
-        CollapsingHeader::new("Shape").show(ui, |ui| {
-            egui::Grid::new("shape_ops").num_columns(2).show(ui, |ui| {
-                command(ui, cmds, "Elli", "Ellipsoid", Command::Op(Op::Shape(Shape::Ellipsoid)));
-                command(ui, cmds, "Cyli", "Cylinder", Command::Op(Op::Shape(Shape::Cylinder)));
-                ui.end_row();
-                command(ui, cmds, "Pyra", "Pyramid", Command::Op(Op::Shape(Shape::Pyramid)));
-                command(ui, cmds, "Cone", "Cone", Command::Op(Op::Shape(Shape::Cone)));
-                ui.end_row();
-                command(ui, cmds, "Maze", "Maze", Command::Op(Op::Maze));
-                command(ui, cmds, "Perlin", "Perlin noise", Command::Op(Op::Perlin));
-                ui.end_row();
+        if tab == EditTab::All {
+            CollapsingHeader::new("View").show(ui, |ui| {
+                ui.checkbox(&mut o.constant, "Constant shading");
+                ui.checkbox(&mut o.fade, "Fade").on_hover_text("Fade Background Objects");
+                let mut bg = o.background.to_array();
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_rgb(&mut bg);
+                    ui.label("Background");
+                });
+                o.background = bg.into();
             });
-        });
-        CollapsingHeader::new("Modify").show(ui, |ui| {
-            egui::Grid::new("modify_ops").num_columns(2).show(ui, |ui| {
-                command(ui, cmds, "Hull", "Remove all invisible voxels", Command::Op(Op::Hull));
-                command(ui, cmds, "Flood", "Fill all enclosed space", Command::Op(Op::Flood));
-                ui.end_row();
-                command(ui, cmds, "Dilate", "Grow by one voxel", Command::Op(Op::Dilate));
-                command(ui, cmds, "Erode", "Shrink by one voxel", Command::Op(Op::Erode));
-                ui.end_row();
-            });
-        });
-        CollapsingHeader::new("View").show(ui, |ui| {
-            ui.checkbox(&mut o.constant, "Constant shading");
-            ui.checkbox(&mut o.fade, "Fade").on_hover_text("Fade Background Objects");
-            let mut bg = o.background.to_array();
-            ui.horizontal(|ui| {
-                ui.color_edit_button_rgb(&mut bg);
-                ui.label("Background");
-            });
-            o.background = bg.into();
-        });
+        }
     });
 }
 

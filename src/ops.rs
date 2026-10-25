@@ -17,7 +17,7 @@ fn selected(sel: Option<&Mask>, i: usize) -> bool {
     sel.is_none_or(|s| s[i])
 }
 
-fn map(v: &Volume, f: impl Fn(usize, u8) -> u8) -> Volume {
+fn map(v: &Volume, mut f: impl FnMut(usize, u8) -> u8) -> Volume {
     let mut out = Volume::new(v.dims);
     for (i, &c) in v.cells.iter().enumerate() {
         out.set_index(i, f(i, c));
@@ -60,24 +60,14 @@ pub fn double(v: &Volume) -> Option<Volume> {
     Some(out)
 }
 
-/// Scale down by two; each 2x2x2 block keeps its most common color, so
-/// thin details survive.
+/// Scale down by two; each 2x2x2 block keeps its first voxel in x, then
+/// y, then z order, like MagicaVoxel.
 pub fn half(v: &Volume) -> Volume {
     let dims = (v.dims + IVec3::ONE) / 2;
     let mut out = Volume::new(dims);
     for i in 0..out.cells.len() {
         let p = out.position(i);
-        let mut counts: Vec<(u8, u32)> = Vec::new();
-        for k in 0..8 {
-            let c = v.get(p * 2 + IVec3::new(k & 1, (k >> 1) & 1, k >> 2));
-            if c != 0 {
-                match counts.iter_mut().find(|e| e.0 == c) {
-                    Some(e) => e.1 += 1,
-                    None => counts.push((c, 1)),
-                }
-            }
-        }
-        if let Some(&(c, _)) = counts.iter().max_by_key(|e| e.1) {
+        if let Some(c) = (0..8).map(|k| v.get(p * 2 + IVec3::new(k & 1, (k >> 1) & 1, k >> 2))).find(|&c| c != 0) {
             out.set_index(i, c);
         }
     }
@@ -710,6 +700,263 @@ pub fn perlin(v: &Volume, color: u8, seed: u32) -> Volume {
     })
 }
 
+// ---- MagicaVoxel's Edit panel, as the GUI buttons do it ----
+//
+// The functions above keep the behavior the MCP tools document. The ones
+// below match MagicaVoxel 0.99.6 exactly, for the Edit panel: with a
+// selection, an edit acts on the selected voxels as a floating layer (they
+// are lifted out, edited, and put back over the rest, and the result is the
+// new selection).
+
+/// Every cell becomes `color`: MagicaVoxel's Full [U] overwrites the model.
+pub fn full_volume(v: &Volume, color: u8) -> Volume {
+    map(v, |_, _| color)
+}
+
+/// Mirror: the low half along `axis` is copied, reflected, over the high
+/// half (the middle slice of an odd canvas stays).
+pub fn mirror_half(v: &Volume, axis: usize) -> Volume {
+    let n = v.dims[axis];
+    map(v, |i, c| {
+        let mut p = v.position(i);
+        if p[axis] > n - 1 - p[axis] {
+            p[axis] = n - 1 - p[axis];
+            v.get(p)
+        } else {
+            c
+        }
+    })
+}
+
+/// Mirror a lifted selection: it gets its reflection appended on the high
+/// side of `axis`, doubling it.
+pub fn mirror_extend(v: &Volume, axis: usize) -> Option<Volume> {
+    let mut dims = v.dims;
+    dims[axis] *= 2;
+    if dims[axis] > MAX_DIM {
+        return None;
+    }
+    let mut out = Volume::new(dims);
+    for (p, c) in v.filled() {
+        let mut q = p;
+        q[axis] = dims[axis] - 1 - p[axis];
+        out.set(p, c);
+        out.set(q, c);
+    }
+    Some(out)
+}
+
+/// Diagonal: with (u, w) the other two axes after `axis`, the canvas
+/// becomes square in u and w and the cells with w > u take their
+/// transposed cell, so the side below the u = w diagonal is copied over
+/// the side above it.
+pub fn diagonal_half(v: &Volume, axis: usize) -> Volume {
+    let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+    let n = v.dims[u].max(v.dims[w]);
+    let mut dims = v.dims;
+    dims[u] = n;
+    dims[w] = n;
+    let mut out = Volume::new(dims);
+    for i in 0..out.cells.len() {
+        let mut p = out.position(i);
+        if p[w] > p[u] {
+            (p[u], p[w]) = (p[w], p[u]);
+        }
+        let c = v.get(p);
+        if c != 0 {
+            out.set_index(i, c);
+        }
+    }
+    out
+}
+
+const BOX: [IVec3; 26] = {
+    let mut out = [IVec3::ZERO; 26];
+    let mut k = 0;
+    let mut i = 0;
+    while i < 27 {
+        if i != 13 {
+            out[k] = IVec3::new(i % 3 - 1, (i / 3) % 3 - 1, i / 9 - 1);
+            k += 1;
+        }
+        i += 1;
+    }
+    out
+};
+
+/// Dilation: every empty cell touching a voxel (also across edges and
+/// corners) gets `color`.
+pub fn dilate_box(v: &Volume, color: u8) -> Volume {
+    map(v, |i, c| {
+        let p = v.position(i);
+        if c != 0 || BOX.iter().all(|&n| v.get(p + n) == 0) { c } else { color }
+    })
+}
+
+/// Erosion: a voxel stays only if all 26 cells around it are solid (the
+/// outside of the canvas is empty).
+pub fn erode_box(v: &Volume) -> Volume {
+    map(v, |i, c| {
+        let p = v.position(i);
+        if c != 0 && BOX.iter().all(|&n| v.get(p + n) != 0) { c } else { 0 }
+    })
+}
+
+/// Fractal: every voxel becomes a copy of the pattern in its own color, so
+/// the canvas grows by the pattern's size. None past `MAX_DIM`.
+pub fn fractal(v: &Volume, pattern: &Volume) -> Option<Volume> {
+    let dims = v.dims * pattern.dims;
+    if dims.max_element() > MAX_DIM {
+        return None;
+    }
+    let mut out = Volume::new(dims);
+    for (p, c) in v.filled() {
+        for (q, _) in pattern.filled() {
+            out.set(p * pattern.dims + q, c);
+        }
+    }
+    Some(out)
+}
+
+/// The pattern's cell over `p` when it is tiled from the canvas origin.
+fn tiled(pattern: &Volume, p: IVec3) -> u8 {
+    pattern.get(IVec3::new(p.x.rem_euclid(pattern.dims.x), p.y.rem_euclid(pattern.dims.y), p.z.rem_euclid(pattern.dims.z)))
+}
+
+/// Mask: keep only the voxels under the tiled pattern's solid cells.
+pub fn mask_pattern(v: &Volume, pattern: &Volume) -> Volume {
+    map(v, |i, c| if c != 0 && tiled(pattern, v.position(i)) != 0 { c } else { 0 })
+}
+
+/// Tex: voxels under the tiled pattern's solid cells take its colors.
+pub fn texture(v: &Volume, pattern: &Volume) -> Volume {
+    map(v, |i, c| match tiled(pattern, v.position(i)) {
+        t if c != 0 && t != 0 => t,
+        _ => c,
+    })
+}
+
+/// The selected voxels alone, in a canvas the size of `v`.
+pub fn layer(v: &Volume, sel: &Mask) -> Volume {
+    map(v, |i, c| if sel[i] { c } else { 0 })
+}
+
+/// `v` with its selected voxels taken away and `out`'s voxels put over the
+/// rest; `out`'s voxels are the new selection.
+pub fn merge(v: &Volume, sel: &Mask, out: &Volume) -> (Volume, Mask) {
+    let mut mask = Mask::new(v.dims);
+    let new = map(v, |i, c| match out.cells[i] {
+        0 if sel[i] => 0,
+        0 => c,
+        o => {
+            mask.set(i, true);
+            o
+        }
+    });
+    (new, mask)
+}
+
+/// Every voxel of `v`, as a selection.
+pub fn layer_mask(v: &Volume) -> Mask {
+    let mut m = Mask::new(v.dims);
+    for (i, _) in v.cells.filled() {
+        m.set(i, true);
+    }
+    m
+}
+
+/// The selected voxels cut to their bounding box, and its min corner.
+pub fn lift(v: &Volume, sel: &Mask) -> Option<(Volume, IVec3)> {
+    crop(&layer(v, sel))
+}
+
+/// Where a box of `new` cells goes to stay centered on a box of `old` cells
+/// at `lo`, rounded like MagicaVoxel.
+pub fn centered(lo: IVec3, old: IVec3, new: IVec3) -> IVec3 {
+    lo + (old - IVec3::ONE) / 2 - (new - IVec3::ONE) / 2
+}
+
+/// `v` without its selection, with `sub` pasted over it at `at` (clipped
+/// to the canvas); the pasted voxels are the new selection.
+pub fn place(v: &Volume, sel: &Mask, sub: &Volume, at: IVec3) -> (Volume, Mask) {
+    let mut out = Volume::new(v.dims);
+    for (p, c) in sub.filled() {
+        out.set(p + at, c);
+    }
+    merge(v, sel, &out)
+}
+
+/// `sub` at `at` in a canvas grown to hold both it and the old canvas of
+/// `dims` (the old cell 0 lands at the returned offset). None past `MAX_DIM`.
+pub fn place_grow(dims: IVec3, sub: &Volume, at: IVec3) -> Option<(Volume, IVec3)> {
+    let lo = at.min(IVec3::ZERO);
+    let hi = (at + sub.dims).max(dims);
+    if (hi - lo).max_element() > MAX_DIM {
+        return None;
+    }
+    let mut out = Volume::new(hi - lo);
+    for (p, c) in sub.filled() {
+        out.set(p + at - lo, c);
+    }
+    Some((out, -lo))
+}
+
+/// Run a box-shaped edit (rotate, flip, 2X, ...) on the lifted selection
+/// and put the result back centered where it was.
+pub fn on_lifted(v: &Volume, sel: &Mask, f: impl FnOnce(&Volume) -> Option<Volume>) -> Option<(Volume, Mask)> {
+    let (sub, lo) = lift(v, sel)?;
+    let new = f(&sub)?;
+    Some(place(v, sel, &new, centered(lo, sub.dims, new.dims)))
+}
+
+/// Scale the model's voxels about their center, nearest cell; the canvas
+/// grows when they no longer fit but never shrinks. None if an edge would
+/// round to 0 or the canvas would exceed `MAX_DIM`.
+pub fn scale_content(v: &Volume, axes: [bool; 3], factor: f32) -> Option<Volume> {
+    let (sub, lo) = crop(v)?;
+    let new = scale_floor(&sub, axes, factor)?;
+    place_grow(v.dims, &new, centered(lo, sub.dims, new.dims)).map(|(out, _)| out)
+}
+
+/// `scale` with MagicaVoxel's sampling: destination cell q takes source
+/// cell floor(q * old / new).
+pub fn scale_floor(v: &Volume, axes: [bool; 3], factor: f32) -> Option<Volume> {
+    let dims = scale(&Volume::new(v.dims), axes, factor)?.dims;
+    let mut out = Volume::new(dims);
+    for i in 0..out.cells.len() {
+        let q = out.position(i);
+        let p = (q.as_i64vec3() * v.dims.as_i64vec3() / dims.as_i64vec3()).as_ivec3();
+        let c = v.get(p);
+        if c != 0 {
+            out.set_index(i, c);
+        }
+    }
+    Some(out)
+}
+
+/// Shear in place: for `axis` = z, x += floor(a*z) and y += floor(b*z)
+/// (the next axes in x→y→z order take a and b). Only `sel`'s voxels move
+/// when given; the canvas keeps its size and voxels pushed out are lost.
+pub fn shear_clip(v: &Volume, sel: Option<&Mask>, axis: usize, a: f32, b: f32) -> Volume {
+    let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+    let mut out = match sel {
+        Some(_) => clear(v, sel),
+        None => Volume::new(v.dims),
+    };
+    for (i, &c) in v.cells.iter().enumerate() {
+        if c != 0 && selected(sel, i) {
+            let p = v.position(i);
+            let mut q = p;
+            q[u] += (a * p[axis] as f32).floor() as i32;
+            q[w] += (b * p[axis] as f32).floor() as i32;
+            if v.contains(q) {
+                out.set(q, c);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,5 +1248,184 @@ mod transform_tests {
         let layer = |z: i32| (0..1024).filter(|&k| a.get(IVec3::new(k % 32, k / 32, z)) != 0).count();
         assert!(layer(0) > layer(23));
         assert!(a.cells.iter().all(|&c| c == 0 || c == 3));
+    }
+}
+
+/// The Edit panel functions against results read off MagicaVoxel 0.99.6.2.
+#[cfg(test)]
+mod mv_tests {
+    use super::*;
+
+    fn vol(dims: [i32; 3], cells: &[([i32; 3], u8)]) -> Volume {
+        let mut v = Volume::new(IVec3::from(dims));
+        for &(p, c) in cells {
+            v.set(IVec3::from(p), c);
+        }
+        v
+    }
+
+    fn cells(v: &Volume) -> Vec<([i32; 3], u8)> {
+        let mut out: Vec<_> = v.filled().map(|(p, c)| (p.to_array(), c)).collect();
+        out.sort();
+        out
+    }
+
+    /// An L of color 2 on a floor of color 1, selected (MagicaVoxel's
+    /// region select on the L).
+    fn floor_and_l() -> (Volume, Mask) {
+        let mut v = Volume::new(IVec3::new(8, 6, 3));
+        for y in 0..6 {
+            for x in 0..8 {
+                v.set(IVec3::new(x, y, 0), 1);
+            }
+        }
+        let mut sel = Mask::new(v.dims);
+        for p in [[1, 1, 1], [2, 1, 1], [3, 1, 1], [1, 2, 1]] {
+            v.set(IVec3::from(p), 2);
+            sel.set(v.index(IVec3::from(p)), true);
+        }
+        (v, sel)
+    }
+
+    /// The color-2 cells of the z = `z` layer.
+    fn l_cells(v: &Volume, z: i32) -> Vec<[i32; 2]> {
+        let mut out: Vec<_> = v.filled().filter(|&(p, c)| c == 2 && p.z == z).map(|(p, _)| [p.x, p.y]).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn half_keeps_each_blocks_first_voxel() {
+        // Blocks along x: the first voxel in x, then y, then z order wins
+        // over the most common color.
+        let v = vol(
+            [10, 2, 2],
+            &[
+                ([1, 0, 0], 1), ([0, 1, 0], 2), ([0, 0, 1], 3),
+                ([2, 1, 0], 2), ([2, 0, 1], 3),
+                ([5, 0, 0], 1), ([4, 0, 1], 3),
+                ([7, 0, 0], 1), ([6, 1, 0], 2), ([6, 1, 1], 2), ([7, 1, 1], 2),
+                ([9, 1, 1], 1), ([8, 1, 1], 2), ([9, 0, 1], 3),
+            ],
+        );
+        let h = half(&v);
+        assert_eq!(h.dims, IVec3::new(5, 1, 1));
+        assert_eq!(h.cells, vec![1, 2, 1, 1, 3]);
+    }
+
+    #[test]
+    fn full_overwrites_and_mirror_copies_the_low_half() {
+        let v = vol([5, 3, 1], &[([0, 0, 0], 1), ([1, 1, 0], 2), ([2, 0, 0], 3), ([2, 2, 0], 3), ([4, 1, 0], 4), ([3, 2, 0], 4)]);
+        assert!(full_volume(&v, 9).cells.iter().all(|&c| c == 9));
+        // The high half is replaced; the middle column stays.
+        assert_eq!(cells(&mirror_half(&v, 0)), vec![([0, 0, 0], 1), ([1, 1, 0], 2), ([2, 0, 0], 3), ([2, 2, 0], 3), ([3, 1, 0], 2), ([4, 0, 0], 1)]);
+        assert_eq!(
+            cells(&mirror_half(&v, 1)),
+            vec![([0, 0, 0], 1), ([0, 2, 0], 1), ([1, 1, 0], 2), ([2, 0, 0], 3), ([2, 2, 0], 3), ([4, 1, 0], 4)]
+        );
+    }
+
+    #[test]
+    fn diagonal_copies_below_the_diagonal_over_above() {
+        let v = vol([5, 3, 1], &[([0, 0, 0], 1), ([1, 1, 0], 2), ([2, 0, 0], 3), ([2, 2, 0], 3), ([4, 1, 0], 4), ([3, 2, 0], 4), ([0, 1, 0], 5)]);
+        let d = diagonal_half(&v, 2);
+        assert_eq!(d.dims, IVec3::new(5, 5, 1));
+        // (0, 1) is above the diagonal, so it takes (1, 0), which is empty.
+        assert_eq!(
+            cells(&d),
+            vec![([0, 0, 0], 1), ([0, 2, 0], 3), ([1, 1, 0], 2), ([1, 4, 0], 4), ([2, 0, 0], 3), ([2, 2, 0], 3), ([2, 3, 0], 4), ([3, 2, 0], 4), ([4, 1, 0], 4)]
+        );
+    }
+
+    #[test]
+    fn dilate_and_erode_use_the_whole_box() {
+        let d = dilate_box(&vol([7, 7, 3], &[([3, 3, 0], 1)]), 5);
+        assert_eq!(d.count(), 18);
+        assert_eq!((d.get(IVec3::new(2, 2, 1)), d.get(IVec3::new(3, 3, 0))), (5, 1));
+        let mut cube = Volume::new(IVec3::splat(5));
+        for i in 0..cube.cells.len() {
+            let p = cube.position(i);
+            if p.cmpge(IVec3::ONE).all() && p.cmple(IVec3::splat(3)).all() && p != IVec3::ONE {
+                cube.set_index(i, 1);
+            }
+        }
+        // A missing corner neighbor is enough to erode the center.
+        assert_eq!(erode_box(&cube).count(), 0);
+        assert_eq!(erode_box(&full_volume(&cube, 1)).count(), 27);
+    }
+
+    #[test]
+    fn selection_edits_work_on_the_lifted_voxels() {
+        let (v, sel) = floor_and_l();
+        let rot = on_lifted(&v, &sel, |s| Some(rotate(s, 2))).unwrap().0;
+        assert_eq!(l_cells(&rot, 1), vec![[2, 0], [3, 0], [3, 1], [3, 2]]);
+        assert_eq!(rot.get(IVec3::new(1, 1, 0)), 1, "the floor stays");
+
+        let (dbl, mask) = on_lifted(&v, &sel, double).unwrap();
+        assert_eq!((l_cells(&dbl, 0), l_cells(&dbl, 1).len()), (vec![], 16));
+        assert_eq!(l_cells(&dbl, 2), l_cells(&dbl, 1));
+        assert_eq!(l_cells(&dbl, 1)[0], [0, 0]);
+        assert_eq!(mask.filled().count(), 32);
+
+        let hlf = on_lifted(&v, &sel, |s| Some(half(s))).unwrap().0;
+        assert_eq!(l_cells(&hlf, 1), vec![[2, 1], [3, 1]]);
+
+        let rep = on_lifted(&v, &sel, |s| repeat(s, [true, false, false], 2)).unwrap().0;
+        assert_eq!(l_cells(&rep, 1), vec![[0, 1], [0, 2], [1, 1], [2, 1], [3, 1], [3, 2], [4, 1], [5, 1]]);
+
+        let sc = on_lifted(&v, &sel, |s| scale_floor(s, [true, false, false], 2.0)).unwrap().0;
+        assert_eq!(l_cells(&sc, 1), vec![[0, 1], [0, 2], [1, 1], [1, 2], [2, 1], [3, 1], [4, 1], [5, 1]]);
+
+        let dia = on_lifted(&v, &sel, |s| Some(diagonal_half(s, 2))).unwrap().0;
+        assert_eq!(l_cells(&dia, 1), vec![[1, 0], [1, 1], [1, 2], [2, 0], [3, 0]]);
+
+        // Mirror grows the selection on its high side instead.
+        let (sub, lo) = lift(&v, &sel).unwrap();
+        let mir = place(&v, &sel, &mirror_extend(&sub, 0).unwrap(), lo).0;
+        assert_eq!(l_cells(&mir, 1), vec![[1, 1], [1, 2], [2, 1], [3, 1], [4, 1], [5, 1], [6, 1], [6, 2]]);
+    }
+
+    #[test]
+    fn layer_edits_replace_the_selection() {
+        let (v, sel) = floor_and_l();
+        // Rev with a selection: the selected voxels go, everything else
+        // becomes the color and is selected.
+        let (rev, mask) = merge(&v, &sel, &reverse(&layer(&v, &sel), 7));
+        assert_eq!(rev.get(IVec3::new(1, 1, 1)), 0);
+        assert_eq!((rev.get(IVec3::new(0, 0, 0)), rev.count()), (7, 8 * 6 * 3 - 4));
+        assert_eq!(mask.filled().count(), rev.count());
+    }
+
+    #[test]
+    fn pattern_edits() {
+        let mut menger = Volume::new(IVec3::splat(3));
+        for i in 0..27 {
+            let p = menger.position(i);
+            if p.cmpeq(IVec3::ONE).bitmask().count_ones() < 2 {
+                menger.set_index(i, 9);
+            }
+        }
+        let f = fractal(&menger, &menger).unwrap();
+        assert_eq!((f.dims, f.count()), (IVec3::splat(9), 400));
+        let block = full_volume(&Volume::new(IVec3::new(7, 5, 4)), 1);
+        let m = mask_pattern(&block, &menger);
+        assert_eq!((m.get(IVec3::new(1, 1, 0)), m.get(IVec3::new(4, 4, 0)), m.get(IVec3::new(0, 0, 0))), (0, 0, 1));
+        let t = texture(&block, &menger);
+        assert_eq!((t.get(IVec3::new(1, 1, 0)), t.get(IVec3::new(0, 0, 0))), (1, 9));
+    }
+
+    #[test]
+    fn shear_and_scale_like_magicavoxel() {
+        let v = vol([8, 3, 4], &[([2, 1, 0], 1), ([2, 1, 1], 2), ([2, 1, 2], 3), ([2, 1, 3], 4)]);
+        // Offsets round down; the canvas keeps its size.
+        let s = shear_clip(&v, None, 2, 0.5, 0.0);
+        assert_eq!(cells(&s), vec![([2, 1, 0], 1), ([2, 1, 1], 2), ([3, 1, 2], 3), ([3, 1, 3], 4)]);
+        let s = shear_clip(&v, None, 2, -1.0, 0.0);
+        assert_eq!(cells(&s), vec![([0, 1, 2], 3), ([1, 1, 1], 2), ([2, 1, 0], 1)]);
+        // Scaling grows the canvas only when the voxels don't fit.
+        let probe = full_volume(&Volume::new(IVec3::new(6, 4, 3)), 1);
+        assert_eq!(scale_content(&probe, [true; 3], 2.0).unwrap().dims, IVec3::new(12, 8, 6));
+        let shrunk = scale_content(&probe, [true, false, false], 0.5).unwrap();
+        assert_eq!((shrunk.dims, shrunk.count()), (probe.dims, 3 * 4 * 3));
     }
 }
