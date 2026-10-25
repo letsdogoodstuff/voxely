@@ -638,21 +638,8 @@ impl Renderer {
     /// Pixel position of a world point, if it is in front of the camera.
     pub fn project(&self, p: Vec3) -> Option<(f32, f32)> {
         let (w, h) = (self.targets.width as f32, self.targets.height as f32);
-        let (fwd, right, up) = self.camera.basis();
-        let tan_half = (self.settings.fov.to_radians() * 0.5).tan();
-        let aspect = w / h;
-        let d = p - self.camera.eye();
-        let z = d.dot(fwd);
-        let (x, y) = if self.settings.projection == Projection::Orthographic {
-            let half = self.camera.dist * tan_half;
-            (d.dot(right) / (half * aspect), d.dot(up) / half)
-        } else {
-            if z <= 1e-3 {
-                return None;
-            }
-            (d.dot(right) / (z * tan_half * aspect), d.dot(up) / (z * tan_half))
-        };
-        Some(((x + 1.0) * 0.5 * w + self.offset.0 as f32, (1.0 - y) * 0.5 * h + self.offset.1 as f32))
+        let (x, y) = project_point(&self.camera, self.settings.fov, self.settings.projection, w, h, p)?;
+        Some((x + self.offset.0 as f32, y + self.offset.1 as f32))
     }
 
     /// Restart accumulation (after the camera or settings change).
@@ -832,6 +819,13 @@ impl Renderer {
         }
     }
 
+    /// Mark cells in the modeler (see `Modeler::set_highlight`).
+    pub fn set_highlight(&mut self, dims: glam::IVec3, cells: &[(glam::IVec3, bool)]) {
+        if let Some(m) = self.modeler.as_mut() {
+            m.set_highlight(&self.device, dims, cells);
+        }
+    }
+
     /// Show a different scene: voxels, materials, lights and settings.
     pub fn load_scene(&mut self, scene: &Scene) {
         self.settings = scene.settings.clone();
@@ -907,6 +901,13 @@ impl Renderer {
     /// Draw the modeler view at `width` x `height` offscreen with the
     /// current camera and read it back as RGBA8.
     pub fn modeler_image(&mut self, width: u32, height: u32) -> Result<Vec<u8>> {
+        let (camera, projection) = (self.camera, self.settings.projection);
+        self.modeler_image_from(width, height, &camera, projection)
+    }
+
+    /// Like `modeler_image` from another camera, leaving the renderer's
+    /// own camera (the one the window shows) alone.
+    pub fn modeler_image_from(&mut self, width: u32, height: u32, camera: &Camera, projection: Projection) -> Result<Vec<u8>> {
         let (Some(m), Some(format)) = (self.modeler.as_mut(), self.modeler_format) else {
             anyhow::bail!("this renderer has no modeler view");
         };
@@ -921,7 +922,7 @@ impl Renderer {
             view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
-        m.draw(&self.device, &self.queue, &view, (width, height), (0, 0, width, height), &self.camera, self.settings.fov, self.settings.projection);
+        m.draw(&self.device, &self.queue, &view, (width, height), (0, 0, width, height), camera, self.settings.fov, projection);
         let bgra = matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
         read_texture(&self.device, &self.queue, &tex, width, height, bgra)
     }
@@ -955,6 +956,27 @@ impl Renderer {
         let pixels = slice.get_mapped_range()?.to_vec();
         Ok(pixels)
     }
+}
+
+/// Pixel position of world point `p` in a `w` x `h` image seen from
+/// `camera`, if it is in front of it. Every projection but orthographic
+/// counts as perspective, like the modeler.
+pub fn project_point(camera: &Camera, fov: f32, projection: Projection, w: f32, h: f32, p: Vec3) -> Option<(f32, f32)> {
+    let (fwd, right, up) = camera.basis();
+    let tan_half = (fov.to_radians() * 0.5).tan();
+    let aspect = w / h;
+    let d = p - camera.eye();
+    let z = d.dot(fwd);
+    let (x, y) = if projection == Projection::Orthographic {
+        let half = camera.dist * tan_half;
+        (d.dot(right) / (half * aspect), d.dot(up) / half)
+    } else {
+        if z <= 1e-3 {
+            return None;
+        }
+        (d.dot(right) / (z * tan_half * aspect), d.dot(up) / (z * tan_half))
+    };
+    Some(((x + 1.0) * 0.5 * w, (1.0 - y) * 0.5 * h))
 }
 
 /// Read an 8-bit color texture back as RGBA8 (swapping channels for BGRA).

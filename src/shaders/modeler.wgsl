@@ -24,6 +24,10 @@ struct U {
     context: vec4<f32>,
     // rgb color context fades toward, w = how far.
     ghost: vec4<f32>,
+    // Highlighted cells holding voxels: rgb, w = opacity where visible.
+    mark: vec4<f32>,
+    // Highlighted empty cells: rgb, w = opacity where hidden.
+    mark_empty: vec4<f32>,
     palette: array<vec4<f32>, 256>,
 }
 
@@ -51,6 +55,10 @@ const CONTEXT = 1u << 23u;
 
 @vertex
 fn vs_main(@location(0) pos: vec4<u32>, @location(1) data: u32) -> VsOut {
+    return vertex(pos, data);
+}
+
+fn vertex(pos: vec4<u32>, data: u32) -> VsOut {
     var o: VsOut;
     o.pos = vec3<f32>(pos.xyz);
     if (data & CONTEXT) != 0u {
@@ -170,4 +178,36 @@ fn vs_line(@location(0) pos: vec4<u32>, @location(1) data: u32) -> @builtin(posi
 @fragment
 fn fs_line() -> @location(0) vec4<f32> {
     return u.line;
+}
+
+// Highlighted cells (color 1 solid, 2 empty), pulled toward the camera so
+// they cover the voxel faces they sit on.
+@vertex
+fn vs_mark(@location(0) pos: vec4<u32>, @location(1) data: u32) -> VsOut {
+    var o = vertex(pos, data);
+    o.clip.z -= 3e-4 * o.clip.w;
+    return o;
+}
+
+fn mark_color(in: VsOut) -> vec3<f32> {
+    if ((in.data >> 8u) & 255u) == 2u {
+        return u.mark_empty.rgb;
+    }
+    return u.mark.rgb;
+}
+
+// Where visible: a strong tint with each cell outlined.
+@fragment
+fn fs_mark(in: VsOut) -> @location(0) vec4<f32> {
+    let n = NORMALS[in.data & 7u];
+    let uv = vec2<f32>(dot(in.pos, n.zxy), dot(in.pos, n.yzx));
+    let edge = 1.0 - lines(uv, screen_grad(uv), 1.0);
+    let c = mark_color(in);
+    return vec4<f32>(mix(c, c * 0.35, edge), max(u.mark.w, edge));
+}
+
+// Through other voxels: a faint tint, so hidden edits still show.
+@fragment
+fn fs_mark_xray(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(mark_color(in), u.mark_empty.w);
 }
