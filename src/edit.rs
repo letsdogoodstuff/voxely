@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use glam::{IVec3, Vec3};
+use glam::{IVec3, Quat, Vec3};
 
 use crate::ops;
 use crate::scene::{Mask, Volume};
@@ -71,6 +71,19 @@ pub enum MarqueeMode {
     Box,
 }
 
+/// The Move tool's Transform options.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum XformMode {
+    /// Drag the selection; voxels pushed off the canvas loop around.
+    Move,
+    /// Drag a face to stretch : Commit [Enter] : Cancel [Esc] : Two-sided [Shift].
+    Scale,
+    /// Drag a face to repeat or crop : Commit [Enter] : Cancel [Esc] : Two-sided [Shift].
+    Wrap,
+    /// Drag around the face's axis : Commit [Enter] : Cancel [Esc] : Snap [Shift].
+    Rotate,
+}
+
 /// Brush settings from MagicaVoxel's brush option panels.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BrushOptions {
@@ -100,6 +113,11 @@ pub struct BrushOptions {
     pub visible_only: bool,
     /// Pattern brush paints with the palette color, not its own colors.
     pub pattern_palette: bool,
+    /// Pattern brush offset [arrows / PageUp / PageDown, Home resets].
+    pub pattern_offset: IVec3,
+    pub xform: XformMode,
+    /// Wrap: empty cells between the copies along each axis [0 - 256].
+    pub wrap_space: [i32; 3],
 }
 
 impl Default for BrushOptions {
@@ -119,6 +137,9 @@ impl Default for BrushOptions {
             marquee: MarqueeMode::Rect,
             visible_only: false,
             pattern_palette: false,
+            pattern_offset: IVec3::ZERO,
+            xform: XformMode::Move,
+            wrap_space: [0; 3],
         }
     }
 }
@@ -197,6 +218,56 @@ pub fn plane_cell(ro: Vec3, rd: Vec3, axis: usize, coord: i32) -> Option<IVec3> 
     let mut c = (ro + rd * t).floor().as_ivec3();
     c[axis] = coord;
     Some(c)
+}
+
+/// Signed offset along `axis` from `p0` to the point on that axis line
+/// closest to the ray (None when the ray runs along the axis).
+fn axis_offset(p0: Vec3, axis: usize, ro: Vec3, rd: Vec3) -> Option<f32> {
+    let mut dir = Vec3::ZERO;
+    dir[axis] = 1.0;
+    let rd = rd.normalize_or_zero();
+    let w = p0 - ro;
+    let (b, d, e) = (dir.dot(rd), dir.dot(w), rd.dot(w));
+    let denom = 1.0 - b * b;
+    (denom >= 1e-6).then(|| (b * e - d) / denom)
+}
+
+/// Where the ray crosses the plane `axis = coord` (world units).
+fn plane_point(ro: Vec3, rd: Vec3, axis: usize, coord: f32) -> Option<Vec3> {
+    if rd[axis].abs() < 1e-6 {
+        return None;
+    }
+    let t = (coord - ro[axis]) / rd[axis];
+    (t > 0.0).then(|| ro + rd * t)
+}
+
+/// The `size` box of `v` at `lo` as a volume of its own (0 outside `v`).
+pub fn sub_volume(v: &Volume, lo: IVec3, size: IVec3) -> Volume {
+    let mut out = Volume::new(size);
+    for p in cuboid(IVec3::ZERO, size - IVec3::ONE) {
+        let c = v.get(lo + p);
+        if c != 0 {
+            out.set(p, c);
+        }
+    }
+    out
+}
+
+/// The pattern after (wrapping) `current` in `files` by `step`, matched
+/// by file stem; the first or last one when there is no current pattern
+/// [3 / 4].
+pub fn step_pattern<'a>(files: &[&'a std::path::Path], current: Option<&str>, step: i32) -> Option<&'a std::path::Path> {
+    if files.is_empty() {
+        return None;
+    }
+    let n = files.len() as i32;
+    let at = current.and_then(|c| files.iter().position(|f| f.file_stem().is_some_and(|s| s.to_string_lossy() == c)));
+    let i = match at {
+        Some(i) => (i as i32 + step).rem_euclid(n),
+        None if step < 0 => n - 1,
+        None => 0,
+    };
+    Some(files[i as usize])
 }
 
 fn axis_of(n: IVec3) -> usize {
@@ -284,6 +355,120 @@ struct Stroke {
     /// Camera rays at press and now (for lines projected on the surface).
     ray0: (Vec3, Vec3),
     ray1: (Vec3, Vec3),
+    /// Face brush: the region being extruded by dragging.
+    extrude: Option<Extrude>,
+}
+
+/// Face brush drag [Extrude: Drag]: more layers the further the cursor
+/// goes along the face normal.
+struct Extrude {
+    /// First layer's cells with their colors.
+    base: Vec<(IVec3, u8)>,
+    /// Center of the pressed face, and the offset along the normal the
+    /// press ray was at.
+    origin: Vec3,
+    t0: f32,
+    layers: i32,
+}
+
+/// A pending Scale / Wrap / Rotate of the selection (or the whole model),
+/// shown in the volume until committed [Enter] or cancelled [Esc].
+struct Xform {
+    mode: XformMode,
+    before: Volume,
+    /// The voxels being transformed, in a box of their own at `lo`.
+    src: Volume,
+    lo: IVec3,
+    /// Scale and Wrap: the target box (min corner, size).
+    box_lo: IVec3,
+    box_size: IVec3,
+    /// Rotate: the turn about the source box's center.
+    rot: Quat,
+    /// Nothing was selected, so don't select the result.
+    whole: bool,
+    drag: Option<XformDrag>,
+}
+
+/// A drag on one face of the transform box.
+struct XformDrag {
+    axis: usize,
+    /// +1 or -1: which face along `axis` was grabbed.
+    sign: i32,
+    /// Shift: Scale and Wrap move both faces, Rotate snaps.
+    shift: bool,
+    /// The grabbed point and its offset along the axis at press.
+    origin: Vec3,
+    t0: f32,
+    box_lo: IVec3,
+    box_size: IVec3,
+    rot: Quat,
+}
+
+/// Snap step for Rotate with Shift.
+const ROTATE_SNAP: f32 = std::f32::consts::PI / 12.0;
+
+impl Xform {
+    /// Draw the transformed voxels over `before` into `v`; returns the
+    /// cells they cover.
+    fn render(&self, v: &mut Volume, space: [i32; 3]) -> Mask {
+        *v = self.before.clone();
+        for (p, _) in self.src.filled() {
+            v.set(self.lo + p, 0);
+        }
+        let mut mask = Mask::new(v.dims);
+        let dims = v.dims;
+        let clip = |lo: IVec3, hi: IVec3| cuboid(lo.max(IVec3::ZERO), hi.min(dims - IVec3::ONE));
+        let n = self.src.dims;
+        let cells: Vec<(IVec3, u8)> = match self.mode {
+            XformMode::Scale => clip(self.box_lo, self.box_lo + self.box_size - IVec3::ONE)
+                .into_iter()
+                .map(|q| {
+                    // Nearest source cell to the target cell's center.
+                    let rel = q - self.box_lo;
+                    (q, self.src.get((rel * 2 + IVec3::ONE) * n / (self.box_size * 2)))
+                })
+                .collect(),
+            XformMode::Wrap => {
+                // Copies repeat every size + spacing cells, anchored where
+                // the voxels were.
+                let period = n + IVec3::from_array(space).max(IVec3::ZERO);
+                clip(self.box_lo, self.box_lo + self.box_size - IVec3::ONE)
+                    .into_iter()
+                    .map(|q| {
+                        let off = (q - self.lo).rem_euclid(period);
+                        (q, if off.cmplt(n).all() { self.src.get(off) } else { 0 })
+                    })
+                    .collect()
+            }
+            XformMode::Rotate => {
+                let center = self.lo.as_vec3() + n.as_vec3() * 0.5;
+                let half = n.as_vec3() * 0.5;
+                let corners = (0..8).map(|k| {
+                    let s = Vec3::new(if k & 1 == 0 { -1.0 } else { 1.0 }, if k & 2 == 0 { -1.0 } else { 1.0 }, if k & 4 == 0 { -1.0 } else { 1.0 });
+                    center + self.rot * (half * s)
+                });
+                let (lo, hi) = corners.fold((Vec3::MAX, Vec3::MIN), |(lo, hi), c| (lo.min(c), hi.max(c)));
+                let inv = self.rot.inverse();
+                clip((lo + 1e-3).floor().as_ivec3(), (hi - 1e-3).floor().as_ivec3())
+                    .into_iter()
+                    .map(|q| {
+                        let s = center + inv * (q.as_vec3() + 0.5 - center);
+                        (q, self.src.get((s + 1e-3).floor().as_ivec3() - self.lo))
+                    })
+                    .collect()
+            }
+            XformMode::Move => Vec::new(),
+        };
+        for (q, c) in cells {
+            if c != 0 {
+                let i = v.index(q);
+                v.set_index(i, c);
+                mask[i] = true;
+            }
+        }
+        v.refresh_bricks();
+        mask
+    }
 }
 
 /// One undoable edit.
@@ -316,14 +501,15 @@ pub struct Editor {
     pub region: ops::RegionOptions,
     pub opts: BrushOptions,
     pub pattern: Option<Pattern>,
-    /// The Code brush's shader output for the current volume.
-    pub code: Option<Volume>,
+    /// The Code brush's shader output for its box, and the box's corner.
+    pub code: Option<(IVec3, Volume)>,
     /// Set when the selection changes, so the view can refresh.
     pub sel_dirty: bool,
     undo: Vec<Entry>,
     redo: Vec<Entry>,
     stroke: Option<Stroke>,
     moving: Option<Move>,
+    xform: Option<Xform>,
     /// Selected cells per volume cell; empty when nothing is selected.
     sel: Mask,
     sel_count: usize,
@@ -348,6 +534,7 @@ impl Editor {
             redo: Vec::new(),
             stroke: None,
             moving: None,
+            xform: None,
             sel: Mask::new(IVec3::ZERO),
             sel_count: 0,
             clipboard: Vec::new(),
@@ -355,7 +542,7 @@ impl Editor {
     }
 
     pub fn active(&self) -> bool {
-        self.stroke.is_some() || self.moving.is_some()
+        self.stroke.is_some() || self.moving.is_some() || self.xform.as_ref().is_some_and(|x| x.drag.is_some())
     }
 
     /// Forget history and selection (after opening another model).
@@ -432,6 +619,7 @@ impl Editor {
     /// Replace the volume with `new` as one undoable edit. Returns whether
     /// anything changed.
     pub fn commit(&mut self, v: &mut Volume, new: Volume) -> bool {
+        self.commit_xform(v);
         if new.dims == v.dims {
             let diff = v.cells.diff(&new.cells);
             if diff.is_empty() {
@@ -543,6 +731,7 @@ impl Editor {
     /// or all of them when nothing is selected, along the plane of the face
     /// under the cursor.
     pub fn begin_move(&mut self, v: &Volume, hit: Pick, along_normal: bool) -> bool {
+        self.commit_xform(v);
         let sel = self.selection();
         let cells: Vec<(IVec3, u8)> =
             v.cells.iter().enumerate().filter(|&(i, &c)| c != 0 && sel.is_none_or(|s| s[i])).map(|(i, &c)| (v.position(i), c)).collect();
@@ -558,17 +747,9 @@ impl Editor {
         let Some(m) = self.moving.as_mut() else { return false };
         let delta = if m.along_normal {
             // Closest point on the normal line through the grabbed voxel.
-            let mut dir = Vec3::ZERO;
-            dir[m.axis] = 1.0;
-            let p0 = m.anchor.as_vec3() + 0.5;
-            let w = p0 - ro;
-            let (b, d, e) = (dir.dot(rd), dir.dot(w), rd.dot(w));
-            let denom = 1.0 - b * b;
-            if denom < 1e-6 {
-                return false;
-            }
+            let Some(t) = axis_offset(m.anchor.as_vec3() + 0.5, m.axis, ro, rd) else { return false };
             let mut delta = IVec3::ZERO;
-            delta[m.axis] = ((b * e - d) / denom).round() as i32;
+            delta[m.axis] = t.round() as i32;
             delta
         } else {
             let Some(cell) = plane_cell(ro, rd, m.axis, m.anchor[m.axis]) else { return false };
@@ -582,14 +763,12 @@ impl Editor {
         for &(p, _) in &m.cells {
             v.set(p, 0);
         }
+        // Move/Loop: voxels pushed off the canvas come back on the other side.
         let mut mask = Mask::new(v.dims);
         for &(p, c) in &m.cells {
-            let q = p + delta;
-            if v.contains(q) {
-                let i = v.index(q);
-                v.set_index(i, c);
-                mask[i] = true;
-            }
+            let i = v.index((p + delta).rem_euclid(v.dims));
+            v.set_index(i, c);
+            mask[i] = true;
         }
         v.refresh_bricks();
         if !m.whole {
@@ -609,8 +788,132 @@ impl Editor {
         changed
     }
 
+    // ---- Scale / Wrap / Rotate ----
+
+    /// Press with the Move tool: Move drags the selection (see
+    /// `begin_move`); Scale, Wrap and Rotate start dragging the face of the
+    /// selection's box (or the model's) under the cursor. Those stay
+    /// pending across drags until committed [Enter] or cancelled [Esc].
+    pub fn begin_transform(&mut self, v: &Volume, hit: Pick, ro: Vec3, rd: Vec3, shift: bool) -> bool {
+        let mode = self.opts.xform;
+        if mode == XformMode::Move {
+            return self.begin_move(v, hit, shift);
+        }
+        if self.xform.as_ref().is_some_and(|x| x.mode != mode) {
+            self.commit_xform(v);
+        }
+        if self.xform.is_none() {
+            let sel = self.selection();
+            let cells: Vec<(IVec3, u8)> = v.filled().filter(|&(p, _)| sel.is_none_or(|s| s[v.index(p)])).collect();
+            let Some(lo) = cells.iter().map(|c| c.0).reduce(IVec3::min) else { return false };
+            let hi = cells.iter().map(|c| c.0).fold(lo, IVec3::max);
+            let mut src = Volume::new(hi - lo + IVec3::ONE);
+            for (p, c) in cells {
+                src.set(p - lo, c);
+            }
+            let size = src.dims;
+            self.xform = Some(Xform { mode, before: v.clone(), src, lo, box_lo: lo, box_size: size, rot: Quat::IDENTITY, whole: sel.is_none(), drag: None });
+        }
+        let x = self.xform.as_mut().unwrap();
+        let axis = axis_of(hit.normal);
+        let sign = if hit.normal[axis] < 0 { -1 } else { 1 };
+        let coord = (hit.cell[axis] + (sign > 0) as i32) as f32;
+        let mut origin = hit.cell.as_vec3() + 0.5;
+        origin[axis] = coord;
+        if mode == XformMode::Rotate {
+            // The point grabbed on the face's plane.
+            let Some(p) = plane_point(ro, rd, axis, coord) else { return false };
+            origin = p;
+        }
+        let t0 = axis_offset(origin, axis, ro, rd).unwrap_or(0.0);
+        x.drag = Some(XformDrag { axis, sign, shift, origin, t0, box_lo: x.box_lo, box_size: x.box_size, rot: x.rot });
+        true
+    }
+
+    fn drag_xform(&mut self, v: &mut Volume, ro: Vec3, rd: Vec3) -> bool {
+        let space = self.opts.wrap_space;
+        let Some(x) = self.xform.as_mut() else { return false };
+        let Some(d) = x.drag.as_ref() else { return false };
+        let a = d.axis;
+        if x.mode == XformMode::Rotate {
+            let center = x.lo.as_vec3() + x.src.dims.as_vec3() * 0.5;
+            let Some(p) = plane_point(ro, rd, a, d.origin[a]) else { return false };
+            let (u, w) = ((a + 1) % 3, (a + 2) % 3);
+            let (p0, p1) = (d.origin - center, p - center);
+            if p0.length_squared() < 1e-6 || p1.length_squared() < 1e-6 {
+                return false;
+            }
+            let mut angle = (p0[u] * p1[w] - p0[w] * p1[u]).atan2(p0[u] * p1[u] + p0[w] * p1[w]);
+            if d.shift {
+                angle = (angle / ROTATE_SNAP).round() * ROTATE_SNAP;
+            }
+            let mut dir = Vec3::ZERO;
+            dir[a] = 1.0;
+            let rot = Quat::from_axis_angle(dir, angle) * d.rot;
+            if rot.dot(x.rot).abs() > 1.0 - 1e-7 {
+                return false;
+            }
+            x.rot = rot;
+        } else {
+            let Some(t) = axis_offset(d.origin, a, ro, rd) else { return false };
+            let size0 = d.box_size[a];
+            let mut o = (t - d.t0).round() as i32 * d.sign;
+            let (mut lo, mut size) = (d.box_lo, d.box_size);
+            if d.shift {
+                // Two-sided: both faces move, keeping at least one cell.
+                o = o.max(-((size0 - 1) / 2));
+                lo[a] -= o;
+                size[a] += 2 * o;
+            } else {
+                o = o.max(1 - size0);
+                if d.sign < 0 {
+                    lo[a] -= o;
+                }
+                size[a] += o;
+            }
+            if (lo, size) == (x.box_lo, x.box_size) {
+                return false;
+            }
+            (x.box_lo, x.box_size) = (lo, size);
+        }
+        let mask = x.render(v, space);
+        if !x.whole {
+            self.set_selection(v, mask);
+        }
+        true
+    }
+
+    /// A Scale, Wrap or Rotate is waiting for Enter or Esc.
+    pub fn xform_pending(&self) -> bool {
+        self.xform.is_some()
+    }
+
+    /// Keep the pending transform as one undoable edit [Enter]. `v` holds
+    /// it already. Returns whether anything changed.
+    pub fn commit_xform(&mut self, v: &Volume) -> bool {
+        let Some(x) = self.xform.take() else { return false };
+        let diff = x.before.cells.diff(&v.cells);
+        if diff.is_empty() {
+            return false;
+        }
+        self.undo.push(Entry::Cells(diff));
+        self.redo.clear();
+        true
+    }
+
+    /// Drop the pending transform, putting the voxels back [Esc].
+    pub fn cancel_xform(&mut self, v: &mut Volume) -> bool {
+        let Some(x) = self.xform.take() else { return false };
+        *v = x.before;
+        if !x.whole {
+            let cells: Vec<usize> = x.src.filled().map(|(p, _)| v.index(x.lo + p)).collect();
+            self.select(v, cells, SelMode::Replace);
+        }
+        true
+    }
+
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        !self.undo.is_empty() || self.xform.is_some()
     }
 
     pub fn can_redo(&self) -> bool {
@@ -734,7 +1037,6 @@ impl Editor {
         let tool = self.tool;
         // A selection masks erasing and painting.
         let sel = if self.sel_count > 0 && tool != Tool::Attach { Some(&self.sel) } else { None };
-        let code = if self.brush == Brush::Code { self.code.as_ref().filter(|c| c.dims == v.dims) } else { None };
         let Some(stroke) = self.stroke.as_mut() else { return false };
         let mut changed = false;
         for (c, color) in all {
@@ -746,15 +1048,10 @@ impl Editor {
                 continue;
             }
             let old = v.cells[i];
-            let new = match (code, tool) {
-                // The shader's output replaces the brushed cells.
-                (Some(code), Tool::Attach) if old == 0 => code.cells[i],
-                (Some(code), Tool::Paint) if old != 0 && code.cells[i] != 0 => code.cells[i],
-                (Some(code), Tool::Erase) if code.cells[i] != 0 => 0,
-                (Some(_), _) => old,
-                (None, Tool::Attach) if old == 0 => color,
-                (None, Tool::Erase) => 0,
-                (None, Tool::Paint) if old != 0 => color,
+            let new = match tool {
+                Tool::Attach if old == 0 => color,
+                Tool::Erase => 0,
+                Tool::Paint if old != 0 => color,
                 _ => old,
             };
             if new != old {
@@ -787,6 +1084,7 @@ impl Editor {
         let mut origin = t - p.volume.dims / 2;
         let outward = if self.tool == Tool::Attach { normal[axis] } else { -normal[axis] };
         origin[axis] = if outward >= 0 { t[axis] } else { t[axis] - p.volume.dims[axis] + 1 };
+        origin += self.opts.pattern_offset;
         p.volume
             .cells
             .iter()
@@ -861,6 +1159,7 @@ impl Editor {
 
     /// Mouse press with the camera ray. Returns whether the volume changed.
     pub fn begin(&mut self, v: &mut Volume, hit: Pick, ro: Vec3, rd: Vec3) -> bool {
+        self.commit_xform(v);
         match self.tool {
             Tool::Region => {
                 if !hit.on_ground() {
@@ -899,7 +1198,7 @@ impl Editor {
             self.select_none();
         }
         let axis = axis_of(hit.normal);
-        self.stroke = Some(Stroke { changes: HashMap::new(), anchor: t, axis, current: t, normal: hit.normal, ray0: (ro, rd), ray1: (ro, rd) });
+        self.stroke = Some(Stroke { changes: HashMap::new(), anchor: t, axis, current: t, normal: hit.normal, ray0: (ro, rd), ray1: (ro, rd), extrude: None });
         if self.tool == Tool::Marquee {
             return if self.opts.marquee == MarqueeMode::Brush { self.apply(v, &[t]) } else { false };
         }
@@ -907,7 +1206,13 @@ impl Editor {
             Brush::Voxel => self.apply(v, &[t]),
             Brush::Face => {
                 let cells = self.face_cells(v, hit);
-                self.apply_colored(v, &cells)
+                let origin = hit.cell.as_vec3() + 0.5 + hit.normal.as_vec3() * 0.5;
+                let t0 = axis_offset(origin, axis, ro, rd).unwrap_or(0.0);
+                let changed = self.apply_colored(v, &cells);
+                if matches!(self.tool, Tool::Attach | Tool::Erase) {
+                    self.stroke.as_mut().unwrap().extrude = Some(Extrude { base: cells, origin, t0, layers: 1 });
+                }
+                changed
             }
             Brush::Pattern => {
                 let cells = self.pattern_cells(t, hit.normal);
@@ -923,8 +1228,14 @@ impl Editor {
         if self.moving.is_some() {
             return self.drag_move(v, ro, rd);
         }
+        if self.xform.as_ref().is_some_and(|x| x.drag.is_some()) {
+            return self.drag_xform(v, ro, rd);
+        }
         let Some(s) = self.stroke.as_mut() else { return false };
         s.ray1 = (ro, rd);
+        if s.extrude.is_some() {
+            return self.drag_extrude(v, ro, rd);
+        }
         let (anchor, axis) = (s.anchor, s.axis);
         let marquee = (self.tool == Tool::Marquee).then_some(self.opts.marquee);
         // Attach draws on the plane of the first voxel; erase, paint and
@@ -954,18 +1265,63 @@ impl Editor {
         }
     }
 
+    /// Face brush drag: attach (or erase) as many layers of the region as
+    /// the cursor is away from the face along its normal, at least one.
+    fn drag_extrude(&mut self, v: &mut Volume, ro: Vec3, rd: Vec3) -> bool {
+        let s = self.stroke.as_mut().unwrap();
+        let (axis, normal) = (s.axis, s.normal);
+        let x = s.extrude.as_ref().unwrap();
+        let Some(t) = axis_offset(x.origin, axis, ro, rd) else { return false };
+        let layers = ((t - x.t0).abs().round() as i32).clamp(1, v.dims[axis].max(1));
+        if layers == x.layers {
+            return false;
+        }
+        // Redo the stroke from the volume before it.
+        for (i, (before, _)) in s.changes.drain() {
+            v.set_index(i, before);
+        }
+        let x = s.extrude.as_mut().unwrap();
+        x.layers = layers;
+        let step = if self.tool == Tool::Attach { normal } else { -normal };
+        let cells: Vec<(IVec3, u8)> = (0..layers).flat_map(|k| x.base.iter().map(move |&(c, color)| (c + step * k, color))).collect();
+        self.apply_colored(v, &cells);
+        v.refresh_bricks();
+        true
+    }
+
+    /// The Code brush's box so far, clipped to the canvas, as (min corner,
+    /// size). Like MagicaVoxel, the shader runs with this box as its whole
+    /// volume; put the output in `code` before release.
+    pub fn code_box(&self, v: &Volume) -> Option<(IVec3, IVec3)> {
+        let s = self.stroke.as_ref().filter(|_| self.brush == Brush::Code && self.tool != Tool::Marquee)?;
+        let top = v.dims - IVec3::ONE;
+        let (lo, hi) = (s.anchor.min(s.current).max(IVec3::ZERO), s.anchor.max(s.current).min(top));
+        hi.cmpge(lo).all().then(|| (lo, hi - lo + IVec3::ONE))
+    }
+
     /// Mouse release: commit the stroke to the undo history.
     pub fn end(&mut self, v: &mut Volume) -> bool {
         if self.moving.is_some() {
             return self.end_move(v);
         }
+        if let Some(x) = self.xform.as_mut().filter(|x| x.drag.is_some()) {
+            // Scale / Wrap / Rotate stay pending until Enter or Esc.
+            x.drag = None;
+            return false;
+        }
         let pending = self.stroke.as_ref().map(|s| self.pending_cells(v, s));
+        let code = self.code.take().filter(|_| self.brush == Brush::Code);
         let changed = match pending {
             Some(cells) if !cells.is_empty() => {
                 if self.tool == Tool::Marquee {
                     // Box select: only voxels inside the box.
                     let solid: Vec<IVec3> = cells.into_iter().filter(|&c| v.get(c) != 0).collect();
                     self.apply(v, &solid)
+                } else if let Some((lo, out)) = code {
+                    // The shader's voxels: attached into empty cells,
+                    // painted over or erased from solid ones.
+                    let cells: Vec<(IVec3, u8)> = out.filled().map(|(p, c)| (lo + p, c)).collect();
+                    self.apply_colored(v, &cells)
                 } else {
                     self.apply(v, &cells)
                 }
@@ -1024,6 +1380,10 @@ impl Editor {
         if let Some(p) = &mut self.pattern {
             p.volume.cells.update_filled(m);
         }
+        if let Some(x) = &mut self.xform {
+            x.before.cells.update_filled(m);
+            x.src.cells.update_filled(m);
+        }
     }
 
     /// Take the history so it can move into the tree's: the volume before
@@ -1031,6 +1391,7 @@ impl Editor {
     /// each of up to `max` undone edits, next redo first (`v` is the volume
     /// now).
     pub fn take_history(&mut self, v: &Volume, max: usize) -> (Vec<Volume>, Vec<Volume>) {
+        self.commit_xform(v);
         let walk = |list: Vec<Entry>, forward: bool| -> Vec<Volume> {
             let mut cur = v.clone();
             list.into_iter()
@@ -1059,6 +1420,9 @@ impl Editor {
     }
 
     pub fn undo(&mut self, v: &mut Volume) -> bool {
+        if self.cancel_xform(v) {
+            return true;
+        }
         let Some(entry) = self.undo.pop() else { return false };
         let entry = Self::step(v, entry, false);
         self.redo.push(entry);
@@ -1067,6 +1431,7 @@ impl Editor {
     }
 
     pub fn redo(&mut self, v: &mut Volume) -> bool {
+        self.commit_xform(v);
         let Some(entry) = self.redo.pop() else { return false };
         let entry = Self::step(v, entry, true);
         self.undo.push(entry);
@@ -1371,5 +1736,225 @@ mod tests {
         e.begin(&mut v, hit, Vec3::ZERO, Vec3::NEG_Z);
         e.end(&mut v);
         assert_eq!(v.cells.iter().filter(|&&c| c == 9).count(), 16);
+    }
+
+    fn slab(v: &mut Volume, depth: i32, c: u8) {
+        for p in cuboid(IVec3::ZERO, IVec3::new(3, 3, depth - 1)) {
+            v.set(p, c);
+        }
+    }
+
+    /// A horizontal ray along +x through height z.
+    fn level_ray(z: f32) -> (Vec3, Vec3) {
+        (Vec3::new(-10.0, 1.5, z), Vec3::X)
+    }
+
+    #[test]
+    fn face_drag_extrudes_layers_in_one_undo() {
+        let mut v = vol();
+        slab(&mut v, 1, 9);
+        let mut e = Editor::new(9);
+        e.brush = Brush::Face;
+        let (ro, rd) = (Vec3::new(1.5, 1.5, 20.0), Vec3::NEG_Z);
+        let hit = pick(&v, ro, rd).unwrap();
+        assert!(e.begin(&mut v, hit, ro, rd));
+        assert_eq!(count(&v, 9), 32);
+        // Three cells above the face: three layers, then back down to one.
+        let (ro, rd) = level_ray(4.0);
+        assert!(e.drag(&mut v, ro, rd, None));
+        assert_eq!(count(&v, 9), 16 * 4);
+        let (ro, rd) = level_ray(1.2);
+        assert!(e.drag(&mut v, ro, rd, None));
+        assert_eq!(count(&v, 9), 32);
+        let (ro, rd) = level_ray(3.0);
+        e.drag(&mut v, ro, rd, None);
+        e.end(&mut v);
+        assert_eq!(count(&v, 9), 48);
+        assert!(e.undo(&mut v));
+        assert_eq!(count(&v, 9), 16);
+        assert!(!e.can_undo());
+    }
+
+    #[test]
+    fn face_drag_erases_layers() {
+        let mut v = vol();
+        slab(&mut v, 4, 9);
+        let mut e = Editor::new(9);
+        e.brush = Brush::Face;
+        e.tool = Tool::Erase;
+        let (ro, rd) = (Vec3::new(1.5, 1.5, 20.0), Vec3::NEG_Z);
+        let hit = pick(&v, ro, rd).unwrap();
+        e.begin(&mut v, hit, ro, rd);
+        // Two cells into the model.
+        let (ro, rd) = level_ray(2.0);
+        e.drag(&mut v, ro, rd, None);
+        e.end(&mut v);
+        assert_eq!(count(&v, 9), 32);
+        assert_eq!((v.get(IVec3::new(0, 0, 1)), v.get(IVec3::new(0, 0, 2))), (9, 0));
+    }
+
+    #[test]
+    fn pattern_offset_moves_the_stamp() {
+        let mut v = Volume::new(IVec3::splat(16));
+        let mut e = Editor::new(1);
+        let mut p = Volume::new(IVec3::ONE);
+        p.set(IVec3::ZERO, 7);
+        e.pattern = Some(Pattern { name: "p".into(), volume: p });
+        e.brush = Brush::Pattern;
+        e.opts.pattern_offset = IVec3::new(2, -1, 3);
+        click(&mut e, &mut v, 8.5, 8.5);
+        assert_eq!(v.get(IVec3::new(10, 7, 3)), 7);
+        assert_eq!(count(&v, 7), 1);
+    }
+
+    #[test]
+    fn step_pattern_wraps_through_the_list() {
+        let files = [std::path::Path::new("/a/x.vox"), std::path::Path::new("/b/y.vox"), std::path::Path::new("/b/z.vox")];
+        let stem = |p: Option<&std::path::Path>| p.and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
+        assert_eq!(stem(step_pattern(&files, Some("y"), 1)).as_deref(), Some("z"));
+        assert_eq!(stem(step_pattern(&files, Some("z"), 1)).as_deref(), Some("x"));
+        assert_eq!(stem(step_pattern(&files, Some("x"), -1)).as_deref(), Some("z"));
+        assert_eq!(stem(step_pattern(&files, None, 1)).as_deref(), Some("x"));
+        assert_eq!(stem(step_pattern(&files, Some("selection"), -1)).as_deref(), Some("z"));
+        assert!(step_pattern(&[], None, 1).is_none());
+    }
+
+    #[test]
+    fn move_loops_around_the_canvas() {
+        let mut v = vol();
+        v.set(IVec3::new(6, 1, 0), 4);
+        let mut e = Editor::new(1);
+        e.select_all(&v);
+        let hit = Pick { cell: IVec3::new(6, 1, 0), normal: IVec3::Z };
+        assert!(e.begin_move(&v, hit, false));
+        e.drag(&mut v, Vec3::new(9.5, 1.5, 20.0), Vec3::NEG_Z, None);
+        e.end(&mut v);
+        assert_eq!((v.get(IVec3::new(1, 1, 0)), count(&v, 4)), (4, 1));
+        assert_eq!(e.selected_count(), 1);
+    }
+
+    /// A bar of `len` voxels along x from `x0` (y = 3, z = 0).
+    fn bar(x0: i32, len: i32) -> Volume {
+        let mut v = vol();
+        for x in x0..x0 + len {
+            v.set(IVec3::new(x, 3, 0), 5);
+        }
+        v
+    }
+
+    fn row(v: &Volume) -> Vec<i32> {
+        (0..8).filter(|&x| v.get(IVec3::new(x, 3, 0)) != 0).collect()
+    }
+
+    /// Drag the +x face of the bar ending at `x_end` out to `x` with the
+    /// Move tool's `mode`.
+    fn drag_x_face(e: &mut Editor, v: &mut Volume, x_end: i32, x: f32, shift: bool) {
+        let hit = Pick { cell: IVec3::new(x_end, 3, 0), normal: IVec3::X };
+        let face = (x_end + 1) as f32;
+        assert!(e.begin_transform(v, hit, Vec3::new(face, 3.5, 20.0), Vec3::NEG_Z, shift));
+        e.drag(v, Vec3::new(x, 3.5, 20.0), Vec3::NEG_Z, None);
+        e.end(v);
+    }
+
+    #[test]
+    fn scale_stretches_and_waits_for_enter() {
+        let mut v = bar(2, 2);
+        let mut e = Editor::new(1);
+        e.tool = Tool::Move;
+        e.opts.xform = XformMode::Scale;
+        drag_x_face(&mut e, &mut v, 3, 6.0, false);
+        assert_eq!(row(&v), vec![2, 3, 4, 5]);
+        assert!(e.xform_pending());
+        // Another drag keeps building on the pending scale; Shift is two-sided.
+        drag_x_face(&mut e, &mut v, 5, 7.0, true);
+        assert_eq!(row(&v), vec![1, 2, 3, 4, 5, 6]);
+        assert!(e.commit_xform(&v));
+        assert!(!e.xform_pending());
+        assert!(e.undo(&mut v));
+        assert_eq!(row(&v), vec![2, 3]);
+        assert!(!e.can_undo());
+    }
+
+    #[test]
+    fn scale_cancel_and_undo_restore() {
+        let mut v = bar(2, 2);
+        let mut e = Editor::new(1);
+        e.select_all(&v);
+        e.opts.xform = XformMode::Scale;
+        drag_x_face(&mut e, &mut v, 3, 6.0, false);
+        assert_eq!(e.selected_count(), 4);
+        assert!(e.cancel_xform(&mut v));
+        assert_eq!((row(&v), e.selected_count()), (vec![2, 3], 2));
+        // Undo while pending cancels too.
+        drag_x_face(&mut e, &mut v, 3, 5.0, false);
+        assert_eq!(row(&v), vec![2, 3, 4]);
+        assert!(e.undo(&mut v));
+        assert_eq!(row(&v), vec![2, 3]);
+        // A brush stroke commits the pending transform first.
+        drag_x_face(&mut e, &mut v, 3, 5.0, false);
+        e.select_none();
+        click(&mut e, &mut v, 0.5, 0.5);
+        assert!(!e.xform_pending());
+        assert_eq!(row(&v), vec![2, 3, 4]);
+        e.undo(&mut v);
+        e.undo(&mut v);
+        assert_eq!((row(&v), v.get(IVec3::ZERO)), (vec![2, 3], 0));
+    }
+
+    #[test]
+    fn wrap_repeats_with_spacing_and_crops() {
+        let mut v = bar(0, 2);
+        let mut e = Editor::new(1);
+        e.opts.xform = XformMode::Wrap;
+        e.opts.wrap_space = [1, 0, 0];
+        drag_x_face(&mut e, &mut v, 1, 6.0, false);
+        assert_eq!(row(&v), vec![0, 1, 3, 4]);
+        e.commit_xform(&v);
+        let mut v = bar(0, 3);
+        drag_x_face(&mut e, &mut v, 2, 2.0, false);
+        assert_eq!(row(&v), vec![0, 1]);
+    }
+
+    #[test]
+    fn rotate_turns_about_the_box_center() {
+        let mut v = bar(2, 3);
+        let mut e = Editor::new(1);
+        e.opts.xform = XformMode::Rotate;
+        // Grab the top face at x = 5.5 and swing it a quarter turn round z.
+        let hit = Pick { cell: IVec3::new(4, 3, 0), normal: IVec3::Z };
+        assert!(e.begin_transform(&v, hit, Vec3::new(5.5, 3.5, 20.0), Vec3::NEG_Z, true));
+        e.drag(&mut v, Vec3::new(3.6, 5.5, 20.0), Vec3::NEG_Z, None);
+        e.end(&mut v);
+        let cells: Vec<IVec3> = v.filled().map(|(p, _)| p).collect();
+        assert_eq!(cells, vec![IVec3::new(3, 2, 0), IVec3::new(3, 3, 0), IVec3::new(3, 4, 0)]);
+        assert!(e.commit_xform(&v));
+    }
+
+    #[test]
+    fn code_brush_uses_its_box_as_the_volume() {
+        let mut v = vol();
+        v.set(IVec3::new(2, 2, 0), 3);
+        let mut e = Editor::new(1);
+        e.brush = Brush::Code;
+        let (ro, rd) = (Vec3::new(1.5, 1.5, 20.0), Vec3::NEG_Z);
+        let hit = pick(&v, ro, rd).unwrap();
+        e.begin(&mut v, hit, ro, rd);
+        let ro2 = Vec3::new(4.5, 3.5, 20.0);
+        let hit2 = pick(&v, ro2, rd);
+        e.drag(&mut v, ro2, rd, hit2);
+        let (lo, size) = e.code_box(&v).unwrap();
+        assert_eq!((lo, size), (IVec3::new(1, 1, 0), IVec3::new(4, 3, 1)));
+        // The shader sees the box's own voxels at local coordinates.
+        let sub = sub_volume(&v, lo, size);
+        assert_eq!((sub.get(IVec3::new(1, 1, 0)), sub.count()), (3, 1));
+        // Its output lands back in the box; empty output cells change nothing.
+        let mut out = Volume::new(size);
+        out.set(IVec3::ZERO, 8);
+        out.set(IVec3::new(3, 2, 0), 8);
+        out.set(IVec3::new(1, 1, 0), 8);
+        e.code = Some((lo, out));
+        assert!(e.end(&mut v));
+        assert_eq!((v.get(IVec3::new(1, 1, 0)), v.get(IVec3::new(4, 3, 0)), v.get(IVec3::new(2, 2, 0))), (8, 8, 3));
+        assert_eq!(v.count(), 3);
     }
 }

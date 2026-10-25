@@ -202,6 +202,7 @@ fn base_tools() -> Value {
             "source": { "type": "string", "description": "Or inline GLSL defining float map(vec3 v); built-ins: i_volume_size, i_color_index, voxel(v), palette(i), color_sel(k)" },
             "args": { "type": ["array", "object"], "items": { "type": "number" }, "description": "Argument values: an array in order, or an object by arg var name" },
             "color": { "type": ["integer", "string"], "description": "The shader's i_color_index for this run (1-255 or \"#rrggbb\"); default: the current color" },
+            "iterations": { "type": "integer", "minimum": 1, "maximum": 64, "description": "Run it this many times, each pass over the last one's result (default 1)" },
         }), &[]),
         tool("get_palette", "Palette colors as hex with their materials. Default: only colors in use.", json!({ "all": { "type": "boolean" } }), &[]),
         tool("set_palette_colors", "Set exact palette colors.", json!({
@@ -1711,8 +1712,9 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if paint == 0 {
                 bail!("color 0 is empty space; pass a palette color 1-255");
             }
+            let iterations = int_in(a, "iterations", 1, 1, 64)? as u32;
             let sels: Vec<u8> = (1..256).filter(|&i| ctx.ed.palette.selected[i]).map(|i| i as u8).collect();
-            let out = crate::xs::run(&ctx.r.device, &ctx.r.queue, &shader, &values, &ctx.scene.volume, &ctx.scene.palette, paint, &sels)?;
+            let out = crate::xs::run_iterations(&ctx.r.device, &ctx.r.queue, &shader, &values, &ctx.scene.volume, &ctx.scene.palette, paint, &sels, iterations)?;
             let new = match ctx.ed.editor.selection() {
                 Some(sel) => Volume::from_cells(
                     out.dims,
