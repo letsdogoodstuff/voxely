@@ -6,7 +6,7 @@ use glam::Vec3;
 
 use crate::env::{self, EnvMap};
 use crate::modeler::Modeler;
-use crate::scene::{BgMode, DenoiseView, GpuLight, GpuMaterial, Projection, RenderSettings, Scene, Volume};
+use crate::scene::{BgMode, DenoiseView, GpuLight, GpuMaterial, Mask, Projection, RenderSettings, Scene, Volume};
 
 const COMMON_WGSL: &str = include_str!("shaders/common.wgsl");
 const PATHTRACE_WGSL: &str = include_str!("shaders/pathtrace.wgsl");
@@ -111,16 +111,16 @@ fn scratch_buffer(device: &wgpu::Device, label: &str, size: u64, extra: wgpu::Bu
     })
 }
 
-fn write_3d(queue: &wgpu::Queue, tex: &wgpu::Texture, dims: [u32; 3], data: &[u8]) {
+fn write_3d(queue: &wgpu::Queue, tex: &wgpu::Texture, dims: [u32; 3], texel: u32, data: &[u8]) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         data,
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(dims[0]), rows_per_image: Some(dims[1]) },
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(dims[0] * texel), rows_per_image: Some(dims[1]) },
         wgpu::Extent3d { width: dims[0], height: dims[1], depth_or_array_layers: dims[2] },
     );
 }
 
-fn upload_3d(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, dims: [u32; 3], data: &[u8]) -> wgpu::Texture {
+fn upload_3d(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, dims: [u32; 3], format: wgpu::TextureFormat, data: &[u8]) -> wgpu::Texture {
     let size = wgpu::Extent3d { width: dims[0], height: dims[1], depth_or_array_layers: dims[2] };
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -128,12 +128,55 @@ fn upload_3d(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, dims: [u32
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D3,
-        format: wgpu::TextureFormat::R8Uint,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    write_3d(queue, &tex, dims, data);
+    write_3d(queue, &tex, dims, (data.len() / (dims[0] * dims[1] * dims[2]) as usize) as u32, data);
     tex
+}
+
+/// Bricks per row and per column of a layer of the path tracer's brick
+/// pool; must match `POOL_W` in `pathtrace.wgsl`.
+const POOL_W: u32 = 64;
+
+/// A volume in the path tracer's sparse layout: a brick map (0 for an
+/// empty 8³ brick, else its pool slot plus one) and a pool texture of the
+/// non-empty bricks, `POOL_W` x `POOL_W` bricks per layer.
+pub struct TraceLayout {
+    pub map: Vec<u32>,
+    pub map_dims: [u32; 3],
+    pub pool: Vec<u8>,
+    pub pool_dims: [u32; 3],
+}
+
+impl TraceLayout {
+    pub fn new(v: &Volume) -> Self {
+        let bd = v.brick_dims();
+        let map_dims = [bd.x.max(1) as u32, bd.y.max(1) as u32, bd.z.max(1) as u32];
+        let mut map = vec![0u32; (map_dims[0] * map_dims[1] * map_dims[2]) as usize];
+        let bricks: Vec<_> = v.cells.bricks().filter(|(_, cells)| cells.iter().any(|&c| c != 0)).collect();
+        let layers = (bricks.len() as u32).div_ceil(POOL_W * POOL_W).max(1);
+        let pool_dims = [POOL_W * 8, POOL_W * 8, layers * 8];
+        let mut pool = vec![0u8; (pool_dims[0] * pool_dims[1] * pool_dims[2]) as usize];
+        for (slot, (b, cells)) in bricks.iter().enumerate() {
+            let slot = slot as u32;
+            map[(b.x as u32 + map_dims[0] * (b.y as u32 + map_dims[1] * b.z as u32)) as usize] = slot + 1;
+            let at = [slot % POOL_W * 8, slot / POOL_W % POOL_W * 8, slot / (POOL_W * POOL_W) * 8];
+            for z in 0..8 {
+                for y in 0..8 {
+                    let row = (at[0] + pool_dims[0] * (at[1] + y + pool_dims[1] * (at[2] + z))) as usize;
+                    pool[row..row + 8].copy_from_slice(&cells[(8 * (y + 8 * z)) as usize..][..8]);
+                }
+            }
+        }
+        TraceLayout { map, map_dims, pool, pool_dims }
+    }
+
+    /// Whether the GPU can hold this layout.
+    pub fn fits(&self, max_dim: u32) -> bool {
+        self.map_dims.iter().chain(&self.pool_dims).all(|&d| d <= max_dim)
+    }
 }
 
 pub async fn request_device(
@@ -223,9 +266,12 @@ pub struct Renderer {
     light_count: u32,
     light_power: f32,
     params: wgpu::Buffer,
+    /// The path tracer's voxels (see `TraceLayout`): the pool of non-empty
+    /// bricks and the brick map into it.
     vox_tex: wgpu::Texture,
     brick_tex: wgpu::Texture,
     brick_dims: [u32; 3],
+    pool_dims: [u32; 3],
     vox_view: wgpu::TextureView,
     brick_view: wgpu::TextureView,
     materials: wgpu::Buffer,
@@ -290,9 +336,9 @@ impl Renderer {
     ) -> Self {
         let v = &scene.volume;
         let dims = [v.dims.x as u32, v.dims.y as u32, v.dims.z as u32];
-        let bdims = [v.brick_dims.x as u32, v.brick_dims.y as u32, v.brick_dims.z as u32];
-        let vox_tex = upload_3d(&device, &queue, "voxels", dims, &v.cells);
-        let brick_tex = upload_3d(&device, &queue, "bricks", bdims, &v.bricks);
+        let layout = TraceLayout::new(v);
+        let vox_tex = upload_3d(&device, &queue, "voxel pool", layout.pool_dims, wgpu::TextureFormat::R8Uint, &layout.pool);
+        let brick_tex = upload_3d(&device, &queue, "brick map", layout.map_dims, wgpu::TextureFormat::R32Uint, bytemuck::cast_slice(&layout.map));
         let vox_view = vox_tex.create_view(&Default::default());
         let brick_view = brick_tex.create_view(&Default::default());
         let materials = storage_buffer(&device, &queue, "materials", bytemuck::cast_slice(&scene.materials));
@@ -371,7 +417,8 @@ impl Renderer {
             params,
             vox_tex,
             brick_tex,
-            brick_dims: bdims,
+            brick_dims: layout.map_dims,
+            pool_dims: layout.pool_dims,
             vox_view,
             brick_view,
             materials,
@@ -566,7 +613,7 @@ impl Renderer {
 
     /// Re-upload voxels after edits, reallocating if the size changed.
     /// `sel` marks selected cells for the modeler.
-    pub fn upload_volume(&mut self, v: &Volume, sel: Option<&[bool]>) {
+    pub fn upload_volume(&mut self, v: &Volume, sel: Option<&Mask>) {
         if let Some(m) = self.modeler.as_mut() {
             m.upload_volume(&self.device, v, sel);
             m.set_context(&self.device, None);
@@ -577,7 +624,7 @@ impl Renderer {
 
     /// Upload a scene's voxels: the edited model, with the other models
     /// as dimmed context, for the modeler; every model for the path tracer.
-    pub fn upload_scene(&mut self, scene: &Scene, sel: Option<&[bool]>) {
+    pub fn upload_scene(&mut self, scene: &Scene, sel: Option<&Mask>) {
         if scene.origin != self.frame_origin {
             self.camera.target += (self.frame_origin - scene.origin).as_vec3();
             self.frame_origin = scene.origin;
@@ -595,17 +642,24 @@ impl Renderer {
 
     fn upload_trace(&mut self, v: &Volume) {
         let dims = [v.dims.x as u32, v.dims.y as u32, v.dims.z as u32];
-        if dims != self.dims {
-            let bdims = [v.brick_dims.x as u32, v.brick_dims.y as u32, v.brick_dims.z as u32];
-            self.vox_tex = upload_3d(&self.device, &self.queue, "voxels", dims, &v.cells);
-            self.brick_tex = upload_3d(&self.device, &self.queue, "bricks", bdims, &v.bricks);
+        let layout = TraceLayout::new(v);
+        if !layout.fits(self.device.limits().max_texture_dimension_3d) {
+            log::warn!("scene too large for the path tracer ({:?} voxels, {} bricks)", dims, layout.pool.len() / 512);
+            return;
+        }
+        if layout.map_dims != self.brick_dims || layout.pool_dims != self.pool_dims {
+            self.vox_tex = upload_3d(&self.device, &self.queue, "voxel pool", layout.pool_dims, wgpu::TextureFormat::R8Uint, &layout.pool);
+            self.brick_tex = upload_3d(&self.device, &self.queue, "brick map", layout.map_dims, wgpu::TextureFormat::R32Uint, bytemuck::cast_slice(&layout.map));
             self.vox_view = self.vox_tex.create_view(&Default::default());
             self.brick_view = self.brick_tex.create_view(&Default::default());
-            (self.dims, self.brick_dims) = (dims, bdims);
+            (self.brick_dims, self.pool_dims) = (layout.map_dims, layout.pool_dims);
+            self.dims = dims;
             self.rebuild_targets(self.targets.width, self.targets.height);
+        } else {
+            write_3d(&self.queue, &self.vox_tex, self.pool_dims, 1, &layout.pool);
+            write_3d(&self.queue, &self.brick_tex, self.brick_dims, 4, bytemuck::cast_slice(&layout.map));
+            self.dims = dims;
         }
-        write_3d(&self.queue, &self.vox_tex, self.dims, &v.cells);
-        write_3d(&self.queue, &self.brick_tex, self.brick_dims, &v.bricks);
         self.reset();
     }
 
@@ -817,7 +871,7 @@ impl Renderer {
     }
 
     /// Refresh only the modeler's selection highlight.
-    pub fn upload_selection(&mut self, v: &Volume, sel: Option<&[bool]>) {
+    pub fn upload_selection(&mut self, v: &Volume, sel: Option<&Mask>) {
         if let Some(m) = self.modeler.as_mut() {
             m.upload_volume(&self.device, v, sel);
         }
@@ -826,7 +880,7 @@ impl Renderer {
     /// Show `v` (and dimmed `context`) in the modeler only, leaving the
     /// path tracer's voxels alone: screenshots of something other than the
     /// edited part. Call again with the scene's own to restore.
-    pub fn modeler_show(&mut self, v: &Volume, context: Option<&(Volume, glam::IVec3)>, sel: Option<&[bool]>) {
+    pub fn modeler_show(&mut self, v: &Volume, context: Option<&(Volume, glam::IVec3)>, sel: Option<&Mask>) {
         if let Some(m) = self.modeler.as_mut() {
             m.upload_volume(&self.device, v, sel);
             m.set_context(&self.device, context);

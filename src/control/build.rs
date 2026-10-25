@@ -8,7 +8,7 @@ use glam::{IVec3, Mat3, Vec2, Vec3};
 use serde_json::{Value, json};
 
 use super::{Ctx, NEIGHBORS, apply, arr, boolean, color, color_arg, color_schema, count, edited, get, ivec3, num, opt_ivec3, string, text, tool, xyz};
-use crate::scene::Volume;
+use crate::scene::{Mask, Volume};
 
 #[derive(Default)]
 pub struct State {
@@ -164,10 +164,12 @@ pub fn mirror_edit(old: &Volume, new: Volume, axes: [bool; 3], planes: IVec3) ->
         return new;
     }
     let mut out = new.clone();
-    let mut done = vec![false; new.cells.len()];
+    let mut changed: Vec<usize> = old.cells.diff(&new.cells).into_iter().map(|c| c.0).collect();
+    changed.sort_unstable();
+    let mut done = Mask::new(new.dims);
     let mut orbit = Vec::with_capacity(8);
-    for i in 0..new.cells.len() {
-        if old.cells[i] == new.cells[i] || done[i] {
+    for i in changed {
+        if done[i] {
             continue;
         }
         orbit.clear();
@@ -185,7 +187,7 @@ pub fn mirror_edit(old: &Volume, new: Volume, axes: [bool; 3], planes: IVec3) ->
         let idx: Vec<usize> = orbit.iter().map(|&p| new.index(p)).collect();
         let c = idx.iter().filter(|&&j| old.cells[j] != new.cells[j]).map(|&j| new.cells[j]).max().unwrap_or(0);
         for j in idx {
-            done[j] = true;
+            done.set(j, true);
             out.set_index(j, c);
         }
     }
@@ -617,9 +619,8 @@ pub fn read_stamp(path: &std::path::Path) -> Result<(Volume, Vec<[u8; 4]>)> {
 fn crop(v: &Volume, lo: IVec3, hi: IVec3) -> Volume {
     let (lo, hi) = (lo.max(IVec3::ZERO), hi.min(v.dims - 1));
     let mut out = Volume::new((hi - lo + 1).max(IVec3::ONE));
-    for (i, &c) in v.cells.iter().enumerate() {
-        let p = v.position(i);
-        if c != 0 && p.cmpge(lo).all() && p.cmple(hi).all() {
+    for (p, c) in v.filled() {
+        if p.cmpge(lo).all() && p.cmple(hi).all() {
             out.set(p - lo, c);
         }
     }
@@ -848,7 +849,7 @@ mod tests {
         assert_eq!(n(&m), 4);
         assert_eq!(m.get(IVec3::new(5, 5, 0)), 7);
         // Erasing mirrors too.
-        let erased = mirror_edit(&m, Volume::from_cells(m.dims, { let mut c = m.cells.clone(); c[m.index(IVec3::new(1, 0, 0))] = 0; c }), [true, true, false], IVec3::new(6, 5, 3));
+        let erased = mirror_edit(&m, Volume::from_cells(m.dims, { let mut c = m.cells.to_vec(); c[m.index(IVec3::new(1, 0, 0))] = 0; c }), [true, true, false], IVec3::new(6, 5, 3));
         assert_eq!(n(&erased), 0);
     }
 

@@ -352,11 +352,19 @@ impl Graph {
         let mut xyzi = Vec::new();
         for z in 0..size.z {
             for y in 0..size.y {
-                for x in 0..size.x {
-                    let c = v.get(origin + IVec3::new(x, y, z));
+                let mut x = 0;
+                while x < size.x {
+                    let p = origin + IVec3::new(x, y, z);
+                    // Skip the rest of a brick that holds no voxels.
+                    if !v.cells.brick_allocated(p >> 3) {
+                        x += 8 - (p.x & 7);
+                        continue;
+                    }
+                    let c = v.get(p);
                     if c != 0 {
                         xyzi.extend_from_slice(&[x as u8, y as u8, z as u8, c]);
                     }
+                    x += 1;
                 }
             }
         }

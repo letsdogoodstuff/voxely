@@ -9,6 +9,7 @@ mod export;
 mod gltf;
 mod gltf_import;
 mod gpu;
+mod grid;
 mod mcp;
 mod modeler;
 mod outline;
@@ -350,7 +351,7 @@ fn load_scene(args: &Args) -> Result<Scene> {
         }
     }
     let d = scene.volume.dims;
-    let filled = scene.volume.cells.iter().filter(|&&c| c != 0).count();
+    let filled = scene.volume.count();
     log::info!("loaded {} ({}x{}x{}, {filled} voxels) in {:.1?}", path.display(), d.x, d.y, d.z, t.elapsed());
     Ok(scene)
 }
@@ -400,7 +401,7 @@ fn apply_xs(scene: &mut Scene, path: &Path, values: &[f32]) -> Result<()> {
     let (_adapter, device, queue) = pollster::block_on(gpu::request_device(&instance, None))?;
     let t = std::time::Instant::now();
     scene.volume = xs::run(&device, &queue, &shader, values, &scene.volume, &scene.palette, 1, &[])?;
-    let filled = scene.volume.cells.iter().filter(|&&c| c != 0).count();
+    let filled = scene.volume.count();
     log::info!("xs {}: {filled} voxels in {:.1?}", shader.name, t.elapsed());
     Ok(())
 }

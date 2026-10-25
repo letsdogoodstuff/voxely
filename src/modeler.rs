@@ -5,7 +5,7 @@
 use glam::{IVec3, Mat4, Vec3};
 
 use crate::gpu::Camera;
-use crate::scene::{Projection, Volume};
+use crate::scene::{Mask, Projection, Volume};
 
 const MODELER_WGSL: &str = include_str!("shaders/modeler.wgsl");
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -36,13 +36,10 @@ fn pack(kind: u32, color: u8, ao: u32) -> u32 {
 }
 
 /// Exposed faces of every voxel as triangles, plus the ground quad.
-pub fn build_mesh(v: &Volume, sel: Option<&[bool]>) -> Vec<Vertex> {
+pub fn build_mesh(v: &Volume, sel: Option<&Mask>) -> Vec<Vertex> {
     let mut out = Vec::new();
     let solid = |p: IVec3| v.get(p) != 0;
-    for (i, &c) in v.cells.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
+    for (i, c) in v.cells.filled() {
         let p = v.position(i);
         let selected = (sel.is_some_and(|s| s[i]) as u32) << 18;
         for axis in 0..3 {
@@ -382,7 +379,7 @@ impl Modeler {
         m
     }
 
-    pub fn upload_volume(&mut self, device: &wgpu::Device, volume: &Volume, sel: Option<&[bool]>) {
+    pub fn upload_volume(&mut self, device: &wgpu::Device, volume: &Volume, sel: Option<&Mask>) {
         (self.vertices, self.vertex_count) = vertex_buffer(device, volume, sel);
         if volume.dims.as_vec3() != self.dims {
             self.bounds = bounds_buffer(device, volume.dims);
@@ -580,7 +577,7 @@ fn bounds_buffer(device: &wgpu::Device, dims: IVec3) -> wgpu::Buffer {
     })
 }
 
-fn vertex_buffer(device: &wgpu::Device, volume: &Volume, sel: Option<&[bool]>) -> (wgpu::Buffer, u32) {
+fn vertex_buffer(device: &wgpu::Device, volume: &Volume, sel: Option<&Mask>) -> (wgpu::Buffer, u32) {
     let mesh = build_mesh(volume, sel);
     (mesh_buffer(device, &mesh), mesh.len() as u32)
 }

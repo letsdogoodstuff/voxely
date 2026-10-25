@@ -6,19 +6,23 @@ use std::collections::VecDeque;
 
 use glam::IVec3;
 
-use crate::scene::Volume;
+use crate::scene::{Mask, Volume};
 
 /// Largest canvas edge the tools will create.
 pub const MAX_DIM: i32 = 1024;
 
 const NEIGHBORS: [IVec3; 6] = [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z];
 
-fn selected(sel: Option<&[bool]>, i: usize) -> bool {
+fn selected(sel: Option<&Mask>, i: usize) -> bool {
     sel.is_none_or(|s| s[i])
 }
 
 fn map(v: &Volume, f: impl Fn(usize, u8) -> u8) -> Volume {
-    Volume::from_cells(v.dims, v.cells.iter().enumerate().map(|(i, &c)| f(i, c)).collect())
+    let mut out = Volume::new(v.dims);
+    for (i, &c) in v.cells.iter().enumerate() {
+        out.set_index(i, f(i, c));
+    }
+    out
 }
 
 /// Fill every empty cell [U].
@@ -27,12 +31,12 @@ pub fn full(v: &Volume, color: u8) -> Volume {
 }
 
 /// Recolor voxels [I].
-pub fn fill(v: &Volume, sel: Option<&[bool]>, color: u8) -> Volume {
+pub fn fill(v: &Volume, sel: Option<&Mask>, color: u8) -> Volume {
     map(v, |i, c| if c != 0 && selected(sel, i) { color } else { c })
 }
 
 /// Remove voxels [Delete].
-pub fn clear(v: &Volume, sel: Option<&[bool]>) -> Volume {
+pub fn clear(v: &Volume, sel: Option<&Mask>) -> Volume {
     map(v, |i, c| if selected(sel, i) { 0 } else { c })
 }
 
@@ -48,12 +52,9 @@ pub fn double(v: &Volume) -> Option<Volume> {
         return None;
     }
     let mut out = Volume::new(dims);
-    for (i, &c) in v.cells.iter().enumerate() {
-        if c != 0 {
-            let p = v.position(i) * 2;
-            for k in 0..8 {
-                out.set(p + IVec3::new(k & 1, (k >> 1) & 1, k >> 2), c);
-            }
+    for (p, c) in v.filled() {
+        for k in 0..8 {
+            out.set(p * 2 + IVec3::new(k & 1, (k >> 1) & 1, k >> 2), c);
         }
     }
     Some(out)
@@ -221,7 +222,7 @@ pub fn crop(v: &Volume) -> Option<(Volume, IVec3)> {
 }
 
 /// Shift by one voxel along `axis`, wrapping around the canvas.
-pub fn loop_shift(v: &Volume, sel: Option<&[bool]>, axis: usize, dir: i32) -> Volume {
+pub fn loop_shift(v: &Volume, sel: Option<&Mask>, axis: usize, dir: i32) -> Volume {
     let mut out = match sel {
         Some(_) => clear(v, sel),
         None => Volume::new(v.dims),
@@ -299,7 +300,9 @@ pub fn region(v: &Volume, start: IVec3, o: RegionOptions) -> Vec<usize> {
         return Vec::new();
     }
     if o.same_color {
-        return (0..v.cells.len()).filter(|&i| v.cells[i] == color).collect();
+        let mut cells: Vec<usize> = v.cells.filled().filter(|&(_, c)| c == color).map(|(i, _)| i).collect();
+        cells.sort_unstable();
+        return cells;
     }
     let steps: Vec<IVec3> = if o.diagonal {
         (0..27).map(|k| IVec3::new(k % 3, (k / 3) % 3, k / 9) - IVec3::ONE).filter(|d| *d != IVec3::ZERO).collect()

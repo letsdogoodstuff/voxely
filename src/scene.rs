@@ -1,4 +1,4 @@
-//! Flattens a `VoxFile` scene graph into a dense voxel volume plus the
+//! Flattens a `VoxFile` scene graph into a voxel volume plus the
 //! material table and render settings the GPU path tracer consumes.
 
 use anyhow::{bail, Result};
@@ -10,29 +10,25 @@ use crate::env::EnvMode;
 use crate::vox::{Dict, VoxFile};
 use crate::world::World;
 
-/// Edge length of the coarse occupancy bricks used to skip empty space.
-pub const BRICK: i32 = 8;
+use crate::grid::Grid;
+
+/// Palette index per cell, stored sparsely: only 8³ bricks that have held
+/// a voxel take memory.
+pub type Cells = Grid<u8>;
+
+/// A selection or highlight: one flag per cell, stored like `Cells`.
+pub type Mask = Grid<bool>;
 
 #[derive(Clone)]
 pub struct Volume {
     pub dims: IVec3,
-    /// Color index per cell, x-fastest then y then z.
-    pub cells: Vec<u8>,
-    /// 1 if the brick may contain a voxel (stays set after erasing, which
-    /// only costs a little traversal speed).
-    pub bricks: Vec<u8>,
-    pub brick_dims: IVec3,
+    /// Color index per cell, addressed x-fastest then y then z.
+    pub cells: Cells,
 }
 
 impl Volume {
     pub fn new(dims: IVec3) -> Self {
-        let brick_dims = (dims + IVec3::splat(BRICK - 1)) / BRICK;
-        Volume {
-            dims,
-            cells: vec![0; (dims.x * dims.y * dims.z) as usize],
-            bricks: vec![0; (brick_dims.x * brick_dims.y * brick_dims.z) as usize],
-            brick_dims,
-        }
+        Volume { dims, cells: Grid::new(dims) }
     }
 
     pub fn contains(&self, p: IVec3) -> bool {
@@ -48,46 +44,53 @@ impl Volume {
         IVec3::new(i % self.dims.x, (i / self.dims.x) % self.dims.y, i / (self.dims.x * self.dims.y))
     }
 
-    /// A volume holding `cells` (x-fastest), with bricks computed.
+    /// A volume holding `cells` (dense, x-fastest).
     pub fn from_cells(dims: IVec3, cells: Vec<u8>) -> Self {
-        let mut v = Volume::new(dims);
-        v.cells = cells;
-        v.refresh_bricks();
-        v
+        Volume { dims, cells: Grid::from_vec(dims, &cells) }
     }
 
-    /// Recompute brick occupancy exactly (after bulk edits).
+    /// Bricks along each axis.
+    pub fn brick_dims(&self) -> IVec3 {
+        self.cells.brick_dims()
+    }
+
+    /// Free the storage of bricks emptied by erasing (after bulk edits).
     pub fn refresh_bricks(&mut self) {
-        self.bricks.fill(0);
-        for i in 0..self.cells.len() {
-            if self.cells[i] != 0 {
-                let b = self.position(i) / BRICK;
-                let bi = (b.x + self.brick_dims.x * (b.y + self.brick_dims.y * b.z)) as usize;
-                self.bricks[bi] = 1;
-            }
-        }
+        self.cells.compact();
     }
 
     pub fn set(&mut self, p: IVec3, c: u8) {
         if self.contains(p) {
-            let i = self.index(p);
-            self.set_index(i, c);
+            self.cells.set_at(p, c);
         }
     }
 
     /// Color index at `p`, 0 outside the volume.
     pub fn get(&self, p: IVec3) -> u8 {
-        if self.contains(p) { self.cells[self.index(p)] } else { 0 }
+        if self.contains(p) { self.cells.at(p) } else { 0 }
     }
 
-    /// Set a cell by index, keeping the brick occupancy conservative.
     pub fn set_index(&mut self, i: usize, c: u8) {
-        self.cells[i] = c;
-        if c != 0 {
-            let b = self.position(i) / BRICK;
-            let bi = (b.x + self.brick_dims.x * (b.y + self.brick_dims.y * b.z)) as usize;
-            self.bricks[bi] = 1;
-        }
+        self.cells.set(i, c);
+    }
+
+    /// Solid cells as (position, color), brick by brick. Costs time for the
+    /// bricks holding voxels, not the whole box.
+    pub fn filled(&self) -> impl Iterator<Item = (IVec3, u8)> + '_ {
+        self.cells.filled().map(|(i, c)| (self.position(i), c))
+    }
+
+    /// Solid cells as (position, color) in dense order (x fastest), for
+    /// output whose order should not depend on the storage.
+    pub fn filled_sorted(&self) -> Vec<(IVec3, u8)> {
+        let mut cells: Vec<(usize, u8)> = self.cells.filled().collect();
+        cells.sort_unstable_by_key(|c| c.0);
+        cells.into_iter().map(|(i, c)| (self.position(i), c)).collect()
+    }
+
+    /// Number of solid cells.
+    pub fn count(&self) -> usize {
+        self.cells.filled().count()
     }
 }
 
@@ -306,6 +309,10 @@ pub enum Mode {
     World,
 }
 
+/// Most 8³ bricks of voxels a scene can hold: what the path tracer's brick
+/// pool fits in 2048-deep textures (half a billion voxels' worth).
+pub const MAX_BRICKS: usize = 1 << 20;
+
 /// Saved trees for undoing whole-part changes.
 const HISTORY: usize = 64;
 
@@ -320,7 +327,7 @@ pub struct Scene {
     /// World position of `volume`'s cell 0.
     pub origin: IVec3,
     /// World mode: the model node each cell of `volume` came from.
-    pub owners: Vec<u32>,
+    pub owners: Grid<u32>,
     /// Edit mode: the other visible models, flattened, and where their
     /// cell 0 sits relative to `volume`.
     pub context: Option<(Volume, IVec3)>,
@@ -362,36 +369,29 @@ pub fn build_lights(v: &Volume, mats: &[GpuMaterial]) -> (Vec<GpuLight>, f32) {
     };
     let mut lights = Vec::new();
     let mut total = 0.0f32;
-    for z in 0..v.dims.z {
-        for y in 0..v.dims.y {
-            for x in 0..v.dims.x {
-                let c = v.cells[(x + v.dims.x * (y + v.dims.y * z)) as usize];
-                if c == 0 {
+    // Emissive voxels in dense order, so the light list doesn't depend on
+    // how the volume is stored.
+    let mut emissive: Vec<(usize, u8)> = v.cells.filled().filter(|&(_, c)| power(c) > 0.0).collect();
+    emissive.sort_unstable_by_key(|&(i, _)| i);
+    for (i, c) in emissive {
+        let pw = power(c);
+        let p = v.position(i);
+        for axis in 0..3 {
+            for positive in [false, true] {
+                let mut d = IVec3::ZERO;
+                d[axis] = if positive { 1 } else { -1 };
+                if !see_through(p + d) || lights.len() >= MAX_FACES {
                     continue;
                 }
-                let pw = power(c);
-                if pw <= 0.0 {
-                    continue;
+                let mut corner = p.as_vec3();
+                if positive {
+                    corner[axis] += 1.0;
                 }
-                let p = IVec3::new(x, y, z);
-                for axis in 0..3 {
-                    for positive in [false, true] {
-                        let mut d = IVec3::ZERO;
-                        d[axis] = if positive { 1 } else { -1 };
-                        if !see_through(p + d) || lights.len() >= MAX_FACES {
-                            continue;
-                        }
-                        let mut corner = p.as_vec3();
-                        if positive {
-                            corner[axis] += 1.0;
-                        }
-                        total += pw;
-                        lights.push(GpuLight {
-                            corner_cdf: [corner.x, corner.y, corner.z, total],
-                            axis_sign_mat: [axis as u32, positive as u32, c as u32, 0],
-                        });
-                    }
-                }
+                total += pw;
+                lights.push(GpuLight {
+                    corner_cdf: [corner.x, corner.y, corner.z, total],
+                    axis_sign_mat: [axis as u32, positive as u32, c as u32, 0],
+                });
             }
         }
     }
@@ -837,9 +837,11 @@ impl Scene {
         if !models.iter().any(|&m| world.visible(m)) {
             bail!("scene has no visible models");
         }
-        let cells: u64 = models.iter().filter_map(|&m| world.node(m)?.volume()).map(|v| v.cells.len() as u64).sum();
-        if cells > 1024 * 1024 * 1024 {
-            bail!("scene too large");
+        // Storage, and the path tracer's brick pool, grow with the bricks
+        // holding voxels, not with the models' boxes.
+        let bricks: usize = models.iter().filter_map(|&m| world.node(m)?.volume()).map(|v| v.cells.allocated()).sum();
+        if bricks > MAX_BRICKS {
+            bail!("scene too large: voxels in {bricks} 8x8x8 bricks (the limit is {MAX_BRICKS})");
         }
         let render_dicts = f.render_order.iter().filter(|k| *k != crate::vox::ANIM_TYPE).filter_map(|k| f.render.get(k).cloned()).collect();
         Ok(Self::assemble(world, f.palette.clone(), &f.materials, render_dicts, RenderSettings::from_vox(f)))
@@ -865,7 +867,7 @@ impl Scene {
             world,
             mode: Mode::World,
             origin: IVec3::ZERO,
-            owners: Vec::new(),
+            owners: Grid::new(IVec3::ZERO),
             context: None,
             picked: Vec::new(),
             history: Vec::new(),
@@ -909,7 +911,7 @@ impl Scene {
                 // around the others it would sit at the wrong angle.
                 self.context = if self.world.tilted(id) { None } else { self.world.composite(Some(id)).map(|c| (c.volume, c.origin - origin)) };
                 (self.volume, self.origin) = (v, origin);
-                self.owners.clear();
+                self.owners = Grid::new(IVec3::ZERO);
                 self.picked = vec![id];
             }
             Mode::World => {
@@ -918,7 +920,7 @@ impl Scene {
                     Some(c) => (self.volume, self.origin, self.owners) = (c.volume, c.origin, c.owners),
                     None => {
                         self.volume = Volume::new(IVec3::ONE);
-                        self.owners = vec![0];
+                        self.owners = Grid::new(IVec3::ONE);
                     }
                 }
                 let w = &self.world;
@@ -1045,7 +1047,7 @@ impl Scene {
     }
 
     /// World mode: cells of the picked nodes, for highlighting.
-    pub fn highlight(&self) -> Option<Vec<bool>> {
+    pub fn highlight(&self) -> Option<Mask> {
         if self.mode != Mode::World || self.picked.is_empty() {
             return None;
         }
@@ -1055,7 +1057,13 @@ impl Scene {
                 ids.insert(i as u32);
             });
         }
-        Some(self.owners.iter().map(|o| ids.contains(o)).collect())
+        let mut mask = Mask::new(self.owners.dims());
+        for (i, o) in self.owners.filled() {
+            if ids.contains(&o) {
+                mask.set(i, true);
+            }
+        }
+        Some(mask)
     }
 
     /// Start a tree change that `apply` continues (one undo step, e.g. a
@@ -1094,7 +1102,7 @@ impl Scene {
 
     /// Recolor every model through `remap` (palette sorting).
     pub fn remap(&mut self, remap: &[u8]) {
-        let fix = |v: &mut Volume| v.cells.iter_mut().filter(|c| **c != 0).for_each(|c| *c = remap[*c as usize]);
+        let fix = |v: &mut Volume| v.cells.update_filled(|c| *c = remap[*c as usize]);
         fix(&mut self.volume);
         if let Some((ctx, _)) = &mut self.context {
             fix(ctx);
@@ -1114,11 +1122,9 @@ impl Scene {
                 let hi = (*offset + ctx.dims).max(self.volume.dims);
                 let mut out = Volume::new(hi - lo);
                 for (v, at) in [(ctx, *offset - lo), (&self.volume, -lo)] {
-                    for (i, &c) in v.cells.iter().enumerate() {
-                        if c != 0 {
-                            let j = out.index(v.position(i) + at);
-                            out.set_index(j, c);
-                        }
+                    for (p, c) in v.filled() {
+                        let j = out.index(p + at);
+                        out.set_index(j, c);
                     }
                 }
                 std::borrow::Cow::Owned(out)

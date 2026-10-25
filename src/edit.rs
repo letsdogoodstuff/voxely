@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use glam::{IVec3, Vec3};
 
 use crate::ops;
-use crate::scene::Volume;
+use crate::scene::{Mask, Volume};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tool {
@@ -325,7 +325,7 @@ pub struct Editor {
     stroke: Option<Stroke>,
     moving: Option<Move>,
     /// Selected cells per volume cell; empty when nothing is selected.
-    sel: Vec<bool>,
+    sel: Mask,
     sel_count: usize,
     /// Copied voxels at their original positions.
     clipboard: Vec<(IVec3, u8)>,
@@ -348,7 +348,7 @@ impl Editor {
             redo: Vec::new(),
             stroke: None,
             moving: None,
-            sel: Vec::new(),
+            sel: Mask::new(IVec3::ZERO),
             sel_count: 0,
             clipboard: Vec::new(),
         }
@@ -368,8 +368,8 @@ impl Editor {
 
     // ---- selection ----
 
-    pub fn selection(&self) -> Option<&[bool]> {
-        (self.sel_count > 0).then_some(self.sel.as_slice())
+    pub fn selection(&self) -> Option<&Mask> {
+        (self.sel_count > 0).then_some(&self.sel)
     }
 
     pub fn selected_count(&self) -> usize {
@@ -380,41 +380,50 @@ impl Editor {
         !self.clipboard.is_empty()
     }
 
-    fn set_selection(&mut self, v: &Volume, mask: Vec<bool>) {
-        self.sel_count = mask.iter().zip(&v.cells).filter(|(s, c)| **s && **c != 0).count();
-        self.sel = if self.sel_count > 0 { mask } else { Vec::new() };
+    fn set_selection(&mut self, v: &Volume, mask: Mask) {
+        self.sel_count = mask.filled().filter(|&(i, _)| v.cells[i] != 0).count();
+        self.sel = if self.sel_count > 0 { mask } else { Mask::new(IVec3::ZERO) };
         self.sel_dirty = true;
     }
 
     /// Combine solid cells `cells` with the selection using `mode`.
     pub fn select(&mut self, v: &Volume, cells: impl IntoIterator<Item = usize>, mode: SelMode) {
-        let mut mask = match (mode, self.sel.len() == v.cells.len()) {
-            (SelMode::Replace, _) | (_, false) => vec![false; v.cells.len()],
-            _ => std::mem::take(&mut self.sel),
+        let mut mask = match (mode, self.sel.dims() == v.dims) {
+            (SelMode::Replace, _) | (_, false) => Mask::new(v.dims),
+            _ => std::mem::replace(&mut self.sel, Mask::new(IVec3::ZERO)),
         };
         for i in cells {
             if v.cells[i] != 0 {
-                mask[i] = mode != SelMode::Remove;
+                mask.set(i, mode != SelMode::Remove);
             }
         }
         self.set_selection(v, mask);
     }
 
     pub fn select_all(&mut self, v: &Volume) {
-        self.set_selection(v, v.cells.iter().map(|&c| c != 0).collect());
+        let mut mask = Mask::new(v.dims);
+        for (i, _) in v.cells.filled() {
+            mask.set(i, true);
+        }
+        self.set_selection(v, mask);
     }
 
     pub fn select_none(&mut self) {
         if self.sel_count > 0 {
-            self.sel.clear();
+            self.sel = Mask::new(IVec3::ZERO);
             self.sel_count = 0;
             self.sel_dirty = true;
         }
     }
 
     pub fn select_invert(&mut self, v: &Volume) {
-        let had = self.selection().map(|s| s.to_vec());
-        let mask = v.cells.iter().enumerate().map(|(i, &c)| c != 0 && !had.as_ref().is_some_and(|s| s[i])).collect();
+        let had = self.selection().cloned();
+        let mut mask = Mask::new(v.dims);
+        for (i, _) in v.cells.filled() {
+            if !had.as_ref().is_some_and(|s| s[i]) {
+                mask.set(i, true);
+            }
+        }
         self.set_selection(v, mask);
     }
 
@@ -424,8 +433,7 @@ impl Editor {
     /// anything changed.
     pub fn commit(&mut self, v: &mut Volume, new: Volume) -> bool {
         if new.dims == v.dims {
-            let diff: Vec<(usize, u8, u8)> =
-                v.cells.iter().zip(&new.cells).enumerate().filter(|(_, (a, b))| a != b).map(|(i, (a, b))| (i, *a, *b)).collect();
+            let diff = v.cells.diff(&new.cells);
             if diff.is_empty() {
                 return false;
             }
@@ -443,10 +451,10 @@ impl Editor {
     /// Drop the selection if it no longer matches the volume.
     fn fit_selection(&mut self, v: &Volume) {
         if self.sel_count > 0 {
-            if self.sel.len() != v.cells.len() {
+            if self.sel.dims() != v.dims {
                 self.select_none();
             } else {
-                let mask = std::mem::take(&mut self.sel);
+                let mask = std::mem::replace(&mut self.sel, Mask::new(IVec3::ZERO));
                 self.set_selection(v, mask);
             }
         }
@@ -492,7 +500,7 @@ impl Editor {
     /// drag into place.
     pub fn paste(&mut self, v: &mut Volume) -> bool {
         let mut new = v.clone();
-        let mut mask = vec![false; v.cells.len()];
+        let mut mask = Mask::new(v.dims);
         for &(p, c) in &self.clipboard {
             if v.contains(p) {
                 let i = v.index(p);
@@ -574,7 +582,7 @@ impl Editor {
         for &(p, _) in &m.cells {
             v.set(p, 0);
         }
-        let mut mask = vec![false; v.cells.len()];
+        let mut mask = Mask::new(v.dims);
         for &(p, c) in &m.cells {
             let q = p + delta;
             if v.contains(q) {
@@ -593,7 +601,7 @@ impl Editor {
     fn end_move(&mut self, v: &mut Volume) -> bool {
         let Some(m) = self.moving.take() else { return false };
         let moved = std::mem::replace(v, m.before);
-        let mask = std::mem::take(&mut self.sel);
+        let mask = std::mem::replace(&mut self.sel, Mask::new(IVec3::ZERO));
         let changed = self.commit(v, moved);
         if !m.whole {
             self.set_selection(v, mask);

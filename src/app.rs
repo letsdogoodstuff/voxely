@@ -17,7 +17,7 @@ use crate::edit::{self, Editor, Pick, SelMode, Tool};
 use crate::gpu::{self, Camera, Renderer};
 use crate::ops;
 use crate::outline::TreeOp;
-use crate::scene::{MaterialKind, Mode, Projection, Scene};
+use crate::scene::{Mask, MaterialKind, Mode, Projection, Scene};
 use crate::ui::{self, Command, Op};
 use crate::world::{Rot, ROOT};
 
@@ -369,7 +369,7 @@ pub fn save_project(r: &Renderer, scene: &mut Scene, ed: &mut EditState, path: P
 /// Push voxel edits to the GPU, refreshing emissive faces if any exist.
 pub fn sync_volume(r: &mut Renderer, scene: &mut Scene, editor: &mut Editor) {
     let highlight = scene.highlight();
-    r.upload_scene(scene, highlight.as_deref().or(editor.selection()));
+    r.upload_scene(scene, highlight.as_ref().or(editor.selection()));
     editor.sel_dirty = false;
     let any_emit = scene.materials.iter().any(|m| m.kind == MaterialKind::Emit as u32 && m.emit > 0.0);
     if any_emit || !scene.lights.is_empty() {
@@ -381,7 +381,7 @@ pub fn sync_volume(r: &mut Renderer, scene: &mut Scene, editor: &mut Editor) {
 /// Refresh the modeler's highlight: selected voxels, or picked parts.
 pub fn sync_selection(r: &mut Renderer, scene: &Scene, editor: &mut Editor) {
     let highlight = scene.highlight();
-    r.upload_selection(&scene.volume, highlight.as_deref().or(editor.selection()));
+    r.upload_selection(&scene.volume, highlight.as_ref().or(editor.selection()));
     editor.sel_dirty = false;
 }
 
@@ -604,11 +604,11 @@ pub fn snapshot(r: &Renderer, project: &str) -> String {
 }
 
 /// Bounding box of solid cells (selected ones, if a selection is given).
-fn solid_bounds(scene: &Scene, sel: Option<&[bool]>) -> Option<(Vec3, Vec3)> {
+fn solid_bounds(scene: &Scene, sel: Option<&Mask>) -> Option<(Vec3, Vec3)> {
     let v = &scene.volume;
     let mut b: Option<(IVec3, IVec3)> = None;
-    for (i, &c) in v.cells.iter().enumerate() {
-        if c != 0 && sel.is_none_or(|s| s[i]) {
+    for (i, _) in v.cells.filled() {
+        if sel.is_none_or(|s| s[i]) {
             let p = v.position(i);
             b = Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))));
         }
@@ -1409,7 +1409,7 @@ impl App {
     pub fn new(scene: Scene, panel: ui::PanelState, source: Option<PathBuf>, save_path: PathBuf) -> Self {
         // Start on the most used color in the model, like picking it up.
         let mut counts = [0usize; 256];
-        for &c in &scene.volume.cells {
+        for (_, c) in scene.volume.cells.filled() {
             counts[c as usize] += 1;
         }
         let color = (1..256).max_by_key(|&i| counts[i]).filter(|&i| counts[i] > 0).unwrap_or(1) as u8;
@@ -1816,8 +1816,10 @@ impl App {
         let (lo, hi) = (a.min(b), a.max(b));
         let v = &self.scene.volume;
         let visible_only = self.edit.editor.opts.visible_only;
-        let cells: Vec<usize> = (0..v.cells.len())
-            .filter(|&i| v.cells[i] != 0)
+        let cells: Vec<usize> = v
+            .cells
+            .filled()
+            .map(|(i, _)| i)
             .filter(|&i| {
                 let p = v.position(i);
                 let Some((x, y)) = g.renderer.project(p.as_vec3() + 0.5) else { return false };
@@ -1840,7 +1842,7 @@ impl App {
     /// Double-click edits the model.
     fn world_press(&mut self) {
         let hit = self.edit.hover.filter(|h| !h.on_ground());
-        let owner = hit.and_then(|h| self.scene.owners.get(self.scene.volume.index(h.cell)).copied()).filter(|&o| o != 0);
+        let owner = hit.and_then(|h| self.scene.owners.get(self.scene.volume.index(h.cell))).filter(|&o| o != 0);
         let Some((hit, model)) = hit.zip(owner.map(|o| o as usize)) else {
             if !self.modifiers.shift_key() {
                 self.command(Command::Tree(TreeOp::PickNone));

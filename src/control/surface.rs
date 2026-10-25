@@ -8,7 +8,7 @@ use glam::{IVec3, Vec3};
 use serde_json::{Value, json};
 
 use super::{Ctx, NEIGHBORS, apply, boolean, color, color_schema, edited, get, int, num, string, text, tool, xyz};
-use crate::scene::{Scene, Volume};
+use crate::scene::{Mask, Scene, Volume};
 
 mod presets;
 
@@ -136,21 +136,19 @@ fn palette_range(args: &Value) -> Result<Vec<u8>> {
 }
 
 /// Cells a surface tool may change: the selection, or every cell.
-fn target(ctx: &Ctx) -> Option<Vec<bool>> {
-    ctx.ed.editor.selection().map(<[bool]>::to_vec)
+fn target(ctx: &Ctx) -> Option<Mask> {
+    ctx.ed.editor.selection().cloned()
 }
 
-fn in_target(sel: &Option<Vec<bool>>, i: usize) -> bool {
-    sel.as_ref().is_none_or(|s| s.get(i).copied().unwrap_or(false))
+fn in_target(sel: &Option<Mask>, i: usize) -> bool {
+    sel.as_ref().is_none_or(|s| s.get(i).unwrap_or(false))
 }
 
 /// "12 #aabbcc -> 34 #ddeeff x 50" lines for a recolor.
 fn describe(scene: &Scene, old: &Volume, new: &Volume) -> String {
     let mut moves: HashMap<(u8, u8), usize> = HashMap::new();
-    for (&a, &b) in old.cells.iter().zip(&new.cells) {
-        if a != b {
-            *moves.entry((a, b)).or_default() += 1;
-        }
+    for (_, a, b) in old.cells.diff(&new.cells) {
+        *moves.entry((a, b)).or_default() += 1;
     }
     let mut list: Vec<_> = moves.into_iter().collect();
     list.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -589,7 +587,7 @@ fn used_slots(scene: &Scene) -> [bool; 256] {
     let w = &scene.world;
     let vols = w.models().into_iter().filter_map(|id| w.node(id).and_then(|n| n.volume()));
     for v in vols.chain(std::iter::once(&scene.volume)) {
-        for &c in &v.cells {
+        for (_, c) in v.cells.filled() {
             used[c as usize] = true;
         }
     }

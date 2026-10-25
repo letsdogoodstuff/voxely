@@ -120,6 +120,10 @@ saved, so files from MagicaVoxel round-trip with their objects, groups, names an
 - A part's box stays put when you resize or reshape it, so cutting a piece out and fitting it no
   longer shifts it.
 - Exports other than `.vox` and glTF flatten all visible parts.
+- Voxels are stored sparsely, in 8x8x8 bricks that only take memory once they hold a voxel, so
+  empty space is nearly free: a big, mostly empty part, or parts placed thousands of voxels apart,
+  cost about what their voxels do. A scene holds up to about a million bricks of voxels (half a
+  billion voxels' worth), and the path tracer reaches 16384 voxels along each axis.
 
 ### Pivots, free rotation and sockets
 

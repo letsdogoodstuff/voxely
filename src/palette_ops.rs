@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 
 use crate::ops::Rng;
-use crate::scene::Volume;
+use crate::scene::{Mask, Volume};
 
 /// Hue sectors used to group colors when sorting.
 const HUE_BINS: f32 = 24.0;
@@ -72,7 +72,7 @@ pub fn sort(palette: &[[u8; 4]], volume: &Volume) -> (Vec<[u8; 4]>, [u8; 256]) {
 /// Voxel Colors"); `palette.len()` entries, index 0 always false.
 pub fn mask_unused(palette: &[[u8; 4]], volume: &Volume) -> Vec<bool> {
     let mut used = vec![false; palette.len().max(256)];
-    for &c in &volume.cells {
+    for (_, c) in volume.cells.filled() {
         used[c as usize] = true;
     }
     used[0] = false;
@@ -82,13 +82,15 @@ pub fn mask_unused(palette: &[[u8; 4]], volume: &Volume) -> Vec<bool> {
 
 /// Replace every voxel's color index `c` with `remap[c]`.
 pub fn apply_remap(volume: &Volume, remap: &[u8; 256]) -> Volume {
-    Volume::from_cells(volume.dims, volume.cells.iter().map(|&c| if c == 0 { 0 } else { remap[c as usize] }).collect())
+    let mut out = volume.clone();
+    out.cells.update_filled(|c| *c = remap[*c as usize]);
+    out
 }
 
 /// Recolor each solid (and selected, if `sel` is given) voxel with a color
 /// picked uniformly from `colors` (MagicaVoxel's "Rand"); empty cells stay
 /// empty and color 0 in `colors` is ignored. Deterministic per seed.
-pub fn random_colors(v: &Volume, sel: Option<&[bool]>, colors: &[u8], seed: u32) -> Volume {
+pub fn random_colors(v: &Volume, sel: Option<&Mask>, colors: &[u8], seed: u32) -> Volume {
     let colors: Vec<u8> = colors.iter().copied().filter(|&c| c != 0).collect();
     if colors.is_empty() {
         return v.clone();
@@ -192,7 +194,7 @@ mod tests {
                 assert!(r.cells[i] == 9 || r.cells[i] == 10);
             }
         }
-        let mut sel = vec![false; v.cells.len()];
+        let mut sel = Mask::new(v.dims);
         sel[0] = true;
         let s = random_colors(&v, Some(&sel), &[9], 1);
         assert_eq!(s.cells[0], 9);

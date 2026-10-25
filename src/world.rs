@@ -16,6 +16,7 @@
 
 use glam::{Affine3A, EulerRot, IVec3, Mat3, Quat, Vec3};
 
+use crate::grid::Grid;
 use crate::scene::Volume;
 use crate::vox::{Node as VoxNode, VoxFile};
 
@@ -261,7 +262,7 @@ pub struct Composite {
     /// World position of cell 0.
     pub origin: IVec3,
     /// Model node id per cell (0 = empty; the root is never a model).
-    pub owners: Vec<u32>,
+    pub owners: Grid<u32>,
 }
 
 impl World {
@@ -399,7 +400,7 @@ impl World {
         }
         let (lo, hi) = b?;
         let mut volume = Volume::new(hi - lo);
-        let mut owners = vec![0u32; volume.cells.len()];
+        let mut owners = Grid::new(volume.dims);
         for m in models {
             let place = self.place(m);
             let v = self.node(m)?.volume()?;
@@ -415,20 +416,17 @@ impl World {
                             if c != 0 {
                                 let j = volume.index(w - lo);
                                 volume.set_index(j, c);
-                                owners[j] = m as u32;
+                                owners.set(j, m as u32);
                             }
                         }
                     }
                 }
                 continue;
             }
-            for (i, &c) in v.cells.iter().enumerate() {
-                if c != 0 {
-                    let w = place.cell(v.dims, v.position(i)) - lo;
-                    let j = volume.index(w);
-                    volume.set_index(j, c);
-                    owners[j] = m as u32;
-                }
+            for (p, c) in v.filled() {
+                let j = volume.index(place.cell(v.dims, p) - lo);
+                volume.set_index(j, c);
+                owners.set(j, m as u32);
             }
         }
         Some(Composite { volume, origin: lo, owners })
@@ -441,11 +439,9 @@ impl World {
         let place = self.place(id);
         let (lo, size) = place.bounds(v.dims);
         let mut out = Volume::new(size);
-        for (i, &c) in v.cells.iter().enumerate() {
-            if c != 0 {
-                let j = out.index(place.cell(v.dims, v.position(i)) - lo);
-                out.set_index(j, c);
-            }
+        for (p, c) in v.filled() {
+            let j = out.index(place.cell(v.dims, p) - lo);
+            out.set_index(j, c);
         }
         Some((out, lo))
     }
@@ -466,11 +462,9 @@ impl World {
         let t = origin - at_zero.bounds(size).0;
         let place = Place { rot, t };
         let mut local = Volume::new(size);
-        for (i, &c) in volume.cells.iter().enumerate() {
-            if c != 0 {
-                let j = local.index(place.local(size, origin + volume.position(i)));
-                local.set_index(j, c);
-            }
+        for (p, c) in volume.filled() {
+            let j = local.index(place.local(size, origin + p));
+            local.set_index(j, c);
         }
         let node_t = parent.rot.inverse().apply(t - parent.t);
         if let Some(n) = self.node_mut(id) {
@@ -1041,6 +1035,28 @@ mod tests {
         let (_, origin) = w.checkout(m).unwrap();
         w.checkin(m, &Volume::new(IVec3::new(7, 4, 3)), origin);
         assert_eq!(w.bounds(m), Some((origin, IVec3::new(7, 4, 3))));
+    }
+
+    #[test]
+    fn far_apart_parts_composite_in_little_memory() {
+        // Two solid 32³ parts 2000 voxels apart in x and y: the composite's
+        // box is 2032x2032x32 (132M cells, 660 MB at a byte of color and
+        // four of owner per cell), but only the parts' bricks hold voxels.
+        let solid = |c: u8| {
+            let mut v = Volume::new(IVec3::splat(32));
+            v.cells.fill(c);
+            v
+        };
+        let mut w = World::single(solid(1));
+        w.add_model(ROOT, "far", solid(2), IVec3::new(2000, 2000, 0));
+        let c = w.composite(None).unwrap();
+        assert_eq!(c.volume.dims, IVec3::new(2032, 2032, 32));
+        let used = c.volume.cells.memory() + c.owners.memory();
+        let dense = c.volume.cells.len() * 5;
+        assert!(used < 4 << 20, "composite uses {used} bytes");
+        assert!(used * 200 < dense, "{used} bytes sparse vs {dense} dense");
+        assert_eq!(c.volume.count(), 2 * 32 * 32 * 32);
+        assert_eq!(c.volume.get(IVec3::new(2010, 2005, 5)), 2);
     }
 
     #[test]

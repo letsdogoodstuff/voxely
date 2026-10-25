@@ -60,10 +60,9 @@ impl LastEdit {
         if e.resized {
             return e;
         }
-        for (i, (&a, &b)) in old.cells.iter().zip(&new.cells).enumerate() {
-            if a == b {
-                continue;
-            }
+        let mut changes = old.cells.diff(&new.cells);
+        changes.sort_unstable_by_key(|c| c.0);
+        for (i, a, b) in changes {
             match (a, b) {
                 (0, _) => e.added += 1,
                 (_, 0) => e.removed += 1,
@@ -582,16 +581,13 @@ fn materials_changed(ctx: &mut Ctx) {
 }
 
 fn count(v: &Volume) -> usize {
-    v.cells.iter().filter(|&&c| c != 0).count()
+    v.count()
 }
 
 fn bounds(v: &Volume) -> Option<(IVec3, IVec3)> {
     let mut b: Option<(IVec3, IVec3)> = None;
-    for (i, &c) in v.cells.iter().enumerate() {
-        if c != 0 {
-            let p = v.position(i);
-            b = Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))));
-        }
+    for (p, _) in v.filled() {
+        b = Some(b.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))));
     }
     b
 }
@@ -1234,7 +1230,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "get_scene_info" => {
             let v = &ctx.scene.volume;
             let mut counts = [0usize; 256];
-            for &c in &v.cells {
+            for (_, c) in v.cells.filled() {
                 counts[c as usize] += 1;
             }
             let colors: Vec<Value> = (1..256)
@@ -1424,9 +1420,8 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let limit = int(a, "limit").unwrap_or(5000).max(1) as usize;
             let mut list = Vec::new();
             let mut total = 0;
-            for (i, &c) in v.cells.iter().enumerate() {
-                let p = v.position(i);
-                if c != 0 && p.cmpge(lo).all() && p.cmple(hi).all() {
+            for (p, c) in v.filled_sorted() {
+                if p.cmpge(lo).all() && p.cmple(hi).all() {
                     total += 1;
                     if list.len() < limit {
                         list.push(json!([p.x, p.y, p.z, c]));
@@ -1559,7 +1554,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "get_palette" => {
             let all = boolean(a, "all").unwrap_or(false);
             let mut used = [false; 256];
-            for &c in &ctx.scene.volume.cells {
+            for (_, c) in ctx.scene.volume.cells.filled() {
                 used[c as usize] = true;
             }
             let kinds = ["diffuse", "metal", "glass", "emit", "blend", "cloud"];
@@ -1680,7 +1675,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "move_selection" => {
             let offset = ivec3(a, "offset")?;
             let v = &ctx.scene.volume;
-            let sel = ctx.ed.editor.selection().map(<[bool]>::to_vec);
+            let sel = ctx.ed.editor.selection().cloned();
             let moving: Vec<(IVec3, u8)> =
                 v.cells.iter().enumerate().filter(|&(i, &c)| c != 0 && sel.as_ref().is_none_or(|s| s[i])).map(|(i, &c)| (v.position(i), c)).collect();
             let mut new = v.clone();

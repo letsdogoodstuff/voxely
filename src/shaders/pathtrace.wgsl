@@ -31,10 +31,14 @@ const KIND_BLEND: u32 = 4u;
 const KIND_MEDIA: u32 = 5u;
 
 const PI: f32 = 3.14159265;
+const POOL_W: u32 = 64u;
 const EPS: f32 = 1e-3;
 const BIG: f32 = 1e30;
 
 @group(0) @binding(0) var<uniform> P: Params;
+// Voxels are stored sparsely: `bricks` maps each 8^3 brick of the volume
+// to 0 (empty) or its slot in `vox` plus one; `vox` packs the non-empty
+// bricks POOL_W x POOL_W to a layer.
 @group(0) @binding(1) var vox: texture_3d<u32>;
 @group(0) @binding(2) var bricks: texture_3d<u32>;
 @group(0) @binding(3) var<storage, read> mats: array<Material, 256>;
@@ -299,7 +303,8 @@ fn trace(ro: vec3<f32>, rd_in: vec3<f32>, inside: u32, tmax: f32) -> Hit {
     var cell = clamp(vec3<i32>(floor(ro + rd * t)), vec3<i32>(0), dimsi - 1);
 
     for (var i = 0; i < 4096; i++) {
-        if inside == 0u && textureLoad(bricks, cell >> vec3<u32>(3u), 0).r == 0u {
+        let slot = textureLoad(bricks, cell >> vec3<u32>(3u), 0).r;
+        if inside == 0u && slot == 0u {
             // Jump to the exit face of this empty brick.
             let b0 = vec3<f32>((cell >> vec3<u32>(3u)) << vec3<u32>(3u));
             let bexit = (select(b0, b0 + 8.0, rd > vec3<f32>(0.0)) - ro) * inv;
@@ -319,7 +324,7 @@ fn trace(ro: vec3<f32>, rd_in: vec3<f32>, inside: u32, tmax: f32) -> Hit {
             continue;
         }
 
-        let v = textureLoad(vox, cell, 0).r;
+        let v = pool_cell(slot, cell);
         if v != inside {
             h.hit = true;
             h.t = t;
@@ -856,11 +861,21 @@ fn aperture_sample() -> vec2<f32> {
 
 // ---------------------------------------------------------------- overlays
 
+// Voxel `c` of brick map slot `slot` (0 = empty brick).
+fn pool_cell(slot: u32, c: vec3<i32>) -> u32 {
+    if slot == 0u {
+        return 0u;
+    }
+    let s = slot - 1u;
+    let at = vec3<u32>(s % POOL_W, (s / POOL_W) % POOL_W, s / (POOL_W * POOL_W)) * 8u + (vec3<u32>(c) & vec3<u32>(7u));
+    return textureLoad(vox, at, 0).r;
+}
+
 fn vox_at(c: vec3<i32>) -> u32 {
     if any(c < vec3<i32>(0)) || any(c >= vec3<i32>(P.dims.xyz)) {
         return 0u;
     }
-    return textureLoad(vox, c, 0).r;
+    return pool_cell(textureLoad(bricks, c >> vec3<u32>(3u), 0).r, c);
 }
 
 // World-space size of a pixel at distance `t`.

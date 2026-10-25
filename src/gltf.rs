@@ -98,12 +98,8 @@ enum Kind {
 /// Mean chord (4 V / S, in voxels) of the voxels of each color.
 fn chords(v: &crate::scene::Volume) -> [f32; 256] {
     let (mut vol, mut area) = ([0u32; 256], [0u32; 256]);
-    for (i, &c) in v.cells.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
+    for (p, c) in v.filled() {
         vol[c as usize] += 1;
-        let p = v.position(i);
         for n in 0..6 {
             if v.get(p + dir(n)) != c {
                 area[c as usize] += 1;

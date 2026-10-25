@@ -69,7 +69,7 @@ pub fn run(ctx: &mut ToolCtx, source: String, file: String, args: Value, timeout
                 let _ = reply.send(result);
             }
             Request::GetVolume(part, reply) => {
-                let result = control::focus_part(ctx, part.as_ref()).map(|()| (ctx.scene.volume.dims, ctx.scene.volume.cells.clone()));
+                let result = control::focus_part(ctx, part.as_ref()).map(|()| (ctx.scene.volume.dims, ctx.scene.volume.cells.to_vec()));
                 let _ = reply.send(result.map_err(|e| format!("{e:#}")));
             }
             Request::SetVolume(dims, cells, part, reply) => {

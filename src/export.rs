@@ -400,11 +400,7 @@ fn ply_mesh(v: &Volume, pal: &[[u8; 4]]) -> String {
 /// quads per cube.
 fn cubes(v: &Volume, pal: &[[u8; 4]]) -> String {
     let mut list = Vec::new();
-    for (i, &c) in v.cells.iter().enumerate() {
-        if c == 0 {
-            continue;
-        }
-        let p = v.position(i);
+    for (p, c) in v.filled_sorted() {
         if (0..6).any(|n| v.get(p + dir(n)) == 0) {
             list.push((p, c));
         }
@@ -540,14 +536,12 @@ fn marching(v: &Volume, pal: &[[u8; 4]]) -> String {
 
 /// Voxel centers (sample offset 0), centered on the model, scale 1, Z up.
 fn points(v: &Volume, pal: &[[u8; 4]]) -> String {
-    let count = v.cells.iter().filter(|&&c| c != 0).count();
+    let cells = v.filled_sorted();
     let mut out = String::new();
-    ply_header(&mut out, count, None);
-    for (i, &c) in v.cells.iter().enumerate() {
-        if c != 0 {
-            let p = v.position(i).as_vec3() + Vec3::splat(0.5);
-            ply_vertex(&mut out, place(v, p, POINT_SCALE, false), rgb(pal, c));
-        }
+    ply_header(&mut out, cells.len(), None);
+    for (p, c) in cells {
+        let p = p.as_vec3() + Vec3::splat(0.5);
+        ply_vertex(&mut out, place(v, p, POINT_SCALE, false), rgb(pal, c));
     }
     out
 }
@@ -566,7 +560,7 @@ fn xraw(v: &Volume, pal: &[[u8; 4]]) -> Vec<u8> {
         push_i32(&mut b, x);
     }
     push_i32(&mut b, 256);
-    b.extend_from_slice(&v.cells);
+    b.extend(v.cells.iter());
     b.extend_from_slice(&[0, 0, 0, 0]);
     for c in &pal[1..256] {
         b.extend_from_slice(c);

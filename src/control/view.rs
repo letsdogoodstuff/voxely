@@ -717,7 +717,7 @@ fn summary(ctx: &Ctx, what: &Shown, names: &[String], f: &Frame, framed: bool, h
         )),
     }
     let mut counts = [0usize; 256];
-    for &c in &v.cells {
+    for (_, c) in v.cells.filled() {
         counts[c as usize] += 1;
     }
     let total: usize = counts[1..].iter().sum();
