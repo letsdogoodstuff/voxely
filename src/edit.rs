@@ -1094,7 +1094,8 @@ impl Editor {
             return vec![c];
         }
         let axis = axis_of(normal);
-        let (lo, hi) = (-(n - 1) / 2, n / 2);
+        // Even sizes reach one further on the - side, like MagicaVoxel.
+        let (lo, hi) = (-(n / 2), (n - 1) / 2);
         let center = (lo + hi) as f32 * 0.5;
         let mut out = Vec::new();
         for z in lo..=hi {
@@ -1835,6 +1836,16 @@ mod tests {
         e.opts = BrushOptions { axis: [false, false, true], ..Default::default() };
         click(&mut e, &mut v, 3.5, 3.5);
         assert_eq!(count(&v, 2), 16);
+
+        // Even sizes, measured in MagicaVoxel: size 4 clicked at x = 9
+        // covers x 7-10; size 2 covers 8-9.
+        for (size, lo, hi) in [(4, 7, 10), (2, 8, 9)] {
+            let mut v = Volume::new(IVec3::splat(16));
+            e.opts = BrushOptions { size, ..Default::default() };
+            click(&mut e, &mut v, 9.5, 3.5);
+            let xs: Vec<i32> = v.filled().map(|(p, _)| p.x).collect();
+            assert_eq!((*xs.iter().min().unwrap(), *xs.iter().max().unwrap()), (lo, hi));
+        }
     }
 
     #[test]
