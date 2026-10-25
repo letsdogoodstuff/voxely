@@ -426,7 +426,7 @@ mod tests {
         assert!(err("fill_box", json!({ "from": [0, 0, 0], "to": [1, 1, 1], "color": 1, "hollow": "yes" })).contains("must be a boolean"));
         assert!(err("set_voxels", json!({ "voxels": [[1, 2, 3, 4], [1, 2, 3.5, 4]] })).contains("`voxels[1][2]` must be an integer or a string"));
         assert!(err("set_voxels", json!({ "voxels": [[1, 2, 3]] })).contains("`voxels[0]` must have exactly 4 items"));
-        assert_eq!(err("set_camera", json!({ "fov": 200 })), "`fov` is 200; must be 1 to 179");
+        assert_eq!(err("set_camera", json!({ "fov": 200 })), "`fov` is 200; must be 1 to 170");
         assert_eq!(err("set_camera", json!({ "distance": 0 })), "`distance` is 0; must be more than 0");
         assert_eq!(err("set_material", json!({ "color": 1, "emission": -1 })), "`emission` is -1; must be at least 0");
         assert!(err("draw_shape", json!({ "shape": "spher", "from": [0, 0, 0], "to": [1, 1, 1], "color": 1 })).contains("`shape` is \"spher\" (did you mean \"sphere\"?); must be one of: box, ellipsoid, sphere"));
