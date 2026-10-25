@@ -69,7 +69,8 @@ pub fn bone_of(name: &str) -> Option<Bone> {
     if has("head") {
         return Some(Head);
     }
-    if has("hips") || has("pelvis") || n == "hip" || n == "root" {
+    // ("root" is usually the armature above the hips, so it isn't one.)
+    if has("hips") || has("pelvis") || n == "hip" {
         return Some(Hips);
     }
     if has("forearm") || has("lowerarm") || has("lower_arm") || has("elbow") {
@@ -94,29 +95,57 @@ pub fn bone_of(name: &str) -> Option<Bone> {
     None
 }
 
-/// Bones found among the nodes under `root` (first match wins; a "leg"
-/// next to an "upleg" counts as the lower leg).
+/// Bones found among the nodes under `root` (see `map_bones`).
 pub fn find_bones(w: &World, root: usize) -> HashMap<Bone, usize> {
-    let mut out = HashMap::new();
-    let mut plain_legs = Vec::new();
+    let mut named = Vec::new();
     w.visit(root, &mut |id, n| {
-        if id == ROOT || n.name.is_empty() {
-            return;
-        }
-        if let Some(b) = bone_of(&n.name) {
-            let lower = n.name.to_ascii_lowercase();
-            if matches!(b, UpperLegL | UpperLegR) && !["up", "thigh", "upper"].iter().any(|k| lower.contains(k)) {
-                plain_legs.push((b, id));
-                return;
-            }
-            out.entry(b).or_insert(id);
+        if id != ROOT && !n.name.is_empty() {
+            named.push((id, n.name.clone()));
         }
     });
+    map_bones(&named)
+}
+
+/// Bones among `(id, name)` pairs in hierarchy order: the first match
+/// wins, and a plain "leg" next to an "upleg" / "thigh" is the lower leg.
+pub fn map_bones(named: &[(usize, String)]) -> HashMap<Bone, usize> {
+    let mut out = HashMap::new();
+    let mut plain_legs = Vec::new();
+    for (id, name) in named {
+        if let Some(b) = bone_of(name) {
+            let lower = name.to_ascii_lowercase();
+            if matches!(b, UpperLegL | UpperLegR) && !["up", "thigh", "upper"].iter().any(|k| lower.contains(k)) {
+                plain_legs.push((b, *id));
+                continue;
+            }
+            out.entry(b).or_insert(*id);
+        }
+    }
     for (b, id) in plain_legs {
         let lower = if b == UpperLegL { LowerLegL } else { LowerLegR };
         if out.contains_key(&b) { out.entry(lower).or_insert(id) } else { out.entry(b).or_insert(id) };
     }
     out
+}
+
+/// The top-level object a node belongs to.
+pub fn top_of(w: &World, mut id: usize) -> usize {
+    while let Some(p) = w.node(id).and_then(|n| n.parent).filter(|&p| p != ROOT) {
+        id = p;
+    }
+    id
+}
+
+/// The rig to animate: `rig`'s top-level object, or the first top-level
+/// object that has `need`.
+pub fn rig_root(w: &World, rig: Option<usize>, need: Bone) -> usize {
+    match rig {
+        Some(id) => top_of(w, id),
+        None => {
+            let tops = w.node(ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
+            tops.into_iter().find(|&t| find_bones(w, t).contains_key(&need)).unwrap_or(ROOT)
+        }
+    }
 }
 
 // ---- templates ----
@@ -345,20 +374,7 @@ pub struct Applied {
 pub fn apply_motion(w: &mut World, rig: Option<usize>, name: &str, frames: u32, amount: f32) -> Result<Applied, String> {
     motion(name, 0.0, 1.0).ok_or_else(|| format!("unknown motion `{name}`; try {}", MOTIONS.iter().map(|m| m.0).collect::<Vec<_>>().join(", ")))?;
     let quad = name.starts_with("quad");
-    let top = |mut id: usize| {
-        while let Some(p) = w.node(id).and_then(|n| n.parent).filter(|&p| p != ROOT) {
-            id = p;
-        }
-        id
-    };
-    let root = match rig {
-        Some(id) => top(id),
-        None => {
-            let need = if quad { LegFL } else { UpperLegL };
-            let tops = w.node(ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
-            tops.into_iter().find(|&t| find_bones(w, t).contains_key(&need)).unwrap_or(ROOT)
-        }
-    };
+    let root = rig_root(w, rig, if quad { LegFL } else { UpperLegL });
     let mut bones = find_bones(w, root);
     if quad {
         // A four-legged rig's body plays the torso / root.
@@ -454,12 +470,21 @@ mod tests {
             ("leg_front_l", LegFL),
             ("hind_leg_r", LegBR),
             ("tail", Tail),
+            ("DEF-hips", Hips),
+            ("DEF-spine.001", Torso),
+            ("DEF-upper_arm.L", UpperArmL),
+            ("DEF-forearm.R", LowerArmR),
+            ("DEF-thigh.L", UpperLegL),
+            ("DEF-shin.R", LowerLegR),
         ] {
             assert_eq!(bone_of(name), Some(bone), "{name}");
         }
         assert_eq!(bone_of("sword"), None);
         // Collarbones aren't arms.
         assert_eq!(bone_of("mixamorig:LeftShoulder"), None);
+        for other in ["root", "DEF-f_index.01.L", "DEF-hand.L", "DEF-neck", "DEF-toe.R"] {
+            assert_eq!(bone_of(other), None, "{other}");
+        }
     }
 
     #[test]

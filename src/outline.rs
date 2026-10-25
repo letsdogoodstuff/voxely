@@ -122,6 +122,8 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
         ui.set_max_width(ui.available_width());
         CollapsingHeader::new("Objects").default_open(true).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("tree").max_height(260.0).show(ui, |ui| {
+                // Rigs nest deep; keep names readable.
+                ui.spacing_mut().indent = 8.0;
                 for &c in w.node(ROOT).map(|n| n.children()).unwrap_or_default() {
                     row(ui, w, c, picked, scene.editing(), cmds);
                 }

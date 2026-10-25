@@ -252,6 +252,12 @@ fn base_tools() -> Value {
             "rig": { "type": ["string", "integer"], "description": "Any part of the rig to animate when there are several (default: the first rig with the right limbs)" },
             "fps": { "type": "number" },
         }), &["motion"]),
+        tool("import_animation", "Retarget an animation clip from a glTF file (.glb/.gltf) onto a rig: free CC0 libraries such as Quaternius's Universal Animation Library, Blender exports, or voxely's own exports. Joints are matched to parts by name (hips, spine, head, upper arms, forearms, thighs, shins, in voxely / Mixamo / Unreal / Rigify naming); each part turns rigidly like its joint, with rest poses lined up (T-pose clips work on arms-down rigs). Without `clip`, lists the file's clips.", json!({
+            "path": { "type": "string" },
+            "clip": { "type": ["string", "integer"], "description": "Clip name or index" },
+            "rig": { "type": ["string", "integer"], "description": "Any part of the rig to animate (default: the first rig with legs)" },
+            "root_motion": { "type": "boolean", "description": "Let the hips travel and bob with the clip (default true; false keeps them in place)" },
+        }), &["path"]),
         tool("set_pivot", "Set the point a part or group turns about (and its origin in glTF exports), in the part's own coordinates (the ones the voxel tools use while editing it; world coordinates for groups). E.g. a shoulder for an arm, the hinge for a door.", json!({
             "part": { "type": ["string", "integer"] },
             "pivot": { "type": ["array", "string"], "items": { "type": "number" }, "description": "[x, y, z], or \"center\" (default), or \"bottom\" (middle of the bottom face)" },
@@ -912,6 +918,36 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             );
             if !applied.missing.is_empty() {
                 msg += &format!(" No part found for: {}.", applied.missing.iter().map(|b| crate::rig::bone_name(*b)).collect::<Vec<_>>().join(", "));
+            }
+            Ok(vec![text(msg)])
+        }
+        "import_animation" => {
+            let path = PathBuf::from(string(a, "path").context("missing `path`")?);
+            let g = crate::gltf_import::Gltf::load(&path)?;
+            let clips = g.clips();
+            let Some(clip) = get(a, "clip").and_then(part_key) else {
+                let list: Vec<String> = clips.iter().enumerate().map(|(k, c)| format!("{k}: {} ({:.1}s)", c.name, c.duration)).collect();
+                return Ok(vec![text(format!("{} clips in {}:\n{}\nPass `clip` to import one.", clips.len(), path.display(), list.join("\n")))]);
+            };
+            let rig = match get(a, "rig") {
+                Some(v) => Some(find_part(ctx.scene, Some(v))?),
+                None => None,
+            };
+            let root_motion = boolean(a, "root_motion").unwrap_or(true);
+            let res = ctx.scene.change_quiet(|w| crate::gltf_import::import(w, &g, Some(&clip), rig, root_motion));
+            ctx.ed.editor.reset();
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            let done = res?;
+            ctx.ed.timeline.open = true;
+            let mut msg = format!(
+                "Imported `{}`: {} frames at {} fps onto {}.",
+                done.clip,
+                done.frames,
+                ctx.scene.world.anim.fps,
+                done.bones.iter().map(|(_, src, dst)| format!("{dst} <- {src}")).collect::<Vec<_>>().join(", ")
+            );
+            if !done.missing.is_empty() {
+                msg += &format!(" Not in the clip: {}.", done.missing.iter().map(|b| crate::rig::bone_name(*b)).collect::<Vec<_>>().join(", "));
             }
             Ok(vec![text(msg)])
         }

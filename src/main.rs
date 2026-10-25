@@ -7,6 +7,7 @@ mod edit;
 mod env;
 mod export;
 mod gltf;
+mod gltf_import;
 mod gpu;
 mod mcp;
 mod modeler;
@@ -79,6 +80,8 @@ editor controls (MagicaVoxel layout; Cmd works for Ctrl on macOS):
   Ctrl+O open  Ctrl+P new          Ctrl+G grid  Ctrl+F frame  Ctrl+B bounds
   F1 model/render                  Ctrl+Tab  hide panels
   arrows sun angle                 6  save a PNG snapshot to export/
+
+animation: , / . previous / next frame   / play / pause   (Anim in the bottom bar)
 
 world mode (Tab switches between editing a model and the world):
   click pick object (Shift adds, Alt picks a model inside a group)

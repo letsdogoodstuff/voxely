@@ -767,6 +767,32 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             },
         },
         Command::EditPart(id) => set_mode(scene, ed, Some(id)),
+        Command::ImportAnimation(None) => {
+            if let Some(p) = rfd::FileDialog::new().add_filter("glTF", &["glb", "gltf"]).pick_file() {
+                match crate::gltf_import::Gltf::load(&p) {
+                    Ok(g) => {
+                        let names: Vec<String> = g.clips().into_iter().map(|c| c.name).collect();
+                        if names.is_empty() {
+                            eprintln!("{}: no animations", p.display());
+                        }
+                        ed.timeline.clips = Some((p, names));
+                        ed.timeline.clip = 0;
+                    }
+                    Err(e) => eprintln!("import: {e:#}"),
+                }
+            }
+            false
+        }
+        Command::ImportAnimation(Some((path, k))) => {
+            let rig = scene.picked.first().copied();
+            let res = crate::gltf_import::Gltf::load(&path).and_then(|g| scene.change_quiet(|w| crate::gltf_import::import(w, &g, Some(&k.to_string()), rig, true)));
+            match res {
+                Ok(done) => eprintln!("imported {} ({} frames, {} parts)", done.clip, done.frames, done.bones.len()),
+                Err(e) => eprintln!("import: {e:#}"),
+            }
+            ed.editor.reset();
+            true
+        }
         Command::Frame(f) => {
             if f == scene.world.frame {
                 false
@@ -1346,6 +1372,8 @@ impl App {
             counts[c as usize] += 1;
         }
         let color = (1..256).max_by_key(|&i| counts[i]).filter(|&i| counts[i] > 0).unwrap_or(1) as u8;
+        let mut edit = EditState::new(color, source, save_path);
+        edit.timeline.open = scene.world.animated();
         App {
             scene,
             gfx: None,
@@ -1353,7 +1381,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             panel,
             show_panel: true,
-            edit: EditState::new(color, source, save_path),
+            edit,
         }
     }
 

@@ -16,6 +16,9 @@ pub struct TimelineState {
     pub playing: bool,
     /// The motion preset picked in the timeline.
     pub motion: usize,
+    /// A glTF file whose clips can be imported, and the clip picked.
+    pub clips: Option<(std::path::PathBuf, Vec<String>)>,
+    pub clip: usize,
     /// When the shown frame last advanced.
     last: Option<Instant>,
 }
@@ -58,7 +61,7 @@ pub fn panel(ui: &mut Ui, scene: &Scene, st: &mut TimelineState, cmds: &mut Vec<
     let a = w.anim.clone();
     let frame = w.frame;
     let part = scene.picked.first().copied().filter(|_| scene.picked.len() == 1);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Animation").strong());
         if ui.button("|<").on_hover_text("First frame").clicked() {
             cmds.push(Command::Frame(0));
@@ -85,7 +88,9 @@ pub fn panel(ui: &mut Ui, scene: &Scene, st: &mut TimelineState, cmds: &mut Vec<
         if next != a {
             cmds.push(Command::Tree(TreeOp::SetAnim(next)));
         }
-        ui.separator();
+    });
+    // Second row: keys for the picked part, motions and imports.
+    ui.horizontal_wrapped(|ui| {
         match part {
             Some(id) => {
                 let n = w.node(id);
@@ -121,11 +126,21 @@ pub fn panel(ui: &mut Ui, scene: &Scene, st: &mut TimelineState, cmds: &mut Vec<
             let frames = if a.frames > 1 { a.frames } else { 24 };
             cmds.push(Command::Tree(TreeOp::Motion(motions[st.motion].0.to_string(), frames)));
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Close").clicked() {
-                st.open = false;
+        ui.separator();
+        if ui.button("Import...").on_hover_text("Animation clips from a .glb / .gltf file (e.g. Quaternius's free Universal Animation Library), retargeted onto the rig").clicked() {
+            cmds.push(Command::ImportAnimation(None));
+        }
+        if let Some((path, names)) = &st.clips {
+            let pick = st.clip.min(names.len().saturating_sub(1));
+            egui::ComboBox::from_id_salt("clip").selected_text(names.get(pick).map_or("", String::as_str)).width(150.0).show_ui(ui, |ui| {
+                for (k, n) in names.iter().enumerate() {
+                    ui.selectable_value(&mut st.clip, k, n);
+                }
+            });
+            if ui.button("Use clip").clicked() {
+                cmds.push(Command::ImportAnimation(Some((path.clone(), pick))));
             }
-        });
+        }
     });
     // The frame strip: click or drag to scrub. Keys of the picked part are
     // diamonds, its flipbook drawings squares.

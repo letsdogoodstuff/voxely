@@ -91,6 +91,8 @@ pub enum Command {
     Tree(crate::outline::TreeOp),
     /// Show this animation frame.
     Frame(u32),
+    /// Pick a glTF file to import clips from (None), or import clip k.
+    ImportAnimation(Option<(PathBuf, usize)>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
