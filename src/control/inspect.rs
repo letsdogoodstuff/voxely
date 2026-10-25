@@ -78,6 +78,7 @@ struct Checkpoint {
     editing: Option<usize>,
     palette: Vec<[u8; 4]>,
     materials: Vec<GpuMaterial>,
+    notes: Vec<String>,
     render_dicts: Vec<crate::vox::Dict>,
     source: Option<PathBuf>,
     save_path: PathBuf,
@@ -673,6 +674,7 @@ fn take(ctx: &Ctx, name: &str) -> Checkpoint {
         editing: ctx.scene.editing(),
         palette: ctx.scene.palette.clone(),
         materials: ctx.scene.materials.clone(),
+        notes: ctx.scene.notes.clone(),
         render_dicts: ctx.scene.render_dicts.clone(),
         source: ctx.ed.source.clone(),
         save_path: ctx.ed.save_path.clone(),
@@ -703,6 +705,10 @@ fn put_back(ctx: &mut Ctx, cp: Checkpoint) {
     scene.change(|w| *w = cp.world);
     scene.palette = cp.palette;
     scene.materials = cp.materials;
+    scene.notes = cp.notes;
+    // Palette undo steps and remembered colors are about the replaced palette.
+    ctx.ed.palette.history.clear();
+    ctx.ed.palette.look = vec![None; 256];
     scene.render_dicts = cp.render_dicts;
     ctx.ed.source = cp.source;
     ctx.ed.save_path = cp.save_path;

@@ -19,11 +19,14 @@ pub const MIN_WINDOW: (f64, f64) = (LAYOUT_WIDTH as f64 * 0.75, 560.0);
 pub struct Prefs {
     /// Interface scale the user chose, 1 = 100%.
     pub ui_scale: f32,
+    /// Starred palettes (file paths, or "preset:<name>"), in the order
+    /// starred; the first four fill the palette's quick buttons.
+    pub palette_favorites: Vec<String>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0 }
+        Prefs { ui_scale: 1.0, palette_favorites: Vec::new() }
     }
 }
 
@@ -57,13 +60,16 @@ impl Prefs {
             if let Some(s) = v["ui_scale"].as_f64() {
                 p.ui_scale = (s as f32).clamp(SCALES[0], SCALES[SCALES.len() - 1]);
             }
+            if let Some(a) = v["palette_favorites"].as_array() {
+                p.palette_favorites = a.iter().filter_map(|s| s.as_str().map(String::from)).collect();
+            }
         }
         p
     }
 
     pub fn save(&self) {
         let Some(path) = Self::path() else { return };
-        let text = serde_json::to_string_pretty(&json!({ "ui_scale": self.ui_scale })).unwrap_or_default();
+        let text = serde_json::to_string_pretty(&json!({ "ui_scale": self.ui_scale, "palette_favorites": self.palette_favorites })).unwrap_or_default();
         let res = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, text));
         if let Err(e) = res {
             eprintln!("saving preferences to {}: {e}", path.display());
@@ -115,6 +121,7 @@ mod tests {
         assert_eq!(Prefs::from_json(r#"{"ui_scale": 1.5}"#).ui_scale, 1.5);
         assert_eq!(Prefs::from_json(r#"{"ui_scale": 9}"#).ui_scale, 2.0);
         assert_eq!(Prefs::from_json("not json").ui_scale, 1.0);
+        assert_eq!(Prefs::from_json(r#"{"palette_favorites": ["preset:pico-8", 3]}"#).palette_favorites, vec!["preset:pico-8"]);
     }
 
     #[test]

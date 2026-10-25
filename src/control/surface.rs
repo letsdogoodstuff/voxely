@@ -10,13 +10,21 @@ use serde_json::{Value, json};
 use super::{Ctx, NEIGHBORS, apply, boolean, color, color_schema, edited, get, int, num, string, text, tool, xyz};
 use crate::scene::{Scene, Volume};
 
-mod presets;
+pub(crate) mod presets;
 
 #[derive(Default)]
 pub struct State {
     /// Palette slots this session filled (presets, image colors); later
     /// free-slot searches skip them even before voxels use them.
     reserved: Vec<u8>,
+}
+
+impl State {
+    /// Follow the palette's colors to new indices.
+    pub fn remap_colors(&mut self, remap: &[u8; 256]) {
+        self.reserved.iter_mut().for_each(|c| *c = remap[*c as usize]);
+        self.reserved.dedup();
+    }
 }
 
 pub const PART_TOOLS: &[&str] = &["vary_colors", "shade_edges", "paint_faces", "voxelize_image"];
@@ -602,6 +610,7 @@ fn write_slots(ctx: &mut Ctx, slots: &[u8], colors: &[[u8; 4]], used: &[bool; 25
     for (&i, &c) in slots.iter().zip(colors) {
         let i = i as usize;
         ctx.scene.palette[i] = [c[0], c[1], c[2], 255];
+        ctx.ed.palette.look[i] = None;
         if used[i] {
             ctx.scene.sync_color(i);
         } else {

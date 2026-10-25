@@ -94,8 +94,12 @@ pub struct WorldDrag {
 
 impl EditState {
     pub fn new(color: u8, source: Option<PathBuf>, save_path: PathBuf) -> Self {
-        let samples = list_samples(source.as_deref());
-        let palettes = list_palettes(source.as_deref());
+        // A model outside MagicaVoxel's folders (a workspace project, say)
+        // has none of its assets around it; list the install's instead.
+        let install = magicavoxel_dir().map(|d| d.join("vox").join("_.vox"));
+        let or_install = |found: Vec<PathBuf>, list: fn(Option<&Path>) -> Vec<PathBuf>| if found.is_empty() { list(install.as_deref()) } else { found };
+        let samples = or_install(list_samples(source.as_deref()), list_samples);
+        let palettes = or_install(list_palettes(source.as_deref()), list_palettes);
         EditState {
             samples,
             scanned: std::time::Instant::now(),
@@ -113,7 +117,7 @@ impl EditState {
             ui_scale: 1.0,
             transform_text: ui::TransformText::default(),
             palette: ui::PaletteState::default(),
-            shaders: ui::ShaderState { files: list_shaders(source.as_deref()), current: None, values: Vec::new(), error: None },
+            shaders: ui::ShaderState { files: or_install(list_shaders(source.as_deref()), list_shaders), current: None, values: Vec::new(), error: None },
             editor: Editor::new(color),
             hover: None,
             enabled: true,
@@ -274,29 +278,6 @@ fn shader_output(r: &Renderer, scene: &Scene, ed: &mut EditState) -> Option<crat
 /// Before a Code brush stroke, compute what the shader would make.
 pub fn prepare_code_brush(r: &Renderer, scene: &Scene, ed: &mut EditState) {
     ed.editor.code = if ed.editor.brush == edit::Brush::Code { shader_output(r, scene, ed) } else { None };
-}
-
-/// Colors of a palette image: pixel k is color index k + 1.
-pub(crate) fn load_palette(path: &Path) -> Result<Vec<[u8; 4]>> {
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path)?));
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
-    let mut reader = decoder.read_info()?;
-    let mut buf = vec![0; reader.output_buffer_size().context("palette image too large")?];
-    let info = reader.next_frame(&mut buf)?;
-    let px = &buf[..info.buffer_size()];
-    let channels = info.color_type.samples();
-    let colors: Vec<[u8; 4]> = px
-        .chunks_exact(channels)
-        .take(255)
-        .map(|c| match channels {
-            4 => [c[0], c[1], c[2], c[3]],
-            3 => [c[0], c[1], c[2], 255],
-            2 => [c[0], c[0], c[0], c[1]],
-            _ => [c[0], c[0], c[0], 255],
-        })
-        .collect();
-    anyhow::ensure!(!colors.is_empty(), "empty palette image");
-    Ok(colors)
 }
 
 /// Snap to the nearest isometric view (orthographic, 45 degree turns).
@@ -646,6 +627,10 @@ pub(crate) fn open_project(path: PathBuf, r: &mut Renderer, scene: &mut Scene, e
 /// Show a newly opened or created scene.
 pub(crate) fn loaded(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     ed.editor.reset();
+    // Palette undo and remembered colors belong to the old scene.
+    ed.palette.history.clear();
+    ed.palette.look = vec![None; 256];
+    ed.palette.previewing = None;
     ed.hover = None;
     r.load_scene(scene);
     ed.editor.sel_dirty = false;
@@ -939,28 +924,6 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             Some(new) => ed.editor.commit(&mut scene.volume, new),
             None => false,
         },
-        Command::PaletteSort => {
-            let (palette, remap) = crate::palette_ops::sort(&scene.palette, &scene.flat());
-            // Materials follow their colors to the new indices.
-            let mut materials = scene.materials.clone();
-            for (old, &to) in remap.iter().enumerate() {
-                materials[to as usize] = scene.materials[old];
-            }
-            scene.palette = palette;
-            scene.materials = materials;
-            ed.editor.color = remap[ed.editor.color as usize];
-            let old_sel = ed.palette.selected.clone();
-            for (old, &to) in remap.iter().enumerate() {
-                ed.palette.selected[to as usize] = old_sel[old];
-            }
-            r.upload_materials(&scene.materials);
-            r.set_palette(&scene.palette);
-            // Sorting isn't undoable as one step with the palette, so the
-            // voxel remap is committed without history.
-            scene.remap(&remap);
-            ed.editor.reset();
-            true
-        }
         Command::PaletteRandom => {
             let colors = selected_colors(ed);
             let new = crate::palette_ops::random_colors(&scene.volume, ed.editor.selection(), &colors, seed());
@@ -994,22 +957,17 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             }
             false
         }
-        Command::LoadPalette(p) => {
-            match load_palette(&p) {
-                Ok(colors) => {
-                    for (k, c) in colors.into_iter().enumerate() {
-                        scene.palette[k + 1] = c;
-                        scene.sync_color(k + 1);
-                    }
-                    r.upload_materials(&scene.materials);
-                    r.set_palette(&scene.palette);
-                    scene.rebuild_lights();
-                    r.set_lights(&scene.lights, scene.light_power);
-                }
-                Err(e) => eprintln!("palette {}: {e:#}", p.display()),
+        Command::Palette(cmd) => match crate::palette_lib::apply(cmd, r, scene, ed) {
+            Ok((msg, changed)) => {
+                ed.palette.say(msg);
+                changed
             }
-            false
-        }
+            Err(e) => {
+                eprintln!("palette: {e:#}");
+                ed.palette.say(format!("{e:#}"));
+                false
+            }
+        },
     };
     if changed {
         sync_volume(r, scene, &mut ed.editor);
@@ -1213,9 +1171,10 @@ pub fn build_ui(
                 iso_camera(r);
             }
         });
+        let quick = crate::palette_lib::quick(ed);
         egui::Panel::left("palette").exact_size(160.0).resizable(false).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                edit = ui::palette_panel(ui, &mut ed.editor, scene, &mut ed.palette, &ed.palettes, cmds);
+                edit = ui::palette_panel(ui, &mut ed.editor, scene, &mut ed.palette, &quick, cmds);
             });
         });
         // The Project column shows in both modes, like MagicaVoxel.
@@ -1262,6 +1221,8 @@ pub fn build_ui(
     if ui::preferences_window(ui.ctx(), &mut ed.prefs_open, &mut ed.prefs, ed.ui_scale) {
         ed.prefs.save();
     }
+    crate::palette_lib::window(ui.ctx(), ed, cmds);
+    crate::palette_lib::handle_drops(ui.ctx(), ed, cmds);
     actions.viewport = Some(ui.available_rect_before_wrap());
     draw_overlay(&ui.ctx().layer_painter(egui::LayerId::background()), r, scene, ed, ppp);
 
@@ -1274,6 +1235,7 @@ pub fn build_ui(
         scene.rebuild_lights();
         r.set_lights(&scene.lights, scene.light_power);
     }
+    crate::palette_lib::sync_preview(r, scene, ed, edit.materials_changed);
     actions
 }
 

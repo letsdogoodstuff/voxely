@@ -13,6 +13,7 @@ mod mcp;
 mod modeler;
 mod outline;
 mod ops;
+mod palette_lib;
 mod palette_ops;
 mod prefs;
 #[cfg(test)]
@@ -117,6 +118,8 @@ struct Args {
     ui_scale: Option<f32>,
     /// Show the Preferences window in `--ui-shot`.
     prefs_shot: bool,
+    /// Show the Palettes window in `--ui-shot`.
+    palettes_shot: bool,
     proj: Option<scene::Projection>,
     dof: Option<f32>,
     blades: Option<u32>,
@@ -202,6 +205,7 @@ fn parse_args() -> Result<Args> {
             "--pathtrace" => args.pathtrace = true,
             "--ui-scale" => args.ui_scale = Some(val()?.parse()?),
             "--prefs" => args.prefs_shot = true,
+            "--palettes" => args.palettes_shot = true,
             "--ui-shot" => args.ui_shot = Some(PathBuf::from(val()?)),
             "--proj" => {
                 use scene::Projection::*;
@@ -438,6 +442,7 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
     ed.enabled = r.modeling;
     ed.prefs.ui_scale = args.ui_scale.unwrap_or(1.0);
     ed.prefs_open = args.prefs_shot;
+    ed.palette.library_open = args.palettes_shot;
     ed.ui_scale = prefs::effective_scale(ed.prefs.ui_scale, w as f32 / native);
     ctx.set_zoom_factor(ed.ui_scale);
     let ppp = native * ed.ui_scale;

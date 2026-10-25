@@ -397,7 +397,7 @@ mod tests {
             v.set(IVec3::ONE, 9);
         }
         let path = std::env::temp_dir().join(format!("voxely-anim-{}.vox", std::process::id()));
-        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[]).unwrap();
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[], &[]).unwrap();
         let back = World::from_vox(&crate::vox::VoxFile::load(&path).unwrap());
         std::fs::remove_file(&path).ok();
         assert_eq!(back.anim, w.anim);

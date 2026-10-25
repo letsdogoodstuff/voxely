@@ -992,6 +992,27 @@ impl Editor {
         self.undo.len()
     }
 
+    /// Recolor the undo and redo history, the brush color, the copied
+    /// voxels and the pattern through `remap` after the palette's colors
+    /// moved to new indices.
+    pub fn remap_colors(&mut self, remap: &[u8; 256]) {
+        let m = |c: &mut u8| *c = remap[*c as usize];
+        for e in self.undo.iter_mut().chain(&mut self.redo) {
+            match e {
+                Entry::Cells(diff) => diff.iter_mut().for_each(|(_, a, b)| {
+                    m(a);
+                    m(b);
+                }),
+                Entry::Swap(v) => v.cells.iter_mut().for_each(m),
+            }
+        }
+        m(&mut self.color);
+        self.clipboard.iter_mut().for_each(|(_, c)| m(c));
+        if let Some(p) = &mut self.pattern {
+            p.volume.cells.iter_mut().for_each(m);
+        }
+    }
+
     /// Fold the edits made since the history had `len` entries into one,
     /// given the volume as it was then.
     pub fn squash(&mut self, v: &mut Volume, len: usize, before: Volume) {
@@ -1064,6 +1085,34 @@ mod tests {
 
     fn vol() -> Volume {
         Volume::new(IVec3::new(8, 8, 8))
+    }
+
+    #[test]
+    fn remap_colors_reaches_history_clipboard_and_pattern() {
+        let mut v = vol();
+        let mut e = Editor::new(3);
+        let mut painted = v.clone();
+        painted.set_index(0, 3);
+        e.commit(&mut v, painted);
+        e.copy(&v);
+        e.pattern = Some(Pattern { name: "p".into(), volume: v.clone() });
+        let mut remap: [u8; 256] = std::array::from_fn(|i| i as u8);
+        remap[3] = 7;
+        v.cells.iter_mut().for_each(|c| *c = remap[*c as usize]);
+        e.remap_colors(&remap);
+        assert_eq!(e.color, 7);
+        assert_eq!(e.pattern.as_ref().unwrap().volume.cells[0], 7);
+        // Paste brings back the remapped color...
+        v.set_index(0, 0);
+        e.paste(&mut v);
+        assert_eq!(v.cells[0], 7);
+        // ...and undoing the first edit leaves it empty, redoing gives 7.
+        e.select_none();
+        e.undo(&mut v);
+        e.undo(&mut v);
+        assert_eq!(v.cells[0], 0);
+        e.redo(&mut v);
+        assert_eq!(v.cells[0], 7);
     }
 
     #[test]

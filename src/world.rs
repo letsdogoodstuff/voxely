@@ -1150,7 +1150,7 @@ mod tests {
             n.sockets = vec![Socket { name: "muzzle".into(), pos: Vec3::new(3.0, 1.5, 1.5) }, Socket { name: "grip".into(), pos: Vec3::new(1.0, 1.0, 0.0) }];
         }
         let path = std::env::temp_dir().join(format!("voxely-extras-{}.vox", std::process::id()));
-        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[]).unwrap();
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[], &[]).unwrap();
         let back = World::from_vox(&VoxFile::load(&path).unwrap());
         std::fs::remove_file(&path).ok();
         let n = back.node(back.find("gun").unwrap()).unwrap();
@@ -1198,7 +1198,7 @@ mod tests {
 
         // Saved and reloaded, the links and placement survive.
         let path = std::env::temp_dir().join(format!("voxely-attach-{}.vox", std::process::id()));
-        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[]).unwrap();
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[], &[]).unwrap();
         let back = World::from_vox(&VoxFile::load(&path).unwrap());
         std::fs::remove_file(&path).ok();
         let (b_arm, b_sword) = (back.find("arm").unwrap(), back.find("sword").unwrap());
