@@ -2055,8 +2055,9 @@ struct Mouse {
     space: bool,
     zoom: bool,
     focus: bool,
-    /// Fractional brush-size change from Ctrl+Alt+drag.
-    size_drag: f32,
+    /// Ctrl+Alt+drag resizing the brush: the pressed face's plane (axis,
+    /// coordinate) and the point pressed on it.
+    size_from: Option<(usize, f32, Vec3)>,
     pos: Option<(f64, f64)>,
     /// Held camera keys W S A D Q E, and when the camera last moved.
     fly: [bool; 6],
@@ -2461,8 +2462,10 @@ impl App {
                 "c" => ed.brush = edit::Brush::Code,
                 "p" => ed.brush = edit::Brush::Pattern,
                 // Pattern rotation, or voxel brush size.
-                "-" | "=" | "+" if ed.brush == edit::Brush::Pattern => ed.rotate_pattern(2, if c == "-" { 3 } else { 1 }),
-                "9" | "0" if ed.brush == edit::Brush::Pattern => ed.rotate_pattern(0, if c == "9" { 3 } else { 1 }),
+                // Rot [-/+/0/9], as MagicaVoxel turns it: - and + a quarter
+                // turn either way about z, 9 about x, 0 about y.
+                "-" | "=" | "+" if ed.brush == edit::Brush::Pattern => ed.rotate_pattern(2, if c == "-" { 1 } else { 3 }),
+                "9" | "0" if ed.brush == edit::Brush::Pattern => ed.rotate_pattern(if c == "9" { 0 } else { 1 }, 1),
                 "-" => ed.opts.size = (ed.opts.size - 1).max(1),
                 "=" | "+" => ed.opts.size = (ed.opts.size + 1).min(64),
                 "t" => ed.tool = Tool::Attach,
@@ -2591,12 +2594,14 @@ impl App {
         if let Some((_, b)) = self.edit.marquee.as_mut() {
             *b = Vec2::new(x as f32, y as f32);
         } else if self.mouse.left && ctrl_alt && !self.edit.editor.active() {
-            // Ctrl+Alt+drag resizes the voxel brush.
-            let o = &mut self.edit.editor.opts;
-            self.mouse.size_drag += dx * 0.1;
-            let step = self.mouse.size_drag.trunc();
-            self.mouse.size_drag -= step;
-            o.size = (o.size + step as i32).clamp(1, 64);
+            // Ctrl+Alt+drag resizes the voxel brush, like MagicaVoxel: its
+            // edge follows the cursor across the pressed face's plane.
+            if let Some((axis, coord, p0)) = self.mouse.size_from {
+                let (ro, rd) = g.renderer.camera_ray(x as f32, y as f32);
+                if let Some(p) = edit::plane_point(ro, rd, axis, coord) {
+                    self.edit.editor.opts.size = ((p.distance(p0) * 2.0).floor() as i32 + 1).clamp(1, 64);
+                }
+            }
         } else if self.mouse.left && self.mouse.zoom {
             cam.dist = (cam.dist * (dy * 0.01).exp()).max(1.0);
             g.renderer.reset();
@@ -2731,6 +2736,10 @@ impl App {
                     let alt_only = alt && !self.modifiers.shift_key() && !cmd;
                     if cmd && alt {
                         // Ctrl+Alt+drag resizes the brush (see mouse_moved).
+                        self.mouse.size_from = hover.zip(self.ray()).and_then(|(h, (ro, rd))| {
+                            let (axis, coord) = h.plane();
+                            edit::plane_point(ro, rd, axis, coord).map(|p| (axis, coord, p))
+                        });
                     } else if alt_only {
                         // Alt+click picks a voxel's color with any tool.
                         if let Some(h) = hover.filter(|h| !h.on_ground()) {

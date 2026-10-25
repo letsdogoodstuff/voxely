@@ -187,6 +187,12 @@ pub struct Pick {
 }
 
 impl Pick {
+    /// The plane of the face that was hit: (axis, coordinate).
+    pub fn plane(&self) -> (usize, f32) {
+        let axis = axis_of(self.normal);
+        (axis, (self.cell[axis] + (self.normal[axis] > 0) as i32) as f32)
+    }
+
     pub fn on_ground(&self) -> bool {
         self.cell.z < 0
     }
@@ -260,7 +266,7 @@ fn axis_offset(p0: Vec3, axis: usize, ro: Vec3, rd: Vec3) -> Option<f32> {
 }
 
 /// Where the ray crosses the plane `axis = coord` (world units).
-fn plane_point(ro: Vec3, rd: Vec3, axis: usize, coord: f32) -> Option<Vec3> {
+pub fn plane_point(ro: Vec3, rd: Vec3, axis: usize, coord: f32) -> Option<Vec3> {
     if rd[axis].abs() < 1e-6 {
         return None;
     }
@@ -1175,7 +1181,8 @@ impl Editor {
             return false;
         }
         let tool = self.tool;
-        // A selection masks erasing and painting.
+        // Like MagicaVoxel, brushes leave selected voxels alone (region
+        // tools and the Edit panel work on them instead).
         let sel = if self.sel_count > 0 && tool != Tool::Attach { Some(&self.sel) } else { None };
         let Some(stroke) = self.stroke.as_mut() else { return false };
         let mut changed = false;
@@ -1184,7 +1191,7 @@ impl Editor {
                 continue;
             }
             let i = v.index(c);
-            if sel.is_some_and(|s| !s[i]) {
+            if sel.is_some_and(|s| s[i]) {
                 continue;
             }
             let old = v.cells[i];
@@ -1417,7 +1424,10 @@ impl Editor {
         let (axis, normal) = (s.axis, s.normal);
         let x = s.extrude.as_ref().unwrap();
         let Some(t) = axis_offset(x.origin, axis, ro, rd) else { return false };
-        let layers = ((t - x.t0).abs().round() as i32).clamp(1, v.dims[axis].max(1));
+        // Layers = how far the cursor is out along the face normal, like
+        // MagicaVoxel (Erase digs that many in); dragging inward keeps one.
+        let out = (t - x.t0) * normal[axis].signum() as f32;
+        let layers = (out.round() as i32).clamp(1, v.dims[axis].max(1));
         if layers == x.layers {
             return false;
         }
@@ -1774,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_masks_paint() {
+    fn selection_is_left_alone_by_brushes() {
         let mut v = vol();
         v.set(IVec3::new(1, 1, 0), 4);
         v.set(IVec3::new(2, 1, 0), 4);
@@ -1785,7 +1795,9 @@ mod tests {
         let hit = pick(&v, Vec3::new(2.5, 1.5, 20.0), Vec3::NEG_Z).unwrap();
         e.begin(&mut v, hit, Vec3::ZERO, Vec3::NEG_Z);
         e.end(&mut v);
-        assert_eq!((v.get(IVec3::new(1, 1, 0)), v.get(IVec3::new(2, 1, 0))), (9, 4));
+        // Measured in MagicaVoxel: painting over a selection changes only
+        // the voxels outside it.
+        assert_eq!((v.get(IVec3::new(1, 1, 0)), v.get(IVec3::new(2, 1, 0))), (4, 9));
     }
 
     fn count(v: &Volume, c: u8) -> usize {
@@ -1985,12 +1997,19 @@ mod tests {
         let (ro, rd) = (Vec3::new(1.5, 1.5, 20.0), Vec3::NEG_Z);
         let hit = pick(&v, ro, rd).unwrap();
         e.begin(&mut v, hit, ro, rd);
-        // Two cells into the model.
-        let (ro, rd) = level_ray(2.0);
-        e.drag(&mut v, ro, rd, None);
+        // Two cells out from the face: MagicaVoxel digs two layers in.
+        let (ro2, rd2) = level_ray(6.0);
+        e.drag(&mut v, ro2, rd2, None);
         e.end(&mut v);
         assert_eq!(count(&v, 9), 32);
         assert_eq!((v.get(IVec3::new(0, 0, 1)), v.get(IVec3::new(0, 0, 2))), (9, 0));
+        // Dragging into the model keeps one layer.
+        e.undo(&mut v);
+        e.begin(&mut v, hit, ro, rd);
+        let (ro2, rd2) = level_ray(2.0);
+        e.drag(&mut v, ro2, rd2, None);
+        e.end(&mut v);
+        assert_eq!(count(&v, 9), 48);
     }
 
     #[test]
