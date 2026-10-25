@@ -16,6 +16,64 @@ use crate::ops;
 use crate::scene::{BgMode, MaterialKind, Projection, Scene, Volume, srgb_to_linear};
 use crate::ui::{Op, TransformKind};
 
+// Tool families kept in their own files. Each has `tools()` (definitions),
+// `PART_TOOLS` (tools that take a `part`), `dispatch` (None if the name
+// isn't one of its tools) and a `State` kept in `EditState::tools`.
+mod build;
+mod inspect;
+mod surface;
+mod view;
+
+/// Per-session state for the tool families, plus a record of the last edit.
+#[derive(Default)]
+pub struct ToolState {
+    pub last_edit: Option<LastEdit>,
+    pub build: build::State,
+    pub inspect: inspect::State,
+    pub surface: surface::State,
+    pub view: view::State,
+}
+
+/// What the most recent committed edit changed, in the edited part's
+/// coordinates.
+#[derive(Clone, Debug, Default)]
+pub struct LastEdit {
+    /// The part that was edited (None in World mode).
+    pub part: Option<usize>,
+    /// The canvas was resized, so cells can't be compared one to one.
+    pub resized: bool,
+    pub added: usize,
+    pub removed: usize,
+    pub recolored: usize,
+    /// Bounds of the changed cells, inclusive.
+    pub bounds: Option<(IVec3, IVec3)>,
+    /// Every changed cell (empty when resized).
+    pub cells: Vec<IVec3>,
+}
+
+impl LastEdit {
+    fn diff(part: Option<usize>, old: &Volume, new: &Volume) -> Self {
+        let mut e = LastEdit { part, resized: old.dims != new.dims, ..Default::default() };
+        if e.resized {
+            return e;
+        }
+        for (i, (&a, &b)) in old.cells.iter().zip(&new.cells).enumerate() {
+            if a == b {
+                continue;
+            }
+            match (a, b) {
+                (0, _) => e.added += 1,
+                (_, 0) => e.removed += 1,
+                _ => e.recolored += 1,
+            }
+            let p = old.position(i);
+            e.bounds = Some(e.bounds.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))));
+            e.cells.push(p);
+        }
+        e
+    }
+}
+
 /// Everything a tool call can touch.
 pub struct Ctx<'a> {
     pub r: &'a mut Renderer,
@@ -241,11 +299,17 @@ const PART_TOOLS: &[&str] = &[
     "resize_canvas", "run_shader", "select", "move_selection",
 ];
 
+fn is_part_tool(name: &str) -> bool {
+    [PART_TOOLS, build::PART_TOOLS, inspect::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
+}
+
 /// The tool list for MCP `tools/list`, with the shared `part` argument.
 pub fn tools() -> Value {
     let mut list = base_tools();
+    let extra = [build::tools(), inspect::tools(), surface::tools(), view::tools()];
+    list.as_array_mut().unwrap().extend(extra.into_iter().flatten());
     for t in list.as_array_mut().into_iter().flatten() {
-        if PART_TOOLS.contains(&t["name"].as_str().unwrap_or_default()) {
+        if is_part_tool(t["name"].as_str().unwrap_or_default()) {
             t["inputSchema"]["properties"]["part"] = json!({ "type": ["string", "integer"], "description": "Part to work on (name or id); default: the part being edited" });
         }
     }
@@ -359,9 +423,13 @@ fn color_arg(scene: &Scene, args: &Value, key: &str) -> Result<u8> {
 
 /// Commit an edit to the volume and push it to the GPU.
 pub(crate) fn apply(ctx: &mut Ctx, new: Volume) -> bool {
+    let new = build::before_commit(ctx, new);
+    let edit = LastEdit::diff(ctx.scene.editing(), &ctx.scene.volume, &new);
     let changed = ctx.ed.editor.commit(&mut ctx.scene.volume, new);
     if changed {
         app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+        ctx.ed.tools.last_edit = Some(edit);
+        inspect::after_commit(ctx);
     }
     changed
 }
@@ -552,8 +620,13 @@ pub(crate) fn focus_part(ctx: &mut Ctx, part: Option<&Value>) -> Result<()> {
 
 fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
     let a = args;
-    if PART_TOOLS.contains(&name) {
+    if is_part_tool(name) {
         focus_part(ctx, get(a, "part"))?;
+    }
+    for family in [build::dispatch, inspect::dispatch, surface::dispatch, view::dispatch] {
+        if let Some(result) = family(ctx, name, a) {
+            return result;
+        }
     }
     match name {
         "list_parts" => {

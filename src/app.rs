@@ -73,6 +73,8 @@ pub struct EditState {
     /// World mode: nodes copied with Ctrl+C.
     pub part_clipboard: Vec<usize>,
     cameras: [Option<Camera>; QUICK_SLOT + 1],
+    /// State for agent tools (symmetry, checkpoints, last edit, ...).
+    pub tools: crate::control::ToolState,
 }
 
 /// Parts dragged across the plane of the face first clicked.
@@ -117,6 +119,7 @@ impl EditState {
             last_click: None,
             part_clipboard: Vec::new(),
             cameras: [None; QUICK_SLOT + 1],
+            tools: Default::default(),
         }
     }
 
