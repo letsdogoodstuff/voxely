@@ -255,10 +255,18 @@ fn base_tools() -> Value {
             "edges": { "type": "boolean" }, "grid": { "type": "boolean" },
             "aperture": { "type": "number", "minimum": 0, "description": "Depth of field, 0 = off" },
         }), &[]),
-        tool("render", "Path-traced image from the current camera and render settings.", json!({
-            "width": { "type": "integer" }, "height": { "type": "integer" },
+        tool("render", "Path-traced image with the current render settings. By default from the window's camera exactly as it is. \
+            frame: true keeps the camera's yaw and pitch but fits distance and target to all the voxels with a margin (a good default for a first look). \
+            views path traces several auto-framed views tiled side by side with labels, same lighting: \"turnaround\" (front, right, back, left), \
+            \"quad\", \"all\", or a list of front, back, left, right, top, bottom, iso, 3/4. Named views are orthographic except 3/4 unless projection says otherwise. \
+            Neither changes the window's camera; the result lists the cameras used.", json!({
+            "width": { "type": "integer", "description": "Whole image width (default 960; with views 480 per tile)" },
+            "height": { "type": "integer", "description": "Whole image height (default 640; with views 600 per tile)" },
             "samples": { "type": "integer", "description": "Samples per pixel (default 128; more is smoother and slower)" },
-            "save_path": { "type": "string", "description": "Also save the PNG here" },
+            "frame": { "type": "boolean", "description": "Fit the camera to the whole scene from its current angle" },
+            "views": { "type": ["string", "array"], "items": { "type": "string" }, "description": "\"turnaround\", \"quad\", \"all\", a view name, or a list of view names" },
+            "projection": { "type": "string", "enum": ["orthographic", "perspective"], "description": "For frame/views (default: each view's own; frame keeps the current projection)" },
+            "save_path": { "type": "string", "description": "Also save the PNG here (the whole tiled image with views)" },
         }), &[]),
         tool("export", "Export the model: gltf (.glb, best for game engines), or MagicaVoxel's formats: obj/ply/mc/cube meshes, xraw/slab/qb/vox volumes, iso/2d/slice sprite images, point clouds.", json!({
             "format": { "type": "string", "enum": ["gltf", "obj", "ply", "mc", "xraw", "slab", "qb", "vox", "iso", "2d", "slice", "point", "cube"],
@@ -1814,6 +1822,9 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         // "screenshot" lives in view.rs.
         "render" => {
+            if get(a, "views").is_some() || boolean(a, "frame").unwrap_or(false) {
+                return view::render_framed(ctx, a);
+            }
             let (w, h) = (int(a, "width").unwrap_or(960).clamp(16, 8192) as u32, int(a, "height").unwrap_or(640).clamp(16, 8192) as u32);
             let spp = int(a, "samples").unwrap_or(128).clamp(1, 65536) as u32;
             let t = std::time::Instant::now();

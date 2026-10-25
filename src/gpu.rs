@@ -823,6 +823,16 @@ impl Renderer {
         }
     }
 
+    /// Show `v` (and dimmed `context`) in the modeler only, leaving the
+    /// path tracer's voxels alone: screenshots of something other than the
+    /// edited part. Call again with the scene's own to restore.
+    pub fn modeler_show(&mut self, v: &Volume, context: Option<&(Volume, glam::IVec3)>, sel: Option<&[bool]>) {
+        if let Some(m) = self.modeler.as_mut() {
+            m.upload_volume(&self.device, v, sel);
+            m.set_context(&self.device, context);
+        }
+    }
+
     /// Mark cells in the modeler (see `Modeler::set_highlight`).
     pub fn set_highlight(&mut self, dims: glam::IVec3, cells: &[(glam::IVec3, bool)]) {
         if let Some(m) = self.modeler.as_mut() {
