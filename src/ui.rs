@@ -1317,6 +1317,8 @@ pub fn project_panel(
     tab: &mut ProjectTab,
     projects: &[PathBuf],
     samples: &[PathBuf],
+    // The opened file's own folder (name, files), when it is elsewhere.
+    folder: Option<(&str, &[PathBuf])>,
     current: &Path,
     pattern: Option<&str>,
     shaders: &mut ShaderState,
@@ -1361,11 +1363,9 @@ pub fn project_panel(
         match *tab {
             ProjectTab::Project | ProjectTab::Pattern => {
                 let pattern_tab = *tab == ProjectTab::Pattern;
-                // MagicaVoxel's `vox` folder is the samples; another folder
-                // (the opened file's) goes by its name.
-                let folder = samples.first().and_then(|p| p.parent()).and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
-                let others = folder.filter(|n| n != "vox").unwrap_or_else(|| "Samples".into());
-                for (title, list) in [("My projects", projects), (others.as_str(), samples)] {
+                let mut sections = vec![("My projects", projects), ("Samples", samples)];
+                sections.extend(folder);
+                for (title, list) in sections {
                     if list.is_empty() && title != "My projects" {
                         continue;
                     }

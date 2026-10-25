@@ -24,7 +24,7 @@ const FLAG_BG_HIDDEN: u32 = 16;
 const REFRAME_FRAMES: u32 = 3;
 
 /// Orbit camera around a target point, Z up like MagicaVoxel.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
     pub target: Vec3,
     pub yaw: f32,

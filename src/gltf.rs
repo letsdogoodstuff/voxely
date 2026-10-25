@@ -463,6 +463,15 @@ fn add_node(id: usize, offset: Vec3, pre: Mat3, o: &mut Out) -> Option<usize> {
     Some(index)
 }
 
+/// `World::bounds` (low and high corners) of what's shown under `id`.
+fn shown_bounds(world: &crate::world::World, id: usize) -> Option<(glam::IVec3, glam::IVec3)> {
+    let n = world.node(id)?;
+    if !n.is_group() {
+        return world.visible(id).then(|| world.bounds(id)).flatten().map(|(lo, size)| (lo, lo + size));
+    }
+    n.children().iter().filter_map(|&c| shown_bounds(world, c)).reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+}
+
 /// Write `scene` to `path`: binary `.glb`, or `.gltf` JSON with the buffer
 /// embedded as a data URI when the extension is `gltf`.
 pub fn write(scene: &Scene, path: &Path) -> Result<()> {
@@ -494,8 +503,8 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
     // engines turn parts the way they turn here; sockets are empty child
     // nodes to attach things to.
     let mut nodes: Vec<Value> = vec![json!({ "name": name })];
-    // Center the scene like the other exports.
-    let center = world.bounds(crate::world::ROOT).map_or(Vec3::ZERO, |(lo, size)| lo.as_vec3() + size.as_vec3() * 0.5);
+    // Center the scene like the other exports, leaving out what's hidden.
+    let center = shown_bounds(world, crate::world::ROOT).map_or(Vec3::ZERO, |(lo, hi)| (lo + hi).as_vec3() * 0.5);
     if center != Vec3::ZERO {
         nodes[0]["translation"] = json!(to_gltf(-center));
     }

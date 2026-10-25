@@ -3036,6 +3036,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "glam",
+ "indexmap",
  "log",
  "naga",
  "png",

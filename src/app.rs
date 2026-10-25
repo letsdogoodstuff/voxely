@@ -42,6 +42,9 @@ pub struct EditState {
     pub projects: Vec<PathBuf>,
     /// MagicaVoxel's sample models (its `vox` folder), when known.
     pub samples: Vec<PathBuf>,
+    /// The folder of a file opened from elsewhere (not the workspace or
+    /// MagicaVoxel's `vox` folder): its name and `.vox` files.
+    pub folder: Option<(String, Vec<PathBuf>)>,
     /// When `projects` was last read from disk.
     scanned: std::time::Instant,
     /// Palette images in MagicaVoxel's `palette` folder.
@@ -195,10 +198,11 @@ impl EditState {
         // has none of its assets around it; list the install's instead.
         let install = magicavoxel_dir().map(|d| d.join("vox").join("_.vox"));
         let or_install = |found: Vec<PathBuf>, list: fn(Option<&Path>) -> Vec<PathBuf>| if found.is_empty() { list(install.as_deref()) } else { found };
-        let samples = or_install(list_samples(source.as_deref()), list_samples);
+        let samples = or_install(list_samples(source.as_deref().filter(|p| in_samples_layout(p))), list_samples);
         let palettes = or_install(list_palettes(source.as_deref()), list_palettes);
         EditState {
             samples,
+            folder: source.as_deref().and_then(other_folder),
             scanned: std::time::Instant::now(),
             palettes,
             project_tab: ui::ProjectTab::default(),
@@ -325,6 +329,24 @@ fn list_samples(source: Option<&Path>) -> Vec<PathBuf> {
     }
 }
 
+/// Whether `model` sits in a MagicaVoxel-style `vox` folder: the
+/// install's, or one with a `palette` folder beside it.
+fn in_samples_layout(model: &Path) -> bool {
+    let Some(dir) = model.parent() else { return false };
+    magicavoxel_dir().is_some_and(|d| same_dir(dir, &d.join("vox"))) || dir.parent().is_some_and(|p| p.join("palette").is_dir())
+}
+
+/// The folder listing for `model` when it is neither in the workspace nor
+/// a samples folder.
+fn other_folder(model: &Path) -> Option<(String, Vec<PathBuf>)> {
+    let dir = model.parent()?;
+    if same_dir(dir, &workspace_dir()) || in_samples_layout(model) {
+        return None;
+    }
+    let name = std::fs::canonicalize(dir).ok().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| dir.display().to_string());
+    Some((name, list_vox(dir)))
+}
+
 fn same_dir(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
@@ -433,8 +455,8 @@ fn is_iso(r: &Renderer) -> bool {
 
 /// Where Ctrl+S writes a project by default. Projects already in the
 /// workspace save in place; anything else (a sample, a file elsewhere, a
-/// new project) gets a copy in the workspace, so originals are never
-/// overwritten by saving's flattening.
+/// new project) gets a copy under a free name in the workspace, so
+/// originals and other projects are never overwritten.
 pub fn default_save_path(source: Option<&Path>) -> PathBuf {
     if let Some(src) = source {
         if src.parent().is_some_and(|d| same_dir(d, &workspace_dir())) {
@@ -442,10 +464,8 @@ pub fn default_save_path(source: Option<&Path>) -> PathBuf {
         }
     }
     let stem = source.and_then(Path::file_stem).map_or("project".into(), |n| n.to_string_lossy().into_owned());
-    if source.is_some() {
-        return project_path(&stem);
-    }
-    // A new project: the first free "project", "project-2", ...
+    // The first free "name", "name-2", ..., so a copy never replaces a
+    // workspace project of the same name.
     (1..).map(|k| if k == 1 { project_path(&stem) } else { project_path(&format!("{stem}-{k}")) }).find(|p| !p.exists()).unwrap()
 }
 
@@ -474,6 +494,7 @@ pub fn save_project(r: &Renderer, scene: &mut Scene, ed: &mut EditState, path: P
         std::fs::create_dir_all(dir)?;
     }
     scene.settings = r.settings.clone();
+    scene.store_camera(&r.camera);
     scene.save(&path)?;
     ed.save_path = path.clone();
     ed.source = Some(path.clone());
@@ -485,6 +506,10 @@ pub fn save_project(r: &Renderer, scene: &mut Scene, ed: &mut EditState, path: P
 
 /// Push voxel edits to the GPU, refreshing emissive faces if any exist.
 pub fn sync_volume(r: &mut Renderer, scene: &mut Scene, editor: &mut Editor) {
+    if std::mem::take(&mut scene.palette_dirty) {
+        r.set_palette(&scene.palette);
+        r.upload_materials(&scene.materials);
+    }
     let highlight = scene.highlight();
     r.upload_scene(scene, highlight.as_ref().or(editor.selection()));
     editor.sel_dirty = false;
@@ -762,13 +787,19 @@ fn solid_bounds(scene: &Scene, sel: Option<&Mask>) -> Option<(Vec3, Vec3)> {
     b.map(|(lo, hi)| (lo.as_vec3(), (hi + IVec3::ONE).as_vec3()))
 }
 
-/// Point the project, palette and shader lists at the folders around
-/// `model` (a file in MagicaVoxel's vox folder). Lists that come up empty
+/// Point the sample, palette and shader lists at the folders around
+/// `model` when it is in a MagicaVoxel-style vox folder; a file from any
+/// other folder lists that folder separately. Lists that come up empty
 /// keep what was found before.
 pub(crate) fn set_asset_lists(ed: &mut EditState, model: &Path) {
-    let samples = list_samples(Some(model));
-    if !samples.is_empty() {
-        ed.samples = samples;
+    if in_samples_layout(model) {
+        let samples = list_samples(Some(model));
+        if !samples.is_empty() {
+            ed.samples = samples;
+        }
+    }
+    if !model.parent().is_some_and(|d| same_dir(d, &workspace_dir())) {
+        ed.folder = other_folder(model);
     }
     let palettes = list_palettes(Some(model));
     if !palettes.is_empty() {
@@ -786,15 +817,23 @@ pub(crate) fn open_project(path: PathBuf, r: &mut Renderer, scene: &mut Scene, e
     set_asset_lists(ed, &path);
     ed.source = Some(path);
     loaded(r, scene, ed);
+    // The view the file was saved with.
+    if let Some(cam) = scene.file_camera() {
+        r.set_camera(cam);
+        scene.vox_camera = Some(r.camera);
+    }
     Ok(())
 }
 
 /// Import `path` read `how`: as a new project (named after the file), or
 /// as new parts of this scene (one undo step). Returns what came in.
 pub(crate) fn import_file(path: &Path, how: &crate::import::How, new_project: bool, add_colors: bool, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) -> Result<String> {
-    let models = crate::import::read(path, how)?;
+    let (models, warnings) = crate::import::read(path, how)?;
     let stem = path.file_stem().map_or("import".into(), |n| n.to_string_lossy().into_owned());
-    let what = crate::import::summary(&models);
+    let mut what = crate::import::summary(&models);
+    for w in &warnings {
+        what += &format!("; warning: {w}");
+    }
     if new_project {
         let ibl = r.settings.ibl_path.clone();
         *scene = crate::import::new_scene(&models)?;
@@ -1671,7 +1710,8 @@ pub fn build_ui(
             let current = ed.source.clone().unwrap_or_default();
             let pattern = ed.editor.pattern.as_ref().map(|p| p.name.clone());
             ed.rescan_if_stale();
-            ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &ed.samples, &current, pattern.as_deref(), &mut ed.shaders, ed.export_status.as_deref(), cmds);
+            let folder = ed.folder.as_ref().map(|(n, l)| (n.as_str(), l.as_slice()));
+            ui::project_panel(ui, &mut ed.project_tab, &ed.projects, &ed.samples, folder, &current, pattern.as_deref(), &mut ed.shaders, ed.export_status.as_deref(), cmds);
         });
         if r.modeling {
             let editing = scene.editing().is_some();

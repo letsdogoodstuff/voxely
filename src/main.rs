@@ -151,7 +151,7 @@ fn parse_rgb(v: &str) -> Result<glam::Vec3> {
 
 fn parse_args() -> Result<Args> {
     let it = std::env::args().skip(1);
-    let mut model = None;
+    let mut model: Option<PathBuf> = None;
     let mut args = Args { spp: 256, size: (960, 640), ..Default::default() };
     let mut it = it.peekable();
     while let Some(a) = it.next() {
@@ -165,7 +165,8 @@ fn parse_args() -> Result<Args> {
             args.grid = Some(opt(&mut it).map(|v| v.parse()).transpose()?.unwrap_or(1));
             continue;
         }
-        let mut val = || it.next().with_context(|| format!("{a} needs a value"));
+        // A required value, which can't be another option.
+        let mut val = || it.next().filter(|v| !v.starts_with("--")).with_context(|| format!("{a} needs a value"));
         match a.as_str() {
             "--denoise" => args.denoise = true,
             "--denoise-view" => {
@@ -183,11 +184,19 @@ fn parse_args() -> Result<Args> {
             "--bg-color" => args.bg = Some((scene::BgMode::Color, parse_rgb(&val()?)?)),
             "--bg-transparent" => args.bg = Some((scene::BgMode::Transparent, glam::Vec3::ZERO)),
             "--render" => args.render = Some(PathBuf::from(val()?)),
-            "--spp" => args.spp = val()?.parse()?,
+            "--spp" => {
+                args.spp = val()?.parse().context("--spp needs a whole number")?;
+                if args.spp == 0 {
+                    bail!("--spp must be at least 1");
+                }
+            }
             "--size" => {
                 let v = val()?;
                 let (w, h) = v.split_once('x').context("--size needs WxH")?;
-                args.size = (w.parse()?, h.parse()?);
+                args.size = (w.parse().context("--size needs WxH")?, h.parse().context("--size needs WxH")?);
+                if args.size.0 == 0 || args.size.1 == 0 {
+                    bail!("--size must be at least 1x1");
+                }
             }
             "--sky" => {
                 args.sky = Some(match val()?.as_str() {
@@ -226,7 +235,21 @@ fn parse_args() -> Result<Args> {
             "--out" => args.out = Some(PathBuf::from(val()?)),
             "--xs" => args.xs = Some(PathBuf::from(val()?)),
             "--xs-args" => args.xs_args = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
-            "--new" => args.new = Some(glam::IVec3::splat(40)),
+            "--new" => {
+                args.new = Some(glam::IVec3::splat(40));
+                // An optional size: anything after --new that isn't an option
+                // or a .vox file must be one.
+                if let Some(v) = it.next_if(|v: &String| !v.starts_with('-') && !v.to_ascii_lowercase().ends_with(".vox")) {
+                    let n: Vec<i32> = v.split('x').map(|n| n.parse()).collect::<Result<_, _>>().map_err(|_| anyhow::anyhow!("--new size must be WxHxD, got {v:?}"))?;
+                    if n.len() != 3 {
+                        bail!("--new size must be WxHxD, got {v:?}");
+                    }
+                    if n.iter().any(|&k| !(1..=ops::MAX_DIM).contains(&k)) {
+                        bail!("--new size must be 1..{} per side", ops::MAX_DIM);
+                    }
+                    args.new = Some(glam::IVec3::new(n[0], n[1], n[2]));
+                }
+            }
             "--cam" => {
                 let v: Vec<f32> = val()?.split(',').map(str::parse).collect::<Result<_, _>>()?;
                 if v.len() != 3 && v.len() != 6 {
@@ -239,14 +262,7 @@ fn parse_args() -> Result<Args> {
                 std::process::exit(0);
             }
             _ if a.starts_with("--") => bail!("unknown option {a}\n\n{USAGE}"),
-            // A size right after --new.
-            _ if args.new.is_some() && model.is_none() && a.split('x').count() == 3 && a.split('x').all(|v| v.parse::<i32>().is_ok()) => {
-                let v: Vec<i32> = a.split('x').map(|v| v.parse().unwrap()).collect();
-                if v.iter().any(|&n| !(1..=1024).contains(&n)) {
-                    bail!("--new size must be 1..1024 per side");
-                }
-                args.new = Some(glam::IVec3::new(v[0], v[1], v[2]));
-            }
+            _ if model.is_some() => bail!("more than one model given ({} and {a})", model.unwrap_or_default().display()),
             _ => model = Some(PathBuf::from(a)),
         }
     }
@@ -387,10 +403,26 @@ fn apply_cam(r: &mut Renderer, args: &Args) {
     }
 }
 
+/// Check an offscreen image size against what the GPU can hold: the
+/// texture side and the per-pixel float buffers (16 bytes a pixel).
+fn check_image_size(device: &wgpu::Device, (w, h): (u32, u32)) -> Result<()> {
+    let l = device.limits();
+    let side = l.max_texture_dimension_2d;
+    let bytes = l.max_buffer_size.min(l.max_storage_buffer_binding_size as u64);
+    if w == 0 || h == 0 || w > side || h > side {
+        bail!("--size {w}x{h}: each side must be 1..={side} on this GPU");
+    }
+    if w as u64 * h as u64 * 16 > bytes {
+        bail!("--size {w}x{h} is too many pixels for this GPU (at most {} in all)", bytes / 16);
+    }
+    Ok(())
+}
+
 fn render_headless(args: &Args, scene: &Scene) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let (_adapter, device, queue) = pollster::block_on(gpu::request_device(&instance, None))?;
     let (w, h) = args.size;
+    check_image_size(&device, (w, h))?;
     let mut r = Renderer::new(device, queue, scene, None, w, h);
     apply_cam(&mut r, args);
     let pixels = r.render_image(args.spp)?;
@@ -419,6 +451,7 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let (_adapter, device, queue) = pollster::block_on(gpu::request_device(&instance, None))?;
     let (w, h) = args.size;
+    check_image_size(&device, (w, h))?;
     let format = wgpu::TextureFormat::Bgra8Unorm;
     let mut egui_renderer = egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
     let mut r = Renderer::new(device, queue, scene, Some(format), w, h);

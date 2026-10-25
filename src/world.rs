@@ -1145,7 +1145,8 @@ impl World {
 
     /// Read transform node `trn` and what it wraps.
     fn read_node(&mut self, f: &VoxFile, trn: i32, parent: usize, depth: u32) {
-        if depth > 64 {
+        // Bounds nesting, and parts from nodes shared many times over.
+        if depth > 64 || self.nodes.len() > MAX_VOX_PARTS {
             return;
         }
         let Some(VoxNode::Transform { attrs, child, layer, rotation, translation, frames }) = f.nodes.get(&trn) else { return };
@@ -1168,10 +1169,7 @@ impl World {
                 // voxely's part with attached parts: the first child is the
                 // part's own shape, the rest are attached in its voxel space.
                 let shape = children.first().and_then(|c| match f.nodes.get(c) {
-                    Some(VoxNode::Transform { child, .. }) => match f.nodes.get(child) {
-                        Some(VoxNode::Shape { models, model_frames, .. }) => shape_models(f, models, model_frames),
-                        _ => None,
-                    },
+                    Some(VoxNode::Transform { child, .. }) => node_models(f, *child),
                     _ => None,
                 });
                 match shape.filter(|_| attrs.get("_vx_part").is_some_and(|v| v == "1")) {
@@ -1188,6 +1186,11 @@ impl World {
                                 cn.keys.iter_mut().for_each(|k| k.t += half);
                             }
                         }
+                    }
+                    None if gattrs.contains_key(crate::vox::TILES) => {
+                        let Some((v, flip)) = node_models(f, *child) else { return };
+                        (n.kind, n.flip) = (Kind::Model(v), flip);
+                        self.push(parent, n);
                     }
                     None => {
                         let id = self.push(parent, n);
@@ -1206,6 +1209,36 @@ impl World {
             }
             _ => {}
         }
+    }
+}
+
+/// Most parts a `.vox` file may expand to.
+const MAX_VOX_PARTS: usize = 1 << 14;
+
+/// The model a transform's child holds: a shape, or voxely's group of
+/// tiles for a model over 256 on a side, put back together.
+fn node_models(f: &VoxFile, id: i32) -> Option<(Volume, Vec<crate::anim::Slot>)> {
+    match f.nodes.get(&id)? {
+        VoxNode::Shape { models, model_frames, .. } => shape_models(f, models, model_frames),
+        VoxNode::Group { attrs, children } => {
+            let dims = parse_v3(attrs.get(crate::vox::TILES)?)?.as_ivec3();
+            if dims.cmplt(IVec3::ONE).any() || dims.cmpgt(IVec3::splat(crate::ops::MAX_DIM)).any() {
+                return None;
+            }
+            let mut v = Volume::new(dims);
+            for c in children {
+                let Some(VoxNode::Transform { child, translation, .. }) = f.nodes.get(c) else { continue };
+                let Some(VoxNode::Shape { models, .. }) = f.nodes.get(child) else { continue };
+                let Some(m) = models.first().and_then(|&m| f.models.get(m as usize)) else { continue };
+                // Inverse of the writer's `o + size / 2 - dims / 2`.
+                let o = *translation + dims / 2 - m.size / 2;
+                for c in &m.voxels {
+                    v.set(o + IVec3::new(c[0] as i32, c[1] as i32, c[2] as i32), c[3]);
+                }
+            }
+            Some((v, Vec::new()))
+        }
+        _ => None,
     }
 }
 

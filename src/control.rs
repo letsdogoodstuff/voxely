@@ -144,14 +144,14 @@ fn base_tools() -> Value {
             "fill": color_schema(),
             "overwrite": { "type": "boolean", "description": "Replace an existing project with this name" },
         }), &["name"]),
-        tool("list_projects", "The workspace's projects (newest first) and MagicaVoxel's sample models.", json!({}), &[]),
+        tool("list_projects", "The workspace's projects (newest first), MagicaVoxel's sample models, and (as `opened_folder`) the .vox files beside a file opened from another folder; open_project opens any of them by name.", json!({}), &[]),
         tool("open_project", "Open a project or sample by name.", json!({ "name": { "type": "string" } }), &["name"]),
         tool("new_scene", "Start a new unnamed project (saved as project, project-2, ... in the workspace). Empty unless `fill` is given.", json!({
             "size": size3("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
             "fill": color_schema(),
         }), &[]),
         tool("open_file", "Open a MagicaVoxel .vox file, keeping its models and groups as parts.", json!({ "path": { "type": "string" } }), &["path"]),
-        tool("save_file", "Save the project as .vox. Without `path`, saves the current project in the workspace. With a `path` it's Save As: that file becomes the current one (later saves and autosave go there) and the project's references are copied to its new name.", json!({ "path": { "type": "string" } }), &[]),
+        tool("save_file", "Save the project as .vox. Without `path`, saves to the current save path (get_scene_info `save_path`): the project's workspace file, or the last path saved to. With a `path` it's Save As: that file becomes the current one (later saves and autosave go there) and the project's references are copied to its new name.", json!({ "path": { "type": "string" } }), &[]),
         tool("set_voxels", "Set individual voxels. Color 0 erases.", json!({
             "voxels": { "type": "array", "description": "[[x, y, z, color], ...]; color is an index or \"#rrggbb\"", "items": { "type": "array", "items": { "type": ["integer", "string"] }, "minItems": 4, "maxItems": 4 } },
         }), &["voxels"]),
@@ -1387,7 +1387,11 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             Ok(edited(ctx, true, &format!("Opened {}", path.display())))
         }
         "save_file" => {
-            let path = string(a, "path").map_or_else(|| ctx.ed.save_path.clone(), |p| PathBuf::from(p).with_extension("vox"));
+            let path = match string(a, "path") {
+                Some(p) if p.trim().is_empty() => bail!("`path` is empty; give a file path, or leave `path` out to save to {}", ctx.ed.save_path.display()),
+                Some(p) => PathBuf::from(p).with_extension("vox"),
+                None => ctx.ed.save_path.clone(),
+            };
             let (old_path, old_name) = (ctx.ed.save_path.clone(), ctx.ed.name());
             let path = app::save_project(ctx.r, ctx.scene, ctx.ed, path)?;
             let full = std::fs::canonicalize(&path).unwrap_or(path);
@@ -1431,14 +1435,19 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let current = ctx.ed.source.as_ref();
             let list: Vec<Value> = projects.iter().map(|p| json!({ "name": stem(p), "current": Some(*p) == current })).collect();
             let samples: Vec<String> = ctx.ed.samples.iter().map(stem).collect();
-            let out = json!({ "workspace": app::workspace_dir().display().to_string(), "projects": list, "samples": samples });
+            let mut out = json!({ "workspace": app::workspace_dir().display().to_string(), "projects": list, "samples": samples });
+            if let Some((name, files)) = &ctx.ed.folder {
+                out["opened_folder"] = json!({ "name": name, "files": files.iter().map(stem).collect::<Vec<_>>() });
+            }
             Ok(vec![text(serde_json::to_string_pretty(&out)?)])
         }
         "open_project" => {
             let name = string(a, "name").context("missing `name`")?;
             ctx.ed.rescan();
-            let matches = |p: &&PathBuf| p.file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(name));
-            let path = ctx.ed.projects.iter().find(matches).or_else(|| ctx.ed.samples.iter().find(matches)).cloned().ok_or_else(|| anyhow!("no project or sample named {name:?}; see list_projects"))?;
+            let key = name.to_lowercase();
+            let matches = |p: &&PathBuf| p.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase() == key);
+            let folder = ctx.ed.folder.as_ref().map_or(&[][..], |(_, f)| f.as_slice());
+            let path = ctx.ed.projects.iter().find(matches).or_else(|| ctx.ed.samples.iter().find(matches)).or_else(|| folder.iter().find(matches)).cloned().ok_or_else(|| anyhow!("no project or sample named {name:?}; see list_projects"))?;
             app::open_project(path.clone(), ctx.r, ctx.scene, ctx.ed)?;
             Ok(edited(ctx, true, &format!("Opened {}", path.display())))
         }

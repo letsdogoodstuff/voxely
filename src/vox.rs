@@ -12,7 +12,8 @@ use crate::scene::Volume;
 use crate::anim::Key;
 use crate::world::{Kind, Rot, World, ROOT};
 
-pub type Dict = HashMap<String, String>;
+/// A `.vox` dictionary, kept in file order so files save back unchanged.
+pub type Dict = indexmap::IndexMap<String, String>;
 
 #[derive(Debug, Clone)]
 pub struct Model {
@@ -61,6 +62,17 @@ pub struct VoxFile {
     pub render: HashMap<String, Dict>,
     /// `_type`s of the render chunks in file order.
     pub render_order: Vec<String>,
+    /// Chunks voxely keeps without using (cameras, palette order).
+    pub extra: Extra,
+}
+
+/// `.vox` chunks read and written back as they are.
+#[derive(Debug, Clone, Default)]
+pub struct Extra {
+    /// Cameras (`rCAM`): id and dictionary.
+    pub cameras: Vec<(i32, Dict)>,
+    /// Palette display order (`IMAP`), 256 bytes.
+    pub imap: Option<Vec<u8>>,
 }
 
 struct Reader<'a> {
@@ -70,21 +82,25 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn i32(&mut self) -> Result<i32> {
-        let s = self.b.get(self.o..self.o + 4).context("unexpected end of file")?;
-        self.o += 4;
+        let s = self.bytes(4)?;
         Ok(i32::from_le_bytes(s.try_into().unwrap()))
     }
     fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        let s = self.b.get(self.o..self.o + n).context("unexpected end of file")?;
+        let s = self.o.checked_add(n).and_then(|e| self.b.get(self.o..e)).context("unexpected end of file")?;
         self.o += n;
         Ok(s)
     }
+    /// A count or length, which must not be negative.
+    fn len(&mut self) -> Result<usize> {
+        let n = self.i32()?;
+        usize::try_from(n).map_err(|_| anyhow::anyhow!("negative count {n}"))
+    }
     fn string(&mut self) -> Result<String> {
-        let n = self.i32()? as usize;
+        let n = self.len()?;
         Ok(String::from_utf8_lossy(self.bytes(n)?).into_owned())
     }
     fn dict(&mut self) -> Result<Dict> {
-        let n = self.i32()?;
+        let n = self.len()?;
         let mut d = Dict::new();
         for _ in 0..n {
             let k = self.string()?;
@@ -140,16 +156,24 @@ impl VoxFile {
 
         while r.o + 12 <= b.len() {
             let id: [u8; 4] = r.bytes(4)?.try_into().unwrap();
-            let content = r.i32()? as usize;
+            let content = r.len().with_context(|| format!("{} chunk size", String::from_utf8_lossy(&id)))?;
             let _children = r.i32()?;
-            let end = r.o + content;
+            let end = r.o.checked_add(content).filter(|&e| e <= b.len()).with_context(|| format!("{} chunk runs past the end of the file", String::from_utf8_lossy(&id)))?;
             match &id {
                 b"SIZE" => {
-                    pending_size = Some(IVec3::new(r.i32()?, r.i32()?, r.i32()?));
+                    let size = IVec3::new(r.i32()?, r.i32()?, r.i32()?);
+                    // XYZI coordinates are bytes, so no model is larger.
+                    if size.cmplt(IVec3::ZERO).any() || size.cmpgt(IVec3::splat(MAX_MODEL)).any() {
+                        bail!("model size {}x{}x{} is outside 0..={MAX_MODEL} per side", size.x, size.y, size.z);
+                    }
+                    if f.models.len() >= MAX_MODELS {
+                        bail!("more than {MAX_MODELS} models");
+                    }
+                    pending_size = Some(size);
                 }
                 b"XYZI" => {
-                    let n = r.i32()? as usize;
-                    let raw = r.bytes(n * 4)?;
+                    let n = r.len()?;
+                    let raw = r.bytes(n.checked_mul(4).context("voxel count too large")?)?;
                     let voxels = raw.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
                     let size = pending_size.take().context("XYZI without SIZE")?;
                     f.models.push(Model { size, voxels });
@@ -157,9 +181,10 @@ impl VoxFile {
                 b"RGBA" => {
                     let raw = r.bytes(256 * 4)?;
                     let mut pal = vec![[0u8; 4]; 256];
-                    // Entry k of the chunk maps to color index k + 1.
-                    for (k, c) in raw.chunks_exact(4).take(255).enumerate() {
-                        pal[k + 1] = [c[0], c[1], c[2], c[3]];
+                    // Entry k of the chunk maps to color index k + 1, and the
+                    // last entry wraps to index 0 (unused, kept for saving).
+                    for (k, c) in raw.chunks_exact(4).enumerate() {
+                        pal[(k + 1) % 256] = [c[0], c[1], c[2], c[3]];
                     }
                     f.palette = pal;
                 }
@@ -171,6 +196,7 @@ impl VoxFile {
                     let n = r.i32()?.clamp(0, 256);
                     f.notes = (0..n).map(|_| r.string()).collect::<Result<_>>()?;
                 }
+                b"nTRN" | b"nGRP" | b"nSHP" if f.nodes.len() >= MAX_NODES => bail!("more than {MAX_NODES} scene nodes"),
                 b"nTRN" => {
                     let node = r.i32()?;
                     let attrs = r.dict()?;
@@ -206,6 +232,13 @@ impl VoxFile {
                     let attrs = r.dict()?;
                     f.layers.insert(id, attrs);
                 }
+                b"rCAM" => {
+                    let id = r.i32()?;
+                    let d = r.dict()?;
+                    f.extra.cameras.retain(|(c, _)| *c != id);
+                    f.extra.cameras.push((id, d));
+                }
+                b"IMAP" => f.extra.imap = Some(r.bytes(256)?.to_vec()),
                 b"rOBJ" => {
                     let d = r.dict()?;
                     if let Some(t) = d.get("_type") {
@@ -233,13 +266,10 @@ fn put_string(out: &mut Vec<u8>, s: &str) {
 }
 
 fn put_dict(out: &mut Vec<u8>, d: &Dict) {
-    // Sorted so output is deterministic.
-    let mut keys: Vec<&String> = d.keys().collect();
-    keys.sort();
-    put_i32(out, keys.len() as i32);
-    for k in keys {
+    put_i32(out, d.len() as i32);
+    for (k, v) in d {
         put_string(out, k);
-        put_string(out, &d[k]);
+        put_string(out, v);
     }
 }
 
@@ -254,8 +284,16 @@ fn put_chunk(out: &mut Vec<u8>, id: &[u8; 4], content: &[u8], children: &[u8]) {
 /// voxely's timeline settings, in a render chunk MagicaVoxel ignores.
 pub const ANIM_TYPE: &str = "_vx_anim";
 
+/// `nGRP` attribute marking a group of tiles that is one voxely model
+/// (its value is the model's size).
+pub const TILES: &str = "_vx_tiles";
+
 /// MagicaVoxel models are at most 256 voxels on a side.
 const MAX_MODEL: i32 = 256;
+/// Limits on what a file may hold, so a broken or hostile file fails
+/// cleanly instead of exhausting memory.
+const MAX_MODELS: usize = 1 << 16;
+const MAX_NODES: usize = 1 << 18;
 
 /// Builds the scene graph chunks: node ids are handed out in pre-order and
 /// every group or shape is wrapped in a transform, as MagicaVoxel expects.
@@ -324,9 +362,13 @@ impl Graph {
     }
 
     fn group(&mut self, id: i32, children: &[i32]) {
+        self.group_with(id, children, &Dict::new());
+    }
+
+    fn group_with(&mut self, id: i32, children: &[i32], attrs: &Dict) {
         let mut c = Vec::new();
         put_i32(&mut c, id);
-        put_dict(&mut c, &Dict::new());
+        put_dict(&mut c, attrs);
         put_i32(&mut c, children.len() as i32);
         for &k in children {
             put_i32(&mut c, k);
@@ -440,7 +482,9 @@ impl Graph {
             }
         }
         let ids: Vec<i32> = placed.iter().map(|_| self.id()).collect();
-        self.group(id, &ids);
+        // Marked so voxely reads the tiles back as one model.
+        let attrs: Dict = [(TILES.to_string(), format!("{} {} {}", v.dims.x, v.dims.y, v.dims.z))].into();
+        self.group_with(id, &ids, &attrs);
         for (&(o, size), &tid) in placed.iter().zip(&ids) {
             let shape = self.id();
             self.transform(tid, shape, "", false, layer, Rot::IDENTITY.to_byte(), o + size / 2 - v.dims / 2);
@@ -457,13 +501,19 @@ fn chunk(id: &[u8; 4], content: &[u8]) -> Vec<u8> {
 
 /// Write the scene tree as a `.vox` file. `palette` is indexed by color
 /// index. Models over 256 on a side are split into tiles.
-pub fn write(
+pub fn write(path: &std::path::Path, world: &World, palette: &[[u8; 4]], materials: &[(u32, Dict)], notes: &[String], render: &[Dict]) -> Result<()> {
+    write_with(path, world, palette, materials, notes, render, &Extra::default())
+}
+
+/// `write`, plus the chunks in `extra`.
+pub fn write_with(
     path: &std::path::Path,
     world: &World,
     palette: &[[u8; 4]],
     materials: &[(u32, Dict)],
     notes: &[String],
     render: &[Dict],
+    extra: &Extra,
 ) -> Result<()> {
     let mut g = Graph { next: 0, nodes: Vec::new(), models: Vec::new() };
     // Root transform 0 -> group 1 -> a transform per top-level node.
@@ -507,10 +557,10 @@ pub fn write(
         put_chunk(&mut body, b"LAYR", &c, &[]);
     }
 
-    // Palette entry k holds color index k + 1.
+    // Palette entry k holds color index k + 1; the last holds index 0.
     let mut c = Vec::with_capacity(1024);
     for k in 0..256 {
-        c.extend_from_slice(&if k < 255 { palette[k + 1] } else { [0; 4] });
+        c.extend_from_slice(&palette.get((k + 1) % 256).copied().unwrap_or_default());
     }
     put_chunk(&mut body, b"RGBA", &c, &[]);
     for (id, d) in materials {
@@ -526,6 +576,15 @@ pub fn write(
             put_string(&mut c, n);
         }
         put_chunk(&mut body, b"NOTE", &c, &[]);
+    }
+    for (id, d) in &extra.cameras {
+        let mut c = Vec::new();
+        put_i32(&mut c, *id);
+        put_dict(&mut c, d);
+        put_chunk(&mut body, b"rCAM", &c, &[]);
+    }
+    if let Some(imap) = extra.imap.as_ref().filter(|m| m.len() == 256) {
+        put_chunk(&mut body, b"IMAP", imap, &[]);
     }
     for d in render.iter().filter(|d| d.get("_type").is_none_or(|t| t != ANIM_TYPE)) {
         let mut c = Vec::new();
@@ -596,6 +655,48 @@ mod tests {
         assert_eq!(p.len(), 256);
         assert_eq!(p[1], [0xff, 0xff, 0xff, 0xff]);
         assert_eq!(p[255], [0x11, 0x11, 0x11, 0xff]);
+    }
+
+    /// A file of `MAIN` holding `chunks` (id, content).
+    fn file(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, c) in chunks {
+            put_chunk(&mut body, id, c, &[]);
+        }
+        let mut out = b"VOX ".to_vec();
+        put_i32(&mut out, 200);
+        put_chunk(&mut out, b"MAIN", &[], &body);
+        out
+    }
+
+    fn ints(v: &[i32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn untrusted_sizes_fail_cleanly() {
+        let huge = file(&[(b"SIZE", ints(&[100_000, 100_000, 100_000])), (b"XYZI", ints(&[0]))]);
+        assert!(VoxFile::parse(&huge).unwrap_err().to_string().contains("outside"));
+        let neg = file(&[(b"SIZE", ints(&[-5, 2, 2])), (b"XYZI", ints(&[0]))]);
+        assert!(VoxFile::parse(&neg).is_err());
+        // Voxel counts and chunk lengths past the end of the file.
+        let count = file(&[(b"SIZE", ints(&[2, 2, 2])), (b"XYZI", ints(&[i32::MAX]))]);
+        assert!(VoxFile::parse(&count).is_err());
+        let mut long = file(&[(b"MATL", ints(&[1, 0]))]);
+        let at = long.len() - 20 + 4;
+        long[at..at + 4].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(VoxFile::parse(&long).is_err());
+        let ok = file(&[(b"SIZE", ints(&[256, 1, 1])), (b"XYZI", ints(&[0]))]);
+        assert_eq!(VoxFile::parse(&ok).unwrap().models[0].size, IVec3::new(256, 1, 1));
+    }
+
+    #[test]
+    fn palette_keeps_its_last_entry() {
+        let mut rgba = vec![0u8; 1024];
+        rgba[1020..].copy_from_slice(&[4, 62, 76, 255]);
+        rgba[..4].copy_from_slice(&[9, 9, 9, 255]);
+        let f = VoxFile::parse(&file(&[(b"RGBA", rgba)])).unwrap();
+        assert_eq!((f.palette[1], f.palette[0]), ([9, 9, 9, 255], [4, 62, 76, 255]));
     }
 
     #[test]

@@ -54,22 +54,31 @@ pub fn how(path: &Path, a: &Value) -> Result<How> {
         Some(k) => k.to_string(),
         None => crate::import::default_how(path).map(|h| h.name().to_string()).unwrap_or_else(|| if path.is_dir() { "slices".into() } else { String::new() }),
     };
-    let u = |k: &str| int(a, k).map(|v| v.max(0) as u32);
+    // A whole-number option, which must lie in `lo..=hi`.
+    let range = |k: &str, lo: i64, hi: i64| -> Result<Option<u32>> {
+        match int(a, k) {
+            Some(v) if !(lo..=hi).contains(&v) => bail!("`{k}` must be {lo}..={hi}, got {v}"),
+            v => Ok(v.map(|v| v as u32)),
+        }
+    };
+    let max = crate::ops::MAX_DIM as i64;
+    let size = || range("size", 1, max);
+    let u = |k: &str| range(k, 0, max);
     Ok(match kind.as_str() {
         "voxels" => How::Voxels,
         "mesh" => {
             let d = mesh::MeshOptions::default();
-            How::Mesh(mesh::MeshOptions { size: u("size").unwrap_or(d.size), solid: boolean(a, "solid").unwrap_or(d.solid), z_up: boolean(a, "z_up").unwrap_or(d.z_up) })
+            How::Mesh(mesh::MeshOptions { size: size()?.unwrap_or(d.size), solid: boolean(a, "solid").unwrap_or(d.solid), z_up: boolean(a, "z_up").unwrap_or(d.z_up) })
         }
         "image" => {
-            let depth = u("depth").unwrap_or(4);
+            let depth = range("depth", 1, max)?.unwrap_or(4);
             let mode = match string(a, "mode").unwrap_or("flat") {
                 "flat" => picture::ImageMode::Flat,
                 "extrude" => picture::ImageMode::Extrude(depth),
                 "relief" => picture::ImageMode::Relief(depth),
                 m => bail!("unknown mode {m:?}; use flat, extrude or relief"),
             };
-            How::Image(picture::ImageOptions { size: u("size"), mode, standing: !boolean(a, "lying").unwrap_or(false), ..Default::default() })
+            How::Image(picture::ImageOptions { size: size()?, mode, standing: !boolean(a, "lying").unwrap_or(false), ..Default::default() })
         }
         "heightmap" => {
             let d = picture::HeightOptions::default();
@@ -80,18 +89,18 @@ pub fn how(path: &Path, a: &Value) -> Result<How> {
                 c => bail!("unknown colors {c:?}; use terrain, picture or gray"),
             };
             How::Heightmap(picture::HeightOptions {
-                size: u("size"),
-                height: u("height").unwrap_or(d.height),
+                size: size()?,
+                height: range("height", 1, max)?.unwrap_or(d.height),
                 invert: boolean(a, "invert").unwrap_or(false),
                 colors,
-                water: u("water").unwrap_or(0),
+                water: u("water")?.unwrap_or(0),
                 solid: boolean(a, "solid").unwrap_or(d.solid),
             })
         }
         "slices" => How::Slices(picture::SliceOptions {
-            columns: u("columns").unwrap_or(0),
-            rows: u("rows").unwrap_or(0),
-            gap: u("gap").unwrap_or(0),
+            columns: u("columns")?.unwrap_or(0),
+            rows: u("rows")?.unwrap_or(0),
+            gap: u("gap")?.unwrap_or(0),
             top_first: boolean(a, "top_first").unwrap_or(false),
         }),
         "" => bail!("{} isn't a format import_file reads; it takes {}", path.display(), crate::import::extensions().join(", ")),
