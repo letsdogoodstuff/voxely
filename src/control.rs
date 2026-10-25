@@ -149,10 +149,15 @@ fn base_tools() -> Value {
             "from": xyz(XYZ), "to": xyz(XYZ), "color": color_schema(),
             "hollow": { "type": "boolean", "description": "Only the outer shell" },
         }), &["from", "to", "color"]),
-        tool("draw_shape", "Draw a solid shape inscribed in the box between two corners (inclusive).", json!({
-            "shape": { "type": "string", "enum": ["box", "ellipsoid", "cylinder", "cone", "pyramid"] },
+        tool("draw_shape", "Draw a solid shape inscribed in the box between two corners (inclusive), optionally rotated about the box center.", json!({
+            "shape": { "type": "string", "enum": build::SHAPES,
+                "description": "frustum: a cylinder narrowing to top_scale; torus: a ring around axis, tube as thick as the box along axis (or `radius`); capsule: a cylinder with round ends along axis; rounded_box: a box with corners rounded by `radius`; wedge: a ramp rising toward +axis (default x), full height along `up` (default z) at the +axis end" },
             "from": xyz(XYZ), "to": xyz(XYZ), "color": color_schema(),
-            "axis": { "type": "string", "enum": ["x", "y", "z"], "description": "Cylinder/cone/pyramid axis (default z; cones and pyramids point toward +axis)" },
+            "axis": { "type": "string", "enum": ["x", "y", "z"], "description": "The shape's long axis (default z): cylinders, cones, frustums and pyramids point toward +axis, a torus's hole runs along it" },
+            "top_scale": { "type": "number", "description": "cylinder/cone/frustum/pyramid: size of the +axis end relative to the base (cylinder 1, cone and pyramid 0, frustum 0.5); >1 widens" },
+            "radius": { "type": "number", "description": "rounded_box: corner radius in voxels; torus: tube radius" },
+            "up": { "type": "string", "enum": ["x", "y", "z"], "description": "wedge: the axis it's tall along (default z)" },
+            "rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees about the box center, applied x then y then z, e.g. a tilted cylinder or a leaning cone; the shape may extend past from/to" },
             "hollow": { "type": "boolean", "description": "Only the outer shell" },
         }), &["shape", "from", "to", "color"]),
         tool("draw_line", "Draw a straight line of voxels between two points.", json!({
@@ -482,45 +487,11 @@ pub(crate) fn edited(ctx: &Ctx, changed: bool, what: &str) -> Vec<Value> {
     }
 }
 
-/// Whether cell `p` lies inside `shape` inscribed in [lo, hi].
-fn in_shape(shape: &str, axis: usize, lo: IVec3, hi: IVec3, p: IVec3) -> bool {
-    if p.cmplt(lo).any() || p.cmpgt(hi).any() {
-        return false;
-    }
-    let center = (lo.as_vec3() + hi.as_vec3() + 1.0) * 0.5;
-    let half = (hi - lo + IVec3::ONE).as_vec3() * 0.5;
-    let q = (p.as_vec3() + 0.5 - center) / half;
-    let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
-    // 0 at the base (low end of the axis), 1 at the tip.
-    let t = (q[axis] + 1.0) * 0.5;
-    match shape {
-        "box" => true,
-        "ellipsoid" | "sphere" => q.length_squared() <= 1.0,
-        "cylinder" => q[u] * q[u] + q[w] * q[w] <= 1.0,
-        "cone" => (q[u] * q[u] + q[w] * q[w]).sqrt() <= 1.0 - t,
-        "pyramid" => q[u].abs().max(q[w].abs()) <= 1.0 - t,
-        _ => false,
-    }
-}
-
 const NEIGHBORS: [IVec3; 6] = [IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y, IVec3::Z, IVec3::NEG_Z];
 
 /// Fill `shape` between two corners with `c`.
 fn shape_volume(v: &Volume, shape: &str, axis: usize, a: IVec3, b: IVec3, c: u8, hollow: bool) -> Volume {
-    let (lo, hi) = (a.min(b), a.max(b));
-    let inside = |p: IVec3| in_shape(shape, axis, lo, hi, p);
-    let mut out = v.clone();
-    for z in lo.z.max(0)..=hi.z.min(v.dims.z - 1) {
-        for y in lo.y.max(0)..=hi.y.min(v.dims.y - 1) {
-            for x in lo.x.max(0)..=hi.x.min(v.dims.x - 1) {
-                let p = IVec3::new(x, y, z);
-                if inside(p) && (!hollow || NEIGHBORS.iter().any(|&n| !inside(p + n))) {
-                    out.set(p, c);
-                }
-            }
-        }
-    }
-    out
+    build::fill_solid(v, &build::Solid::new(shape, axis, a, b), c, hollow)
 }
 
 fn shader_path(ctx: &Ctx, name: &str) -> Result<PathBuf> {
@@ -1011,12 +982,10 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "draw_shape" => {
             let shape = string(a, "shape").context("missing `shape`")?;
-            if !["box", "ellipsoid", "sphere", "cylinder", "cone", "pyramid"].contains(&shape) {
-                bail!("unknown shape {shape:?}");
-            }
             let (from, to) = (ivec3(a, "from")?, ivec3(a, "to")?);
             let c = color_arg(ctx.scene, a, "color")?;
-            let new = shape_volume(&ctx.scene.volume, shape, axis(a)?, from, to, c, boolean(a, "hollow").unwrap_or(false));
+            let solid = build::Solid::build(shape, axis(a)?, from, to, a)?;
+            let new = build::fill_solid(&ctx.scene.volume, &solid, c, boolean(a, "hollow").unwrap_or(false));
             let changed = apply(ctx, new);
             Ok(edited(ctx, changed, &format!("Drew {shape}")))
         }
