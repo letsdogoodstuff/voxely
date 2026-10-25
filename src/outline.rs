@@ -2,11 +2,11 @@
 //! outliner, plus buttons for MagicaVoxel's World-editor commands.
 
 use egui::{CollapsingHeader, RichText, Ui};
-use glam::IVec3;
+use glam::{IVec3, Vec3};
 
 use crate::scene::{Mode, Scene};
 use crate::ui::Command;
-use crate::world::{World, ROOT};
+use crate::world::{Socket, World, ROOT};
 
 /// A change to the scene tree. Most act on the picked nodes.
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +31,23 @@ pub enum TreeOp {
     PickNone,
     PickInvert,
     Rename(usize, String),
+    /// New pivot, free rotation and sockets for a node. `true` starts an
+    /// undo step (false continues a drag).
+    Extras(usize, Extras, bool),
+}
+
+/// A node's voxely-only settings, in its own coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Extras {
+    pub pivot: Option<Vec3>,
+    pub tilt: Vec3,
+    pub sockets: Vec<Socket>,
+}
+
+impl Extras {
+    pub fn of(n: &crate::world::Node) -> Extras {
+        Extras { pivot: n.pivot, tilt: n.tilt, sockets: n.sockets.clone() }
+    }
 }
 
 /// The rename field's text and which node it belongs to.
@@ -159,10 +176,99 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                     ui.weak(format!("size {} {} {}", size.x, size.y, size.z));
                 }
             });
+            extras_ui(ui, w, id, cmds);
         }
         if scene.mode == Mode::World {
             ui.add_space(6.0);
             ui.weak("Drag a part to move it. Tab edits the picked model.");
         }
     });
+}
+
+/// Three drag fields; returns (changed, started a new edit).
+fn vec3_ui(ui: &mut Ui, v: &mut Vec3, speed: f64, suffix: &str) -> (bool, bool) {
+    let (mut changed, mut begin) = (false, false);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for k in 0..3 {
+            let r = ui.add(egui::DragValue::new(&mut v[k]).speed(speed).max_decimals(1).suffix(suffix));
+            if r.changed() {
+                changed = true;
+                begin |= !r.dragged() || r.drag_started();
+            }
+        }
+    });
+    (changed, begin)
+}
+
+/// Pivot, free rotation and sockets of node `id`. Positions show in part
+/// coordinates (what the voxel tools use while editing it).
+fn extras_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
+    let Some(n) = w.node(id) else { return };
+    let mut x = Extras::of(n);
+    let (mut changed, mut begin) = (false, false);
+    let mut track = |(c, b): (bool, bool)| {
+        changed |= c;
+        begin |= b;
+    };
+    CollapsingHeader::new("Pivot").default_open(true).show(ui, |ui| {
+        let mut p = w.to_part(id, w.pivot_local(id));
+        let r = vec3_ui(ui, &mut p, 0.25, "");
+        if r.0 {
+            x.pivot = Some(w.from_part(id, p));
+        }
+        track(r);
+        ui.horizontal(|ui| {
+            if ui.button("Center").on_hover_text("Turn about the middle").clicked() {
+                x.pivot = None;
+                track((true, true));
+            }
+            if let Some((_, size)) = w.bounds(id).filter(|_| !n.is_group() && !n.tilted()) {
+                if ui.button("Bottom").on_hover_text("Turn about the middle of the bottom face").clicked() {
+                    x.pivot = Some(w.from_part(id, Vec3::new(size.x as f32 * 0.5, size.y as f32 * 0.5, 0.0)));
+                    track((true, true));
+                }
+            }
+        });
+    });
+    CollapsingHeader::new("Rotation").default_open(true).show(ui, |ui| {
+        let r = vec3_ui(ui, &mut x.tilt, 1.0, "°");
+        track(r);
+        if n.tilted() && ui.button("Straighten").on_hover_text("Remove the free rotation").clicked() {
+            x.tilt = Vec3::ZERO;
+            track((true, true));
+        }
+    });
+    CollapsingHeader::new("Sockets").default_open(true).show(ui, |ui| {
+        let mut remove = None;
+        for (k, sock) in x.sockets.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut sock.name).desired_width(ui.available_width() - 34.0));
+                if r.changed() {
+                    track((true, true));
+                }
+                if ui.small_button("x").on_hover_text("Remove").clicked() {
+                    remove = Some(k);
+                }
+            });
+            let mut p = w.to_part(id, sock.pos);
+            let r = vec3_ui(ui, &mut p, 0.25, "");
+            if r.0 {
+                sock.pos = w.from_part(id, p);
+            }
+            track(r);
+        }
+        if let Some(k) = remove {
+            x.sockets.remove(k);
+            track((true, true));
+        }
+        if ui.button("+ Socket").on_hover_text("A named attachment point, for attaching parts here and for game engines").clicked() {
+            let name = (1..).map(|i| format!("socket{i}")).find(|s| !x.sockets.iter().any(|o| &o.name == s)).unwrap();
+            x.sockets.push(Socket { name, pos: w.pivot_local(id) });
+            track((true, true));
+        }
+    });
+    if changed && x != Extras::of(n) {
+        cmds.push(Command::Tree(TreeOp::Extras(id, x, begin)));
+    }
 }

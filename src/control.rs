@@ -36,7 +36,9 @@ Typical flow: new_project -> draw with fill_box / draw_shape / draw_line / set_v
 screenshot (fast) -> set_material and set_render_settings -> render (path traced) -> save_file. \
 Every edit is undoable. If the voxely window is open, edits appear in it live.
 
-Scenes are a tree of parts (models) and groups, like MagicaVoxel's World editor. Voxel tools work on one part at a time, in that part's own coordinates (0..size-1): the part being edited (see get_scene_info), or the one named by a tool's `part` argument. Build separate pieces (body, head, arms, wheels, props) as separate parts with create_part, place them with transform_part (move, 90° rotate, flip) and group_parts, and inspect the tree with list_parts. Part positions are world voxel coordinates of the part's minimum corner; a new project's first part spans [0, size).";
+Scenes are a tree of parts (models) and groups, like MagicaVoxel's World editor. Voxel tools work on one part at a time, in that part's own coordinates (0..size-1): the part being edited (see get_scene_info), or the one named by a tool's `part` argument. Build separate pieces (body, head, arms, wheels, props) as separate parts with create_part, place them with transform_part (move, 90° rotate, flip) and group_parts, and inspect the tree with list_parts. Give parts pivots (set_pivot: a shoulder, a hinge) \
+and named sockets (set_socket: hand, muzzle, seat), then snap parts together with transform_part attach_to; \
+both carry into glTF exports for game engines. Part positions are world voxel coordinates of the part's minimum corner; a new project's first part spans [0, size).";
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
@@ -190,14 +192,26 @@ fn base_tools() -> Value {
             "parent": { "type": ["string", "integer"], "description": "Group to put it in (default: the top level)" },
             "fill": color_schema(),
         }), &["name", "size"]),
-        tool("transform_part", "Move, rotate (90° steps) or flip a part or group as a whole. Rotations and flips turn it about its own center, around world axes.", json!({
+        tool("transform_part", "Move, rotate or flip a part or group as a whole. 90° turns and flips are exact and turn about its pivot (default: its center), around world axes. free_rotation adds any angle (shown resampled; edit the part upright). attach_to moves it so its pivot (or its own socket) lands on another part's socket.", json!({
             "part": { "type": ["string", "integer"] },
             "move": xyz("[dx, dy, dz] offset"),
             "position": xyz("New world position of its minimum corner"),
             "rotate_axis": axis,
             "quarter_turns": { "type": "integer", "description": "Counter-clockwise quarter turns about rotate_axis (negative for clockwise)" },
             "flip_axis": axis,
+            "free_rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees about the pivot, applied x then y then z; replaces any previous free rotation. [0, 0, 0] straightens." },
+            "attach_to": { "type": "string", "description": "\"part:socket\", e.g. \"body:shoulder_r\"" },
+            "attach_socket": { "type": "string", "description": "With attach_to: this part's own socket to line up (default: its pivot). It becomes the pivot if none was set, so later turns keep it attached." },
         }), &["part"]),
+        tool("set_pivot", "Set the point a part or group turns about (and its origin in glTF exports), in the part's own coordinates (the ones the voxel tools use while editing it; world coordinates for groups). E.g. a shoulder for an arm, the hinge for a door.", json!({
+            "part": { "type": ["string", "integer"] },
+            "pivot": { "type": ["array", "string"], "items": { "type": "number" }, "description": "[x, y, z], or \"center\" (default), or \"bottom\" (middle of the bottom face)" },
+        }), &["part", "pivot"]),
+        tool("set_socket", "Add, move or remove a named attachment point (socket) on a part, in its own coordinates. Other parts attach to sockets with transform_part attach_to; glTF exports them as empty nodes engines can parent things to (hand, muzzle, seat ...).", json!({
+            "part": { "type": ["string", "integer"] },
+            "name": { "type": "string" },
+            "position": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z]; omit to remove the socket" },
+        }), &["part", "name"]),
         tool("modify_part", "Rename, duplicate, delete, hide, show or ungroup a part or group.", json!({
             "part": { "type": ["string", "integer"] },
             "action": { "type": "string", "enum": ["rename", "duplicate", "delete", "hide", "show", "ungroup"] },
@@ -478,10 +492,28 @@ fn part_json(scene: &Scene, id: usize) -> Value {
     if let Some(m) = n.volume() {
         v["voxels"] = json!(if scene.editing() == Some(id) { count(&scene.volume) } else { count(m) });
     }
+    if n.pivot.is_some() {
+        v["pivot"] = json!(w.to_part(id, w.pivot_local(id)).to_array());
+    }
+    if n.tilted() {
+        v["free_rotation"] = json!(n.tilt.to_array());
+    }
+    if !n.sockets.is_empty() {
+        v["sockets"] = n
+            .sockets
+            .iter()
+            .map(|s| json!({ "name": s.name, "position": w.to_part(id, s.pos).to_array(), "world": w.affine(id).transform_point3(s.pos).to_array() }))
+            .collect();
+    }
     if n.is_group() {
         v["children"] = n.children().iter().map(|&c| part_json(scene, c)).collect();
     }
     v
+}
+
+fn vec3_value(v: &Value) -> Option<Vec3> {
+    let a: Vec<f32> = v.as_array()?.iter().map(|x| x.as_f64().map(|f| f as f32)).collect::<Option<_>>()?;
+    (a.len() == 3).then(|| Vec3::new(a[0], a[1], a[2]))
 }
 
 /// After a tree change: reset voxel history and upload.
@@ -566,8 +598,28 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 Some(_) => Some(axis_named(a, "flip_axis")?),
                 None => None,
             };
-            if mv.is_none() && pos.is_none() && turn.is_none() && flip.is_none() {
-                bail!("give move, position, rotate_axis or flip_axis");
+            let tilt = match get(a, "free_rotation") {
+                Some(v) => Some(vec3_value(v).context("free_rotation is [x, y, z] degrees")?),
+                None => None,
+            };
+            let attach = match string(a, "attach_to") {
+                Some(spec) => {
+                    let (p, sock) = spec.split_once(':').context("attach_to is \"part:socket\"")?;
+                    let target = find_part(ctx.scene, Some(&json!(p)))?;
+                    let synced = ctx.scene.synced_world();
+                    let at = synced.socket_world(target, sock).with_context(|| format!("`{p}` has no socket `{sock}`"))?;
+                    let own = string(a, "attach_socket").map(str::to_string);
+                    Some((at, own))
+                }
+                None => None,
+            };
+            if mv.is_none() && pos.is_none() && turn.is_none() && flip.is_none() && tilt.is_none() && attach.is_none() {
+                bail!("give move, position, rotate_axis, flip_axis, free_rotation or attach_to");
+            }
+            if let Some((_, Some(own))) = &attach {
+                if ctx.scene.world.socket_world(id, own).is_none() {
+                    bail!("`{}` has no socket `{own}`", ctx.scene.world.label(id));
+                }
             }
             ctx.scene.change(|w| {
                 if let Some((axis, q)) = turn {
@@ -584,10 +636,72 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 if let Some(d) = mv {
                     w.translate(id, d);
                 }
+                if let Some(t) = tilt {
+                    w.set_tilt(id, t);
+                }
+                match &attach {
+                    Some((at, None)) => w.attach(id, *at),
+                    Some((at, Some(own))) => {
+                        // The joint becomes the pivot, so later turns keep it attached.
+                        let sock = w.node(id).and_then(|n| n.sockets.iter().find(|s| s.name.eq_ignore_ascii_case(own))).map(|s| s.pos);
+                        if let (Some(n), Some(pos)) = (w.node_mut(id), sock) {
+                            n.pivot = n.pivot.or(Some(pos));
+                        }
+                        if let Some(from) = w.socket_world(id, own) {
+                            w.translate(id, (*at - from).round().as_ivec3());
+                        }
+                    }
+                    None => {}
+                }
             });
             tree_changed(ctx);
             let (lo, size) = ctx.scene.world.bounds(id).unwrap_or_default();
             Ok(vec![text(format!("`{}` now at {:?}, size {:?}", ctx.scene.world.label(id), arr(lo), arr(size)))])
+        }
+        "set_pivot" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            let w = &ctx.scene.world;
+            let pivot = match get(a, "pivot") {
+                Some(Value::String(s)) if s == "center" => None,
+                Some(Value::String(s)) if s == "bottom" => {
+                    let (_, size) = w.bounds(id).context("empty")?;
+                    Some(w.from_part(id, Vec3::new(size.x as f32 * 0.5, size.y as f32 * 0.5, 0.0)))
+                }
+                Some(v) => Some(w.from_part(id, vec3_value(v).context("pivot is [x, y, z], \"center\" or \"bottom\"")?)),
+                None => bail!("missing `pivot`"),
+            };
+            ctx.scene.change(|w| w.node_mut(id).map(|n| n.pivot = pivot));
+            tree_changed(ctx);
+            let w = &ctx.scene.world;
+            Ok(vec![text(format!("`{}` pivot at {:?} (part coordinates), {:?} world", w.label(id), w.to_part(id, w.pivot_local(id)).to_array(), w.pivot_world(id).to_array()))])
+        }
+        "set_socket" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            let name = string(a, "name").context("missing `name`")?.trim().to_string();
+            if name.is_empty() || name.contains(['|', ':']) {
+                bail!("socket names can't be empty or contain | or :");
+            }
+            let pos = match get(a, "position") {
+                Some(v) => Some(ctx.scene.world.from_part(id, vec3_value(v).context("position is [x, y, z]")?)),
+                None => None,
+            };
+            let existed = ctx.scene.world.node(id).is_some_and(|n| n.sockets.iter().any(|s| s.name == name));
+            if pos.is_none() && !existed {
+                bail!("`{}` has no socket `{name}`", ctx.scene.world.label(id));
+            }
+            ctx.scene.change(|w| {
+                let Some(n) = w.node_mut(id) else { return };
+                n.sockets.retain(|s| s.name != name);
+                if let Some(pos) = pos {
+                    n.sockets.push(crate::world::Socket { name: name.clone(), pos });
+                }
+            });
+            tree_changed(ctx);
+            let w = &ctx.scene.world;
+            Ok(vec![text(match pos {
+                Some(_) => format!("Socket `{name}` on `{}` at {:?} world", w.label(id), w.socket_world(id, &name).unwrap_or_default().to_array()),
+                None => format!("Removed socket `{name}`"),
+            })])
         }
         "modify_part" => {
             let id = find_part(ctx.scene, get(a, "part"))?;

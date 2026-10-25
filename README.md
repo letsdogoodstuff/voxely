@@ -73,7 +73,7 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Area | Tools |
 |---|---|
 | Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
-| Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip), `modify_part` (rename, duplicate, delete, hide, show, ungroup), `group_parts` |
+| Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach to a socket), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup), `group_parts` |
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
 | Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid), `draw_line` |
 | Reading | `get_voxels`, `get_slice` (a text map of one layer) |
@@ -109,7 +109,21 @@ saved, so files from MagicaVoxel round-trip with their objects, groups, names an
 - Undo steps through voxel edits in the current edit session, then whole-part changes.
 - A part's box stays put when you resize or reshape it, so cutting a piece out and fitting it no
   longer shifts it.
-- Exports other than `.vox` flatten all visible parts.
+- Exports other than `.vox` and glTF flatten all visible parts.
+
+### Pivots, free rotation and sockets
+
+These go beyond MagicaVoxel (they are stored in `.vox` attributes MagicaVoxel ignores, so the file
+still opens there, just without them):
+
+- **Pivot**: the point a part or group turns about, e.g. an arm's shoulder or a door's hinge. Default:
+  the center. Set it in the World panel (Center / Bottom buttons or exact values) or with `set_pivot`.
+- **Free rotation**: any angle about the pivot, on top of the exact 90° turns. Shown resampled to the
+  voxel grid; the part is edited upright and on its own. MagicaVoxel shows such parts unrotated.
+- **Sockets**: named attachment points (hand, muzzle, seat). Shown as green dots on picked parts.
+  `transform_part` with `attach_to: "body:shoulder_r"` snaps a part's pivot (or its own socket,
+  `attach_socket`) onto another part's socket; an attached socket becomes the pivot so later turns
+  keep the joint together.
 
 ## glTF export
 
@@ -131,7 +145,10 @@ Name the file `.gltf` instead to get readable JSON with the data embedded.
     `"voxely_material": "cloud"`, `palette_index`, `color`, `density` (extinction per voxel,
     1 voxel = 0.1 m), `phase` and `opacity`. Find that node on import and swap in Godot's
     FogVolume, Unity/Unreal volumetric fog, or a custom shader.
-- Structure: a root node named after the project, with the model and each cloud as child nodes.
+- Structure: the scene tree. A root node named after the project, then a node per group and part
+  with its transform. Each node's origin is the part's pivot, so rotating it in an engine turns it
+  the same way it turns in voxely. Sockets are empty child nodes (`extras.voxely_socket: true`) to
+  parent weapons, riders or effects to; clouds are child nodes of their part.
 
 Exports pass the Khronos glTF Validator with no errors or warnings (it can't yet check
 `KHR_materials_diffuse_transmission`, which is newer than the validator).

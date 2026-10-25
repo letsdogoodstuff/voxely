@@ -455,6 +455,20 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
         TreeOp::Move(d) => scene.change(|w| picked.iter().for_each(|&p| w.translate(p, d))),
         TreeOp::Turn(axis, q) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::turn(axis, q)))),
         TreeOp::Flip(axis) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::flip(axis)))),
+        TreeOp::Extras(id, x, begin) => {
+            let set = |w: &mut crate::world::World| {
+                if let Some(n) = w.node_mut(id) {
+                    n.pivot = x.pivot;
+                    n.sockets = x.sockets.clone();
+                }
+                w.set_tilt(id, x.tilt);
+            };
+            if begin {
+                scene.change(set);
+            } else {
+                scene.apply(set);
+            }
+        }
         TreeOp::Rename(id, name) => scene.change(|w| {
             if let Some(n) = w.node_mut(id) {
                 n.name = name.trim().to_string();
@@ -908,6 +922,9 @@ fn draw_overlay(p: &egui::Painter, r: &Renderer, scene: &Scene, ed: &EditState, 
     if !r.modeling || !ed.enabled {
         return;
     }
+    for &id in &scene.picked {
+        draw_markers(p, r, scene, ppp, id);
+    }
     if scene.mode == Mode::World {
         let painter = p;
         // Picked parts' boxes.
@@ -954,6 +971,30 @@ fn draw_overlay(p: &egui::Painter, r: &Renderer, scene: &Scene, ed: &EditState, 
         let lo = cells.iter().fold(IVec3::MAX, |a, c| a.min(*c));
         let hi = cells.iter().fold(IVec3::MIN, |a, c| a.max(*c));
         outline(p, r, ppp, lo.as_vec3(), (hi + IVec3::ONE).as_vec3(), stroke);
+    }
+}
+
+/// A node's pivot (orange cross) and sockets (green dots with names).
+fn draw_markers(p: &egui::Painter, r: &Renderer, scene: &Scene, ppp: f32, id: usize) {
+    let w = &scene.world;
+    let Some(n) = w.node(id) else { return };
+    // Into the volume's frame: the edited part's own coordinates, or world.
+    let at = |local: Vec3| {
+        let v = if scene.editing() == Some(id) { w.to_part(id, local) } else { w.affine(id).transform_point3(local) - scene.origin.as_vec3() };
+        r.project(v).map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+    };
+    let orange = egui::Color32::from_rgb(255, 160, 40);
+    if let Some(c) = at(w.pivot_local(id)) {
+        let s = egui::Stroke::new(2.0, orange);
+        p.line_segment([c - egui::vec2(6.0, 0.0), c + egui::vec2(6.0, 0.0)], s);
+        p.line_segment([c - egui::vec2(0.0, 6.0), c + egui::vec2(0.0, 6.0)], s);
+    }
+    let green = egui::Color32::from_rgb(90, 220, 120);
+    for sock in &n.sockets {
+        if let Some(c) = at(sock.pos) {
+            p.circle(c, 4.0, green, egui::Stroke::new(1.0, egui::Color32::BLACK));
+            p.text(c + egui::vec2(7.0, -7.0), egui::Align2::LEFT_BOTTOM, &sock.name, egui::FontId::proportional(12.0), green);
+        }
     }
 }
 
@@ -1065,7 +1106,10 @@ pub fn build_ui(
             } else if let Some(m) = r.modeler.as_mut() {
                 egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut m.options, &mut ed.transform_text, cmds));
             }
-            let part = scene.editing().map(|id| scene.world.label(id));
+            let part = scene.editing().map(|id| {
+                let label = scene.world.label(id);
+                if scene.world.tilted(id) { format!("{label} (upright, alone)") } else { label }
+            });
             egui::Panel::top("viewbar").show(ui, |ui| ui::view_bar(ui, dims, &mut ed.canvas, part.as_deref(), scene.world.models().len(), cmds));
         } else {
             // MagicaVoxel's render layout: Light / Sample / Display on the

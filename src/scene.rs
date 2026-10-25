@@ -716,7 +716,9 @@ impl Scene {
         match mode {
             Mode::Edit(id) => {
                 let (v, origin) = self.world.checkout(id).expect("a model");
-                self.context = self.world.composite(Some(id)).map(|c| (c.volume, c.origin - origin));
+                // A freely rotated part is edited upright and on its own:
+                // around the others it would sit at the wrong angle.
+                self.context = if self.world.tilted(id) { None } else { self.world.composite(Some(id)).map(|c| (c.volume, c.origin - origin)) };
                 (self.volume, self.origin) = (v, origin);
                 self.owners.clear();
                 self.picked = vec![id];

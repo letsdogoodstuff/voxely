@@ -8,8 +8,13 @@
 //! compose down the tree. Rotations are signed permutations, so placement
 //! is exact integer math and a model can be turned to world orientation and
 //! back without loss.
+//!
+//! On top of that (voxely only, kept in `.vox` attributes MagicaVoxel
+//! ignores): a pivot that turns happen about, a free rotation ("tilt") that
+//! is resampled when shown or exported, and named sockets (attachment
+//! points) for building from parts and for game engines.
 
-use glam::{IVec3, Mat3};
+use glam::{Affine3A, EulerRot, IVec3, Mat3, Quat, Vec3};
 
 use crate::scene::Volume;
 use crate::vox::{Node as VoxNode, VoxFile};
@@ -144,6 +149,13 @@ pub enum Kind {
     Model(Volume),
 }
 
+/// A named attachment point in a node's own coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Socket {
+    pub name: String,
+    pub pos: Vec3,
+}
+
 #[derive(Clone)]
 pub struct Node {
     pub name: String,
@@ -154,9 +166,49 @@ pub struct Node {
     pub t: IVec3,
     pub parent: Option<usize>,
     pub kind: Kind,
+    /// Where turns happen, in the node's own coordinates (a model's voxel
+    /// space, `0..size`). Default: a model's center; a group's box center.
+    pub pivot: Option<Vec3>,
+    /// Free rotation about the pivot after `rot`: degrees about x, then y,
+    /// then z.
+    pub tilt: Vec3,
+    pub sockets: Vec<Socket>,
 }
 
 impl Node {
+    fn new(name: &str, parent: Option<usize>, layer: i32, kind: Kind) -> Node {
+        Node { name: name.to_string(), hidden: false, layer, rot: Rot::IDENTITY, t: IVec3::ZERO, parent, kind, pivot: None, tilt: Vec3::ZERO, sockets: Vec::new() }
+    }
+
+    pub fn tilted(&self) -> bool {
+        self.tilt != Vec3::ZERO
+    }
+
+    pub fn tilt_quat(&self) -> Quat {
+        let r = self.tilt * (std::f32::consts::PI / 180.0);
+        Quat::from_euler(EulerRot::ZYX, r.z, r.y, r.x)
+    }
+
+    /// Half the model size as `.vox` placement uses it (integer division).
+    fn half(&self) -> Vec3 {
+        self.volume().map_or(Vec3::ZERO, |v| (v.dims / 2).as_vec3())
+    }
+
+    /// The node's transform into its parent (continuous).
+    pub fn local_affine(&self) -> Affine3A {
+        let r = rot_mat(self.rot);
+        let half = self.half();
+        if !self.tilted() {
+            return Affine3A::from_translation(self.t.as_vec3()) * Affine3A::from_mat3(r) * Affine3A::from_translation(-half);
+        }
+        let pivot = self.pivot.unwrap_or_else(|| self.volume().map_or(Vec3::ZERO, |v| v.dims.as_vec3() * 0.5));
+        Affine3A::from_translation(self.t.as_vec3())
+            * Affine3A::from_mat3(r)
+            * Affine3A::from_translation(pivot - half)
+            * Affine3A::from_quat(self.tilt_quat())
+            * Affine3A::from_translation(-pivot)
+    }
+
     pub fn is_group(&self) -> bool {
         matches!(self.kind, Kind::Group(_))
     }
@@ -205,7 +257,7 @@ pub struct Composite {
 
 impl World {
     fn root_group() -> Node {
-        Node { name: String::new(), hidden: false, layer: -1, rot: Rot::IDENTITY, t: IVec3::ZERO, parent: None, kind: Kind::Group(Vec::new()) }
+        Node::new("", None, -1, Kind::Group(Vec::new()))
     }
 
     /// One model filling the box `[0, size)`.
@@ -292,6 +344,16 @@ impl World {
     pub fn bounds(&self, id: usize) -> Option<(IVec3, IVec3)> {
         let n = self.node(id)?;
         match &n.kind {
+            Kind::Model(v) if self.tilted(id) => {
+                let a = self.affine(id);
+                let (mut lo, mut hi) = (Vec3::MAX, Vec3::MIN);
+                for c in 0..8 {
+                    let p = a.transform_point3((IVec3::new(c & 1, (c >> 1) & 1, c >> 2) * v.dims).as_vec3());
+                    (lo, hi) = (lo.min(p), hi.max(p));
+                }
+                let lo = lo.floor().as_ivec3();
+                Some((lo, hi.ceil().as_ivec3() - lo))
+            }
             Kind::Model(v) => Some(self.place(id).bounds(v.dims)),
             Kind::Group(children) => {
                 let mut b: Option<(IVec3, IVec3)> = None;
@@ -322,6 +384,25 @@ impl World {
         for m in models {
             let place = self.place(m);
             let v = self.node(m)?.volume()?;
+            if self.tilted(m) {
+                // Free rotation: sample the model at each world cell center.
+                let inv = self.affine(m).inverse();
+                let (blo, bsize) = self.bounds(m)?;
+                for z in 0..bsize.z {
+                    for y in 0..bsize.y {
+                        for x in 0..bsize.x {
+                            let w = blo + IVec3::new(x, y, z);
+                            let c = v.get(inv.transform_point3(w.as_vec3() + 0.5).floor().as_ivec3());
+                            if c != 0 {
+                                let j = volume.index(w - lo);
+                                volume.set_index(j, c);
+                                owners[j] = m as u32;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             for (i, &c) in v.cells.iter().enumerate() {
                 if c != 0 {
                     let w = place.cell(v.dims, v.position(i)) - lo;
@@ -399,7 +480,7 @@ impl World {
         let parent = self.group_of(parent);
         let pp = self.place(parent);
         let layer = self.layers.first().map_or(-1, |l| l.id);
-        let node = Node { name: name.to_string(), hidden: false, layer, rot: pp.rot.inverse(), t: IVec3::ZERO, parent: Some(parent), kind: Kind::Model(Volume::new(IVec3::ONE)) };
+        let node = Node { rot: pp.rot.inverse(), ..Node::new(name, Some(parent), layer, Kind::Model(Volume::new(IVec3::ONE))) };
         let id = self.push(parent, node);
         self.checkin(id, &volume, origin);
         id
@@ -454,7 +535,7 @@ impl World {
     pub fn group(&mut self, ids: &[usize]) -> Option<usize> {
         let ids: Vec<usize> = ids.iter().copied().filter(|&i| i != ROOT && self.node(i).is_some()).collect();
         let parent = self.node(*ids.first()?)?.parent?;
-        let g = Node { name: String::new(), hidden: false, layer: self.layers.first().map_or(-1, |l| l.id), rot: Rot::IDENTITY, t: IVec3::ZERO, parent: Some(parent), kind: Kind::Group(Vec::new()) };
+        let g = Node::new("", Some(parent), self.layers.first().map_or(-1, |l| l.id), Kind::Group(Vec::new()));
         let gid = self.push(parent, g);
         for id in ids {
             if self.is_ancestor(id, gid) {
@@ -519,6 +600,18 @@ impl World {
     /// Apply a world-space rotation or flip `q` to a node in place, about
     /// the center of its box.
     pub fn reorient(&mut self, id: usize, q: Rot) {
+        if self.node(id).is_some_and(|n| n.pivot.is_some()) {
+            // About the chosen pivot.
+            let before = self.pivot_world(id);
+            let Some(parent) = self.node(id).and_then(|n| n.parent) else { return };
+            let pr = self.place(parent).rot;
+            if let Some(n) = self.node_mut(id) {
+                n.rot = pr.inverse().mul(&q).mul(&pr).mul(&n.rot);
+            }
+            let shift = (before - self.pivot_world(id)).round().as_ivec3();
+            self.translate(id, shift);
+            return;
+        }
         let Some((lo, size)) = self.bounds(id) else { return };
         let center2 = lo * 2 + size;
         let Some(parent) = self.node(id).and_then(|n| n.parent) else { return };
@@ -532,6 +625,131 @@ impl World {
             self.translate(id, shift);
         }
     }
+}
+
+/// A signed permutation as a float matrix.
+pub fn rot_mat(r: Rot) -> Mat3 {
+    let c = |j: usize| Vec3::new(r.m[0][j] as f32, r.m[1][j] as f32, r.m[2][j] as f32);
+    Mat3::from_cols(c(0), c(1), c(2))
+}
+
+// ---- pivots, free rotation, sockets ----
+
+impl World {
+    /// Any free rotation on this node or above it.
+    pub fn tilted(&self, id: usize) -> bool {
+        let mut cur = Some(id);
+        while let Some(n) = cur.and_then(|c| self.node(c)) {
+            if n.tilted() {
+                return true;
+            }
+            cur = n.parent;
+        }
+        false
+    }
+
+    /// The node's own coordinates to world space, free rotation included.
+    pub fn affine(&self, id: usize) -> Affine3A {
+        let Some(n) = self.node(id) else { return Affine3A::IDENTITY };
+        n.parent.map_or(Affine3A::IDENTITY, |p| self.affine(p)) * n.local_affine()
+    }
+
+    /// The node's pivot in world space.
+    pub fn pivot_world(&self, id: usize) -> Vec3 {
+        let Some(n) = self.node(id) else { return Vec3::ZERO };
+        match (n.pivot, n.volume()) {
+            (Some(p), _) => self.affine(id).transform_point3(p),
+            (None, Some(v)) => self.affine(id).transform_point3(v.dims.as_vec3() * 0.5),
+            (None, None) => self.bounds(id).map_or(Vec3::ZERO, |(lo, size)| lo.as_vec3() + size.as_vec3() * 0.5),
+        }
+    }
+
+    /// The pivot in the node's own coordinates (see `Node::pivot`).
+    pub fn pivot_local(&self, id: usize) -> Vec3 {
+        let Some(n) = self.node(id) else { return Vec3::ZERO };
+        match (n.pivot, n.volume()) {
+            (Some(p), _) => p,
+            (None, Some(v)) => v.dims.as_vec3() * 0.5,
+            (None, None) => self.affine(id).inverse().transform_point3(self.pivot_world(id)),
+        }
+    }
+
+    /// Part coordinates, the frame voxel editing uses: a model's voxel
+    /// space turned to world orientation (free rotation ignored), with its
+    /// box starting at 0. Groups use world coordinates.
+    pub fn to_part(&self, id: usize, local: Vec3) -> Vec3 {
+        let Some(v) = self.node(id).and_then(Node::volume) else { return self.affine(id).transform_point3(local) };
+        let place = self.place(id);
+        let w = rot_mat(place.rot) * (local - (v.dims / 2).as_vec3()) + place.t.as_vec3();
+        w - place.bounds(v.dims).0.as_vec3()
+    }
+
+    /// Inverse of `to_part`.
+    pub fn from_part(&self, id: usize, p: Vec3) -> Vec3 {
+        let Some(v) = self.node(id).and_then(Node::volume) else { return self.affine(id).inverse().transform_point3(p) };
+        let place = self.place(id);
+        let w = p + place.bounds(v.dims).0.as_vec3() - place.t.as_vec3();
+        rot_mat(place.rot).transpose() * w + (v.dims / 2).as_vec3()
+    }
+
+    /// Set the free rotation (degrees), turning about the pivot.
+    pub fn set_tilt(&mut self, id: usize, deg: Vec3) {
+        if self.node(id).is_some_and(|n| n.is_group() && n.pivot.is_none()) {
+            // Fix a group's pivot first so it doesn't drift as it turns.
+            let p = self.pivot_local(id);
+            if let Some(n) = self.node_mut(id) {
+                n.pivot = Some(p);
+            }
+        }
+        if let Some(n) = self.node_mut(id) {
+            n.tilt = Vec3::new(wrap_deg(deg.x), wrap_deg(deg.y), wrap_deg(deg.z));
+        }
+    }
+
+    /// Move a node so its pivot lands on `target` (world).
+    pub fn attach(&mut self, id: usize, target: Vec3) {
+        let d = target - self.pivot_world(id);
+        self.translate(id, d.round().as_ivec3());
+    }
+
+    /// A socket's world position, by `part:socket` or a node and name.
+    pub fn socket_world(&self, id: usize, name: &str) -> Option<Vec3> {
+        let s = self.node(id)?.sockets.iter().find(|s| s.name.eq_ignore_ascii_case(name))?;
+        Some(self.affine(id).transform_point3(s.pos))
+    }
+}
+
+fn wrap_deg(d: f32) -> f32 {
+    let w = (d + 180.0).rem_euclid(360.0) - 180.0;
+    if w.abs() < 1e-4 { 0.0 } else { w }
+}
+
+/// voxely's own transform attributes (MagicaVoxel ignores them).
+pub fn write_extras(n: &Node, attrs: &mut crate::vox::Dict) {
+    let v3 = |v: Vec3| format!("{} {} {}", v.x, v.y, v.z);
+    if let Some(p) = n.pivot {
+        attrs.insert("_vx_pivot".into(), v3(p));
+    }
+    if n.tilted() {
+        attrs.insert("_vx_tilt".into(), v3(n.tilt));
+    }
+    if !n.sockets.is_empty() {
+        let list: Vec<String> = n.sockets.iter().map(|s| format!("{}:{}", s.name.replace(['|', ':'], "_"), v3(s.pos))).collect();
+        attrs.insert("_vx_sockets".into(), list.join("|"));
+    }
+}
+
+fn read_extras(n: &mut Node, attrs: &crate::vox::Dict) {
+    let v3 = |s: &str| {
+        let v: Vec<f32> = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
+    };
+    n.pivot = attrs.get("_vx_pivot").and_then(|s| v3(s));
+    n.tilt = attrs.get("_vx_tilt").and_then(|s| v3(s)).unwrap_or(Vec3::ZERO);
+    n.sockets = attrs
+        .get("_vx_sockets")
+        .map(|s| s.split('|').filter_map(|e| e.split_once(':')).filter_map(|(name, p)| Some(Socket { name: name.to_string(), pos: v3(p)? })).collect())
+        .unwrap_or_default();
 }
 
 // ---- .vox ----
@@ -578,7 +796,8 @@ impl World {
         let Some(VoxNode::Transform { attrs, child, layer, rotation, translation }) = f.nodes.get(&trn) else { return };
         let name = attrs.get("_name").cloned().unwrap_or_default();
         let hidden = attrs.get("_hidden").is_some_and(|v| v == "1");
-        let base = Node { name, hidden, layer: *layer, rot: Rot::from_mat3(*rotation), t: *translation, parent: Some(parent), kind: Kind::Group(Vec::new()) };
+        let mut base = Node { hidden, rot: Rot::from_mat3(*rotation), t: *translation, ..Node::new(&name, Some(parent), *layer, Kind::Group(Vec::new())) };
+        read_extras(&mut base, attrs);
         match f.nodes.get(child) {
             Some(VoxNode::Group { attrs: gattrs, children }) => {
                 let mut n = base;
@@ -708,5 +927,90 @@ mod tests {
         let d = w.duplicate(b).unwrap();
         assert_eq!(w.label(d), "b copy");
         assert!(w.delete(d) && w.node(d).is_none());
+    }
+
+    fn solid(w: &World) -> Vec<IVec3> {
+        let c = w.composite(None).unwrap();
+        let mut out: Vec<IVec3> = (0..c.volume.cells.len()).filter(|&i| c.volume.cells[i] != 0).map(|i| c.volume.position(i) + c.origin).collect();
+        out.sort_by_key(|p| (p.z, p.y, p.x));
+        out
+    }
+
+    #[test]
+    fn free_quarter_turn_matches_exact_turn() {
+        let v = vol(IVec3::new(4, 2, 3), &[(IVec3::ZERO, 1), (IVec3::new(3, 1, 2), 2), (IVec3::new(1, 0, 2), 3)]);
+        let mut a = World::single(v.clone());
+        let mut b = World::single(v);
+        let m = a.models()[0];
+        a.reorient(m, Rot::turn(2, 1));
+        b.set_tilt(m, Vec3::new(0.0, 0.0, 90.0));
+        assert!(b.tilted(m));
+        // Same shape; the free turn is about the exact center, the 90° one
+        // keeps the box on whole cells, so allow a shift of under a voxel.
+        let (sa, sb) = (solid(&a), solid(&b));
+        assert_eq!(sa.len(), sb.len());
+        let d = sb[0] - sa[0];
+        assert!(d.abs().max_element() <= 1);
+        assert!(sa.iter().zip(&sb).all(|(p, q)| *q - *p == d));
+        // A 45° tilt keeps voxels (roughly) and grows the box.
+        b.set_tilt(m, Vec3::new(0.0, 0.0, 45.0));
+        let (_, size) = b.bounds(m).unwrap();
+        assert!(size.x >= 4 && size.y >= 4, "{size}");
+        assert!(!solid(&b).is_empty());
+    }
+
+    #[test]
+    fn turns_happen_about_the_pivot_and_attach_snaps() {
+        let mut w = World::single(Volume::new(IVec3::new(2, 2, 6)));
+        let arm = w.models()[0];
+        // Pivot at the top center (the shoulder).
+        w.node_mut(arm).unwrap().pivot = Some(Vec3::new(1.0, 1.0, 6.0));
+        let shoulder = w.pivot_world(arm);
+        w.reorient(arm, Rot::turn(0, 1));
+        assert_eq!(w.pivot_world(arm), shoulder);
+        // The arm now sticks out sideways from the shoulder.
+        let (lo, size) = w.bounds(arm).unwrap();
+        assert_eq!(size, IVec3::new(2, 6, 2));
+        assert!(lo.z as f32 <= shoulder.z && shoulder.z <= (lo.z + size.z) as f32);
+
+        let body = w.add_model(ROOT, "body", Volume::new(IVec3::splat(4)), IVec3::new(10, 0, 0));
+        w.node_mut(body).unwrap().sockets.push(Socket { name: "shoulder_r".into(), pos: Vec3::new(4.0, 2.0, 3.0) });
+        let s = w.socket_world(body, "SHOULDER_R").unwrap();
+        w.attach(arm, s);
+        assert_eq!(w.pivot_world(arm), s);
+    }
+
+    #[test]
+    fn part_coordinates_follow_the_edit_view() {
+        let mut w = World::single(Volume::new(IVec3::new(4, 2, 1)));
+        let m = w.models()[0];
+        w.translate(m, IVec3::new(5, 5, 0));
+        w.reorient(m, Rot::turn(2, 1));
+        let (v, _) = w.checkout(m).unwrap();
+        // Local x runs along world y after the turn.
+        let p = w.to_part(m, Vec3::new(4.0, 0.0, 0.0));
+        assert!(p.cmpge(Vec3::ZERO).all() && p.cmple(v.dims.as_vec3()).all(), "{p}");
+        assert!((w.from_part(m, p) - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn extras_round_trip_through_vox() {
+        let mut w = World::single(vol(IVec3::splat(3), &[(IVec3::ONE, 4)]));
+        let m = w.models()[0];
+        {
+            let n = w.node_mut(m).unwrap();
+            n.name = "gun".into();
+            n.pivot = Some(Vec3::new(0.5, 1.5, 0.0));
+            n.tilt = Vec3::new(0.0, 15.0, -30.0);
+            n.sockets = vec![Socket { name: "muzzle".into(), pos: Vec3::new(3.0, 1.5, 1.5) }, Socket { name: "grip".into(), pos: Vec3::new(1.0, 1.0, 0.0) }];
+        }
+        let path = std::env::temp_dir().join(format!("voxely-extras-{}.vox", std::process::id()));
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[]).unwrap();
+        let back = World::from_vox(&VoxFile::load(&path).unwrap());
+        std::fs::remove_file(&path).ok();
+        let n = back.node(back.find("gun").unwrap()).unwrap();
+        assert_eq!(n.pivot, Some(Vec3::new(0.5, 1.5, 0.0)));
+        assert_eq!(n.tilt, Vec3::new(0.0, 15.0, -30.0));
+        assert_eq!(n.sockets, w.node(m).unwrap().sockets);
     }
 }

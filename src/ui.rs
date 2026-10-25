@@ -1063,7 +1063,7 @@ pub fn view_bar(ui: &mut Ui, dims: IVec3, canvas: &mut IVec3, part: Option<&str>
             return;
         };
         if models > 1 {
-            ui.label(egui::RichText::new(part).strong());
+            ui.label(egui::RichText::new(part).strong()).on_hover_text("Parts with a free rotation are edited upright and on their own");
         }
         ui.separator();
         command(ui, cmds, "Fit", "Shrink the canvas to the model", Command::Op(Op::Fit));

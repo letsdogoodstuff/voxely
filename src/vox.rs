@@ -261,7 +261,11 @@ impl Graph {
 
     #[allow(clippy::too_many_arguments)]
     fn transform(&mut self, id: i32, child: i32, name: &str, hidden: bool, layer: i32, rot: u8, t: IVec3) {
-        let mut attrs = Dict::new();
+        self.transform_with(id, child, name, hidden, layer, rot, t, Dict::new());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transform_with(&mut self, id: i32, child: i32, name: &str, hidden: bool, layer: i32, rot: u8, t: IVec3, mut attrs: Dict) {
         if !name.is_empty() {
             attrs.insert("_name".into(), name.into());
         }
@@ -324,9 +328,11 @@ impl Graph {
         let Some(node) = w.node(n) else { return };
         let child = self.id();
         let (name, rot, layer) = (node.name.as_str(), node.rot.to_byte(), node.layer);
+        let mut extras = Dict::new();
+        crate::world::write_extras(node, &mut extras);
         match &node.kind {
             Kind::Group(children) => {
-                self.transform(trn, child, name, node.hidden, layer, rot, node.t);
+                self.transform_with(trn, child, name, node.hidden, layer, rot, node.t, extras);
                 let ids: Vec<i32> = children.iter().map(|_| self.id()).collect();
                 self.group(child, &ids);
                 for (&c, &id) in children.iter().zip(&ids) {
@@ -334,7 +340,7 @@ impl Graph {
                 }
             }
             Kind::Model(v) if v.dims.cmple(IVec3::splat(MAX_MODEL)).all() => {
-                self.transform(trn, child, name, node.hidden, layer, rot, node.t);
+                self.transform_with(trn, child, name, node.hidden, layer, rot, node.t, extras);
                 self.shape(child, v, IVec3::ZERO, v.dims);
             }
             Kind::Model(v) => {
