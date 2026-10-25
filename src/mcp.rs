@@ -109,12 +109,14 @@ pub fn run(args: &[String]) -> Result<()> {
         let result = match method {
             "initialize" => Ok(json!({
                 "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
-                "capabilities": { "tools": { "listChanged": false } },
+                "capabilities": { "tools": { "listChanged": false }, "prompts": { "listChanged": false } },
                 "serverInfo": { "name": "voxely", "version": env!("CARGO_PKG_VERSION") },
                 "instructions": control::INSTRUCTIONS,
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": control::tools() })),
+            "prompts/list" => Ok(control::guide::prompts()),
+            "prompts/get" => control::guide::prompt(&params).map_err(|e| json!({ "code": -32602, "message": e.to_string() })),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));

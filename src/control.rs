@@ -20,6 +20,7 @@ use crate::ui::{Op, TransformKind};
 // `PART_TOOLS` (tools that take a `part`), `dispatch` (None if the name
 // isn't one of its tools) and a `State` kept in `EditState::tools`.
 mod build;
+pub mod guide;
 mod inspect;
 mod surface;
 mod view;
@@ -94,7 +95,10 @@ Typical flow: new_project -> draw with fill_box / draw_shape / draw_line / set_v
 screenshot (fast) -> set_material and set_render_settings -> render (path traced) -> save_file. \
 For loops, procedural builds or anything needing many calls, use run_script: one JavaScript program \
 that calls every tool as voxely.<camelCaseName>({...}) and can edit a part's whole grid as a Uint8Array. \
-Every edit is undoable. If the voxely window is open, edits appear in it live.
+Every edit is undoable. If the voxely window is open, edits appear in it live. \
+Before building something, read get_guide (topic craft, plus character / prop / building as fits): \
+pick a scale, block out the silhouette first, use a few shades per material, and check each stage \
+with a screenshot.
 
 Scenes are a tree of parts (models) and groups, like MagicaVoxel's World editor. Voxel tools work on one part at a time, in that part's own coordinates (0..size-1): the part being edited (see get_scene_info), or the one named by a tool's `part` argument. Build separate pieces (body, head, arms, wheels, props) as separate parts with create_part, place them with transform_part (move, 90° rotate, flip) and group_parts, and inspect the tree with list_parts. Give parts pivots (set_pivot: a shoulder, a hinge) \
 and named sockets (set_socket: hand, muzzle, seat), then attach parts with transform_part attach_to (\"arm:hand\") so they follow, like a skeleton; \
@@ -300,13 +304,13 @@ const PART_TOOLS: &[&str] = &[
 ];
 
 fn is_part_tool(name: &str) -> bool {
-    [PART_TOOLS, build::PART_TOOLS, inspect::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
+    [PART_TOOLS, build::PART_TOOLS, guide::PART_TOOLS, inspect::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
 }
 
 /// The tool list for MCP `tools/list`, with the shared `part` argument.
 pub fn tools() -> Value {
     let mut list = base_tools();
-    let extra = [build::tools(), inspect::tools(), surface::tools(), view::tools()];
+    let extra = [build::tools(), guide::tools(), inspect::tools(), surface::tools(), view::tools()];
     list.as_array_mut().unwrap().extend(extra.into_iter().flatten());
     for t in list.as_array_mut().into_iter().flatten() {
         if is_part_tool(t["name"].as_str().unwrap_or_default()) {
@@ -623,7 +627,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
     if is_part_tool(name) {
         focus_part(ctx, get(a, "part"))?;
     }
-    for family in [build::dispatch, inspect::dispatch, surface::dispatch, view::dispatch] {
+    for family in [build::dispatch, guide::dispatch, inspect::dispatch, surface::dispatch, view::dispatch] {
         if let Some(result) = family(ctx, name, a) {
             return result;
         }
