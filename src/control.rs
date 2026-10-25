@@ -92,33 +92,20 @@ voxely is a MagicaVoxel-style voxel editor and path tracer. Coordinates are inte
 \"#rrggbb\" strings, which pick the nearest palette color (use set_palette_colors to define exact colors). \
 Projects live in a workspace folder and show in the window's Project list; use new_project to start \
 a named one, list_projects / open_project to flip between them, and save_file to save. \
-Typical flow: new_project -> draw with fill_box / draw_shape (incl. torus, capsule, rounded_box, \
-rotation) / draw_tube / extrude_polygon / set_voxels -> look with screenshot (fast; views \"quad\" \
-shows front/side/top/3-4 with coordinate rulers, highlight_last_edit shows where the last edit landed) \
--> finish with vary_colors / shade_edges / paint_faces -> set_material and set_render_settings -> \
-render (path traced) -> save_file. set_symmetry mirrors every edit. Edit results report what changed \
-and warn when shapes were clipped by the canvas. get_slice / get_projection give exact text maps. \
-checkpoint / restore snapshot the whole scene before risky changes; autosave saves every 25 edits. \
-save_stamp / place_stamp reuse pieces; apply_palette_preset loads a coherent palette; \
-voxelize_image turns a picture into voxels. \
-With a reference image or photo (any subject: character, animal, vehicle, building, scene), \
-measure instead of eyeballing: analyze_image finds the views and colors, set_reference stores a view, \
-reference_profile gives its silhouette as voxel rows to build from, paint_from_reference colors the model \
-from it, and compare_reference scores the model \
-against it (silhouette IoU, width errors, colors, diff image); the build_from_reference prompt walks through it. \
-render views \"turnaround\" path traces front/right/back/left in one image; render frame true auto-frames. \
-For loops, procedural builds or anything needing many calls, use run_script: one JavaScript program \
-that calls every tool as voxely.<camelCaseName>({...}) and can edit a part's whole grid as a Uint8Array; \
-its util library has seeded noise and signed distance shapes (smoothUnion, capsule, displace ...) for organic \
-forms (get_guide scripting). \
-Every edit is undoable. If the voxely window is open, edits appear in it live. \
-Before building something, read get_guide (topic craft, plus character / prop / building as fits): \
-pick a scale, block out the silhouette first, use a few shades per material, and check each stage \
-with a screenshot.
+Typical flow: new_project -> set_palette_colors -> draw with fill_box / draw_shape / draw_line / \
+set_voxels -> look with screenshot (views \"quad\" shows front/side/top/3-4 with rulers) -> \
+set_material and set_render_settings -> render (path traced) -> save_file. \
+Every edit is undoable. If the voxely window is open, edits appear in it live.
 
-Scenes are a tree of parts (models) and groups, like MagicaVoxel's World editor. Voxel tools work on one part at a time, in that part's own coordinates (0..size-1): the part being edited (see get_scene_info), or the one named by a tool's `part` argument. Build separate pieces (body, head, arms, wheels, props) as separate parts with create_part, place them with transform_part (move, 90° rotate, flip) and group_parts, and inspect the tree with list_parts. Give parts pivots (set_pivot: a shoulder, a hinge) \
-and named sockets (set_socket: hand, muzzle, seat), then attach parts with transform_part attach_to (\"arm:hand\") so they follow, like a skeleton; \
-both carry into glTF exports for game engines. Part positions are world voxel coordinates of the part's minimum corner; a new project's first part spans [0, size).";
+House style: clean, designed voxel art. Chunky boxy forms, ONE flat color per material plus a few \
+deliberate accents, and small details placed by hand (eyes with pupils and highlights, gems, buckles, \
+trim, emblems). The renderer does the lighting, so never paint shading, noise or speckle. Designing \
+from your head, a character is 32-48 voxels tall. With a picture, it is the design reference: read its \
+parts, proportions, flat colors and recognizable details, then build them cleanly; if the picture is \
+voxel art, match its block size (one picture block = one voxel; analyze_image measures \
+it). get_guide (craft, character, image, ...) has more.
+
+Scenes are a tree of parts (models) and groups. Voxel tools work on one part at a time, in that part's own coordinates (0..size-1): the part being edited (see get_scene_info), or the one named by a tool's `part` argument. Build separate pieces (body, head, arms, legs, gear, props) as separate parts with create_part, place them with transform_part and group_parts, inspect with list_parts. Pivots (set_pivot), sockets (set_socket) and transform_part attach_to make a skeleton for animation and glTF export. Part positions are world voxel coordinates of the part's minimum corner. run_script runs one JavaScript program that calls every tool (voxely.<camelCaseName>) for repetitive or exactly computed layouts.";
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
     json!({
@@ -411,11 +398,17 @@ fn is_part_tool(name: &str) -> bool {
     [PART_TOOLS, build::PART_TOOLS, guide::PART_TOOLS, inspect::PART_TOOLS, reference::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
 }
 
+/// Tools that pull agents away from the house style (noise, painted
+/// shading, reference colors copied with their lighting): not offered, but
+/// still callable by name for anyone who wants that look.
+const UNLISTED: &[&str] = &["vary_colors", "shade_edges", "paint_from_reference"];
+
 /// The tool list for MCP `tools/list`, with the shared `part` argument.
 pub fn tools() -> Value {
     let mut list = base_tools();
     let extra = [build::tools(), guide::tools(), inspect::tools(), reference::tools(), surface::tools(), view::tools()];
     list.as_array_mut().unwrap().extend(extra.into_iter().flatten());
+    list.as_array_mut().unwrap().retain(|t| !UNLISTED.contains(&t["name"].as_str().unwrap_or_default()));
     for t in list.as_array_mut().into_iter().flatten() {
         if is_part_tool(t["name"].as_str().unwrap_or_default()) {
             t["inputSchema"]["properties"]["part"] = json!({ "type": ["string", "integer"], "description": "Part to work on (name or id); default: the part being edited" });

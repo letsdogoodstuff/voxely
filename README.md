@@ -79,10 +79,10 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
 | Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid, frustum, torus, capsule, rounded_box, wedge; any `rotation`), `draw_line`, `draw_tube` (curves with tapering radius), `extrude_polygon`, `set_symmetry` (mirror every edit) |
 | Stamps | `save_stamp`, `list_stamps`, `place_stamp`, `delete_stamp` (reusable pieces saved in `<workspace>/stamps`) |
-| Surface | `vary_colors` (noise/dither color variation), `shade_edges` (edge darkening, highlights, cavity AO), `paint_faces` (snow on top, moss on north faces …), `voxelize_image` |
+| Surface | `vary_colors` (noise/dither color variation) and `shade_edges` (edge darkening, highlights, cavity AO), both callable by name but not listed to agents since they fight the flat house style; `paint_faces` (snow on top, moss on north faces …), `voxelize_image` |
 | Reading | `get_voxels`, `get_slice` (text maps of one or more layers), `get_projection` (color/height map seen along an axis) |
 | Safety | `checkpoint` / `restore` (whole-scene snapshots), `set_autosave` (default: every 25 edits) |
-| References | `analyze_image` (views, width profiles, dominant colors of a photo or sheet), `set_reference`, `list_references`, `reference_profile` (silhouette as voxel rows), `compare_reference` (IoU, width errors, color agreement, diff image), `paint_from_reference` (project the reference's colors onto the visible voxels) |
+| References | `analyze_image` (views, voxel block size, width profiles, dominant colors of a photo or sheet), `set_reference`, `list_references`, `reference_profile` (silhouette as voxel rows), `compare_reference` (IoU, width errors, color agreement, diff image), `paint_from_reference` (project the reference's colors onto the visible voxels) |
 | Guidance | `get_guide` (voxel-art craft notes by topic); MCP prompts `build_from_reference`, `build_character`, `build_prop`, `build_environment`, `review_model` (each takes one free-text request) |
 | Model tools | `edit_model` (MagicaVoxel's Edit panel: fill, hull, mirror, rotate, …), `transform_model` (scale/shear/rotate/repeat) |
 | Shaders | `list_shaders`, `run_shader` (MagicaVoxel voxel shaders, or inline GLSL) |

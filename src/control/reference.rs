@@ -3,6 +3,7 @@
 //! against them.
 
 mod compare;
+mod pitch;
 mod segment;
 
 use std::collections::BTreeMap;
@@ -57,10 +58,11 @@ pub fn tools() -> Vec<Value> {
         tool(
             "analyze_image",
             "First look at a reference picture (photo, concept art, turnaround sheet) as numbers. Separates subjects from the background (a smooth fit to the border colors, plus texture so pale subjects on pale backgrounds still count), numbers the blobs left to right and flags caption-like blobs (short rows of glyphs such as FRONT / SIDE / BACK) as text, not views. \
-             Per subject: box in pixels, aspect ratio, a width profile (filled extent at 20 heights, as fractions of the box width, so proportions read off directly) and dominant colors (k-means in OKLab) with where they sit. Returns an annotated image with numbered boxes; then attach views with set_reference.",
+             Per subject: box in pixels, aspect ratio, the voxel block size if the picture is voxel art (so the model can match it: one picture block = one voxel), a width profile (filled extent at 20 heights, as fractions of the box width, so proportions read off directly) and dominant colors (k-means in OKLab) with where they sit. Returns an annotated image with numbered boxes; then attach views with set_reference.",
             json!({
                 "path": { "type": "string", "description": "PNG or JPEG" },
                 "threshold": { "type": "number", "description": "Color difference from the background (0-255, largest channel) that counts as subject; default automatic (about 15). Lower it if parts of the subject are missed, raise it if shadows join in" },
+                "crop": { "type": "array", "items": { "type": "integer" }, "minItems": 4, "maxItems": 4, "description": "[x0, y0, x1, y1] pixel box around one subject (e.g. the character in a busy scene): also reports its voxel block size and how many blocks tall the box is" },
             }),
             &["path"],
         ),
@@ -113,7 +115,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "paint_from_reference",
-            "Color the model from a reference view: every voxel visible from that view (across all parts, so whatever is in front gets painted, not what it hides) takes the reference's color at that spot, matched to the nearest allowed palette color (OKLab, lightness counted half since references are shaded). \
+            "Copies the reference's colors INCLUDING its lighting, which shows up as speckle and muddy shading; not the house style (pick flat colors from the sheet instead). Use it only when the user asks for a painted copy. Color the model from a reference view: every voxel visible from that view (across all parts, so whatever is in front gets painted, not what it hides) takes the reference's color at that spot, matched to the nearest allowed palette color (OKLab, lightness counted half since references are shaded). \
              Gets straps, trim, faces, markings, liveries and facades right in one call; then shade and fix by hand. Aligned like compare_reference (pinned scale if set, else fit). Run it per view (front, then back and sides) on a finished shape; later views only repaint what they see. Each part changed is one undo step.",
             json!({
                 "view": view,
@@ -313,6 +315,28 @@ fn analyze_image(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             out.push("The border is busy (not a plain backdrop): blobs may be unreliable; use set_reference crop to pick the subject by hand.".to_string());
         }
     }
+    // Block size over the whole picture and in the box asked about: on busy
+    // scenes the blobs are fragments, but the agent can see the subject.
+    let all = |_: usize, _: usize| true;
+    let mut boxes = vec![("The whole picture".to_string(), [0, 0, img.w - 1, img.h - 1])];
+    if let Some(c) = get(a, "crop").and_then(Value::as_array) {
+        let v: Vec<usize> = c.iter().filter_map(Value::as_u64).map(|n| n as usize).collect();
+        if v.len() != 4 || v[0] >= v[2] || v[1] >= v[3] {
+            bail!("`crop` is [x0, y0, x1, y1] in pixels");
+        }
+        boxes.push((format!("Box [{}, {}]-[{}, {}]", v[0], v[1], v[2], v[3]), [v[0], v[1], v[2].min(img.w - 1), v[3].min(img.h - 1)]));
+    }
+    for (what, bb) in boxes {
+        out.push(match pitch::voxel_pitch(&img, &all, bb) {
+            Some((p, conf)) => format!(
+                "{what}: if it is voxel art, its blocks are {p:.1} px (confidence {:.0}%), so {} px tall = {:.0} blocks: build at that size, one picture block = one voxel. (Photos and textures can show a spacing too; you judge whether it is voxel art.)",
+                conf * 100.0,
+                bb[3] - bb[1] + 1,
+                (bb[3] - bb[1] + 1) as f32 / p
+            ),
+            None => format!("{what}: no regular block spacing (not voxel art, or too blurry to tell)."),
+        });
+    }
     out.push(format!("{} subject blob(s), {} text label(s) (captions, not views), {} tiny specks ignored.", subjects.len(), texts.len(), seg.specks));
     for b in &subjects {
         let id = b.id as u32;
@@ -332,6 +356,15 @@ fn analyze_image(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             pct(b.area as f32 / (b.w() * b.h()) as f32),
             (b.x0 + b.x1) / 2
         ));
+        out.push(match pitch::voxel_pitch(&img, &on, [b.x0, b.y0, b.x1, b.y1]) {
+            Some((p, conf)) => format!(
+                "  If voxel art: {p:.1}-pixel blocks (confidence {:.0}%), so about {:.0} blocks tall and {:.0} wide: build it at that size, one picture block = one voxel.",
+                conf * 100.0,
+                b.h() as f32 / p,
+                b.w() as f32 / p
+            ),
+            None => "  No regular block spacing (not voxel art, or too blurry to tell).".to_string(),
+        });
         out.push("  Width profile, top to bottom (row position in the box (pixel y): span as fractions of the box width, 0 = left edge -> width; filled share; spans if >1):".to_string());
         let max_w = b.w() as f32;
         for r in segment::width_profile(&on, bx, 20) {
