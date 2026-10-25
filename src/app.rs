@@ -117,7 +117,7 @@ pub struct Notice {
 /// and materials, and the render settings that are saved with the file.
 #[derive(Clone, PartialEq)]
 pub struct Sig {
-    history: [u64; 6],
+    history: [u64; 5],
     look: u64,
     settings: crate::scene::RenderSettings,
 }
@@ -127,7 +127,7 @@ impl Sig {
         use std::hash::{Hash, Hasher};
         let (tree_back, tree_fwd) = scene.tree_depth();
         let (undo, redo) = ed.editor.history_lens();
-        let history = [scene.tree_steps(), tree_back as u64, tree_fwd as u64, undo as u64, redo as u64, ed.palette.history.len() as u64];
+        let history = [scene.tree_steps(), tree_back as u64, tree_fwd as u64, undo as u64, redo as u64];
         let mut h = std::hash::DefaultHasher::new();
         scene.palette.hash(&mut h);
         bytemuck::cast_slice::<_, u8>(&scene.materials).hash(&mut h);
@@ -720,25 +720,30 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
 }
 
 /// Before a change that resets the voxel editor (tree changes, switching
-/// part or frame): move this edit session's voxel edits into the tree's
-/// history, one undo step each, so none get merged.
+/// part or frame, stepping into tree undo steps): move this edit session's
+/// voxel edits, done and undone, into the tree's history, one undo step
+/// each, so none get merged or lost.
 pub(crate) fn keep_history(scene: &mut Scene, editor: &mut Editor) {
-    if scene.editing().is_some() && editor.can_undo() {
-        let past = editor.take_history(&scene.volume, Scene::KEPT_STEPS);
-        scene.keep_steps(past);
+    if scene.editing().is_some() && (editor.can_undo() || editor.can_redo()) {
+        let (past, future) = editor.take_history(&scene.volume, Scene::KEPT_STEPS);
+        scene.keep_steps(past, future);
     }
 }
 
 /// Undo (or redo) one step: voxel edits in this edit session first, then
-/// whole-part changes.
+/// whole-part and palette changes.
 pub(crate) fn history_step(scene: &mut Scene, ed: &mut EditState, forward: bool) -> bool {
     let e = &mut ed.editor;
     if scene.editing().is_some() && (if forward { e.can_redo() } else { e.can_undo() }) {
         return if forward { e.redo(&mut scene.volume) } else { e.undo(&mut scene.volume) };
     }
+    keep_history(scene, &mut ed.editor);
     let done = scene.undo_tree(forward);
     if done {
         ed.editor.reset();
+        if let Some(remap) = scene.recolor.take() {
+            crate::palette_lib::remap_tools(ed, &remap);
+        }
     }
     done
 }
@@ -958,9 +963,6 @@ fn delete_project(path: &Path, ed: &mut EditState) -> Result<String> {
 /// Show a newly opened or created scene.
 pub(crate) fn loaded(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     ed.editor.reset();
-    // Palette undo and remembered colors belong to the old scene.
-    ed.palette.history.clear();
-    ed.palette.look = vec![None; 256];
     ed.palette.previewing = None;
     ed.hover = None;
     ed.tools.build.scene_changed();
@@ -1773,7 +1775,7 @@ pub fn build_ui(
         (ed.prefs.autosave, ed.prefs.autosave_every) = autosave;
         ed.prefs.save();
     }
-    crate::palette_lib::window(ui.ctx(), ed, cmds);
+    crate::palette_lib::window(ui.ctx(), scene, ed, cmds);
     crate::palette_lib::handle_drops(ui.ctx(), ed, cmds);
     crate::import::window::window(ui.ctx(), &mut ed.import, cmds);
     // The reference picture follows the project.
@@ -2769,6 +2771,50 @@ mod tests {
         ed.editor.commit(&mut scene.volume, full);
         assert!(ed.dirty.see(sig(&scene, &ed)));
         assert!(ed.dirty.is_dirty());
+    }
+
+    #[test]
+    fn redo_goes_back_over_tree_changes_and_later_voxel_edits() {
+        let solid = |s: &Scene| (s.synced_world().models().len(), s.volume.dims, s.volume.filled_sorted());
+        // resize_canvas, then create_part: tree changes, each followed by a
+        // voxel edit.
+        let mut scene = Scene::empty(IVec3::splat(10));
+        let mut ed = EditState::new(1, None, PathBuf::from("x.vox"));
+        let mut states = vec![solid(&scene)];
+        keep_history(&mut scene, &mut ed.editor);
+        let bigger = ops::resize(&scene.volume, IVec3::splat(12));
+        assert!(scene.recanvas(&bigger, -ops::resize_shift(&scene.volume, IVec3::splat(12))));
+        ed.editor.reset();
+        states.push(solid(&scene));
+        let fill = |scene: &mut Scene, ed: &mut EditState, c: u8| {
+            let mut new = scene.volume.clone();
+            for p in [IVec3::ZERO, IVec3::X, IVec3::Y, IVec3::Z, IVec3::new(1, 1, 0), IVec3::new(1, 0, 1), IVec3::new(0, 1, 1), IVec3::ONE] {
+                new.set(p, c);
+            }
+            assert!(ed.editor.commit(&mut scene.volume, new));
+        };
+        fill(&mut scene, &mut ed, 7);
+        states.push(solid(&scene));
+        keep_history(&mut scene, &mut ed.editor);
+        let id = scene.change(|w| w.add_model(crate::world::ROOT, "b", crate::scene::Volume::new(IVec3::splat(4)), IVec3::new(20, 0, 0)));
+        assert!(set_mode(&mut scene, &mut ed, Some(id)));
+        states.push(solid(&scene));
+        fill(&mut scene, &mut ed, 9);
+        states.push(solid(&scene));
+        let n = states.len() - 1;
+        for back in 1..=n {
+            for _ in 0..back {
+                assert!(history_step(&mut scene, &mut ed, false));
+            }
+            assert_eq!(solid(&scene).0, states[n - back].0);
+            for _ in 0..back {
+                assert!(history_step(&mut scene, &mut ed, true), "redo {back}");
+            }
+            assert!(!history_step(&mut scene, &mut ed, true), "nothing more to redo");
+            assert_eq!(scene.synced_world().models().len(), 2);
+        }
+        let count = |s: &Scene| s.synced_world().models().iter().map(|&m| s.synced_world().node(m).unwrap().volume().unwrap().count()).sum::<usize>();
+        assert_eq!(count(&scene), 16, "both fills are back");
     }
 
     #[test]

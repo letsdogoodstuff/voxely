@@ -1,10 +1,10 @@
 //! Looking at the model: multi-view screenshots, overlays, edit highlights.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use glam::{IVec3, Vec3};
 use serde_json::{Value, json};
 
-use super::{Ctx, boolean, get, int, string, text, tool};
+use super::{Ctx, boolean, get, int_in, max_image_side, string, text, tool};
 use crate::gpu::{Camera, project_point};
 use crate::scene::Projection;
 
@@ -231,10 +231,12 @@ pub fn render_framed(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let cols = if n <= 4 { n } else { (n as f32).sqrt().ceil() as u32 };
     let rows = n.div_ceil(cols);
     let (dw, dh) = if n == 1 { (960, 640) } else { (480 * cols, 600 * rows) };
-    let width = int(a, "width").map_or(dw, |v| v as u32).clamp(16 * cols, 8192);
-    let height = int(a, "height").map_or(dh, |v| v as u32).clamp(16 * rows, 8192);
+    let max = max_image_side(ctx);
+    let tiles = || format!("{n} views in {cols} columns and {rows} rows need 16 pixels per tile");
+    let width = int_in(a, "width", dw as i64, 16 * cols as i64, max).with_context(tiles)? as u32;
+    let height = int_in(a, "height", dh as i64, 16 * rows as i64, max).with_context(tiles)? as u32;
     let (tw, th) = (width / cols, height / rows);
-    let spp = int(a, "samples").unwrap_or(128).clamp(1, 65536) as u32;
+    let spp = int_in(a, "samples", 128, 1, 65536)? as u32;
     let (lo, hi) = traced_bounds(ctx.scene).ok_or_else(|| anyhow::anyhow!("nothing to render: the scene has no voxels"))?;
 
     let t = std::time::Instant::now();

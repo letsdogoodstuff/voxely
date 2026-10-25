@@ -159,8 +159,9 @@ pub struct PaletteState {
     pub drag: Option<usize>,
     /// Colors drawn with lately, newest first.
     pub recent: Vec<u8>,
-    /// Palette states to go back to (see `palette_lib::Cmd::Undo`).
-    pub history: Vec<crate::palette_lib::Snap>,
+    /// The undo step of the color drag going on (see
+    /// `palette_lib::drag_step`).
+    pub step: Option<(u64, usize)>,
     /// The swatch whose color is being edited, so one slider drag is one
     /// palette undo step.
     pub editing: Option<usize>,
@@ -169,13 +170,8 @@ pub struct PaletteState {
     pub shift: [f32; 3],
     pub shift_base: Option<Vec<(usize, [u8; 4])>>,
     /// Loading a palette recolors the model's colors to the nearest new
-    /// ones instead of replacing them by index.
+    /// ones instead of replacing them by index (see `Scene::look`).
     pub match_colors: bool,
-    /// For each slot such a load recolored, the color it had before the
-    /// first of them, so later loads match against the model's real colors
-    /// and loading the original palette back restores them exactly. Editing
-    /// a slot's color forgets it.
-    pub look: Vec<Option<[u8; 4]>>,
     pub library_open: bool,
     /// The palette hovered this frame, shown on the model.
     pub preview: Option<crate::palette_lib::Source>,
@@ -200,12 +196,11 @@ impl Default for PaletteState {
             code: String::new(),
             drag: None,
             recent: Vec::new(),
-            history: Vec::new(),
+            step: None,
             editing: None,
             shift: [0.0; 3],
             shift_base: None,
             match_colors: true,
-            look: vec![None; 256],
             library_open: false,
             preview: None,
             previewing: None,
@@ -772,7 +767,7 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
                 ui.close();
             }
             ui.separator();
-            if ui.add_enabled(!pal.history.is_empty(), egui::Button::new("Undo palette")).on_hover_text("Undo the last palette change").clicked() {
+            if ui.add_enabled(crate::palette_lib::can_undo(scene, e), egui::Button::new("Undo palette")).on_hover_text("Undo the last palette change").clicked() {
                 cmds.push(Command::Palette(Cmd::Undo));
                 ui.close();
             }
@@ -913,16 +908,15 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
         }
     });
     if rgb != before {
-        if pal.editing != Some(i) {
-            lib::push(&mut pal.history, lib::snapshot(scene, &pal.look));
-            pal.editing = Some(i);
-        }
-        pal.look[i] = None;
+        lib::drag_step(scene, e, &mut pal.step, pal.editing != Some(i));
+        pal.editing = Some(i);
+        scene.look[i] = None;
         scene.palette[i] = [rgb[0], rgb[1], rgb[2], scene.palette[i][3]];
         scene.sync_color(i);
+        scene.palette_step_update(None);
         a.materials_changed = true;
     }
-    a.materials_changed |= ramp_tools(ui, i, scene, pal, cmds);
+    a.materials_changed |= ramp_tools(ui, i, e, scene, pal, cmds);
     if let Some((msg, t)) = &pal.status {
         if t.elapsed().as_secs() < 6 {
             ui.add(egui::Label::new(egui::RichText::new(msg).weak().small()).wrap());
@@ -971,7 +965,7 @@ fn ramp_name(ui: &mut Ui, i: usize, scene: &mut Scene) {
 /// The ramp row under the color editor: its name, Blend, and a hue /
 /// saturation / value shift for the selected colors (or the ramp).
 /// Returns whether colors changed.
-fn ramp_tools(ui: &mut Ui, i: usize, scene: &mut Scene, pal: &mut PaletteState, cmds: &mut Vec<Command>) -> bool {
+fn ramp_tools(ui: &mut Ui, i: usize, e: &mut Editor, scene: &mut Scene, pal: &mut PaletteState, cmds: &mut Vec<Command>) -> bool {
     use crate::palette_lib::{self as lib, Cmd};
     let (lo, hi) = ramp_of(i);
     ui.separator();
@@ -1000,9 +994,10 @@ fn ramp_tools(ui: &mut Ui, i: usize, scene: &mut Scene, pal: &mut PaletteState, 
         done |= r.drag_stopped() || (r.changed() && !r.dragged());
     }
     if changed {
-        if pal.shift_base.as_ref().is_none_or(|b| !b.iter().map(|x| x.0).eq(targets.iter().copied())) {
-            lib::push(&mut pal.history, lib::snapshot(scene, &pal.look));
-            lib::forget(&mut pal.look, targets.iter().copied());
+        let fresh = pal.shift_base.as_ref().is_none_or(|b| !b.iter().map(|x| x.0).eq(targets.iter().copied()));
+        lib::drag_step(scene, e, &mut pal.step, fresh);
+        if fresh {
+            lib::forget(&mut scene.look, targets.iter().copied());
             pal.shift_base = Some(targets.iter().map(|&t| (t, scene.palette[t])).collect());
         }
         let [dh, ds, dv] = pal.shift;
@@ -1010,6 +1005,7 @@ fn ramp_tools(ui: &mut Ui, i: usize, scene: &mut Scene, pal: &mut PaletteState, 
             scene.palette[t] = crate::palette_ops::adjust(c, dh, ds, dv);
             scene.sync_color(t);
         }
+        scene.palette_step_update(None);
     }
     if done {
         pal.shift = [0.0; 3];

@@ -336,6 +336,23 @@ mod tests {
         format!("{:#}", check_call(name, &args).unwrap_err())
     }
 
+    #[test]
+    fn out_of_range_sizes_and_rates_are_errors() {
+        for (name, args, want) in [
+            ("set_animation", json!({ "fps": 1000 }), "0.5 to 120"),
+            ("set_animation", json!({ "frames": 0 }), "1 to 10000"),
+            ("render", json!({ "width": 99999 }), "16 to 8192"),
+            ("render", json!({ "height": 10 }), "16 to 8192"),
+            ("render", json!({ "samples": 0 }), "1 to 65536"),
+            ("frame_strip", json!({ "columns": -1 }), "at least 1"),
+            ("frame_strip", json!({ "frames": [-1] }), "at least 0"),
+            ("frame_strip", json!({ "width": 4000 }), "32 to 1024"),
+        ] {
+            let e = err(name, args.clone());
+            assert!(e.contains(want), "{name} {args}: {e}");
+        }
+    }
+
     const KEYWORDS: &[&str] = &["type", "description", "enum", "items", "minItems", "maxItems", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "properties", "required", "anyOf", "additionalProperties"];
     const TYPES: &[&str] = &["integer", "number", "string", "boolean", "array", "object", "null"];
 
