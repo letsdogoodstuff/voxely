@@ -11,6 +11,7 @@ mod modeler;
 mod outline;
 mod ops;
 mod palette_ops;
+mod prefs;
 #[cfg(test)]
 mod render_knobs;
 mod scene;
@@ -76,6 +77,7 @@ editor controls (MagicaVoxel layout; Cmd works for Ctrl on macOS):
   Ctrl+Z undo  Ctrl+Y redo         Ctrl+S save  Ctrl+Shift+S save as
   Ctrl+O open  Ctrl+P new          Ctrl+G grid  Ctrl+F frame  Ctrl+B bounds
   F1 model/render                  Ctrl+Tab  hide panels
+  Ctrl+, preferences               Ctrl+= / Ctrl+- / Ctrl+0  interface scale
   arrows sun angle                 6  save a PNG snapshot to export/
 
 world mode (Tab switches between editing a model and the world):
@@ -101,6 +103,10 @@ struct Args {
     ui_shot: Option<PathBuf>,
     /// Show the path tracer instead of the modeler in `--ui-shot`.
     pathtrace: bool,
+    /// Interface scale for `--ui-shot` (as chosen in Preferences).
+    ui_scale: Option<f32>,
+    /// Show the Preferences window in `--ui-shot`.
+    prefs_shot: bool,
     proj: Option<scene::Projection>,
     dof: Option<f32>,
     blades: Option<u32>,
@@ -184,6 +190,8 @@ fn parse_args() -> Result<Args> {
             "--fog" => args.fog = Some(val()?.parse()?),
             "--bloom" => args.bloom = true,
             "--pathtrace" => args.pathtrace = true,
+            "--ui-scale" => args.ui_scale = Some(val()?.parse()?),
+            "--prefs" => args.prefs_shot = true,
             "--ui-shot" => args.ui_shot = Some(PathBuf::from(val()?)),
             "--proj" => {
                 use scene::Projection::*;
@@ -411,10 +419,18 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
     });
     let view = tex.create_view(&Default::default());
     let ctx = egui::Context::default();
-    let ppp = 2.0;
+    // Three passes are too few for windows to finish fading in.
+    ctx.all_styles_mut(|s| s.animation_time = 0.0);
+    // A Retina screen; the interface scale multiplies it as in the window.
+    let native = 2.0;
     let panel = ui::PanelState { ibl_files: list_ibl(&args.model, scene.settings.ibl_path.as_ref()) };
     let mut ed = app::EditState::new(1, Some(args.model.clone()), PathBuf::new());
     ed.enabled = r.modeling;
+    ed.prefs.ui_scale = args.ui_scale.unwrap_or(1.0);
+    ed.prefs_open = args.prefs_shot;
+    ed.ui_scale = prefs::effective_scale(ed.prefs.ui_scale, w as f32 / native);
+    ctx.set_zoom_factor(ed.ui_scale);
+    let ppp = native * ed.ui_scale;
     let mut out = None;
     // A few passes so layout and fonts settle; textures upload every pass.
     // The 3D view is fitted between the panels, then rendered.
@@ -429,7 +445,7 @@ fn ui_snapshot(args: &Args, scene: &mut Scene, out_path: &Path) -> Result<()> {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32 / ppp, h as f32 / ppp))),
             ..Default::default()
         };
-        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+        raw.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(native);
         let o = ctx.run_ui(raw, |ui| {
             let a = app::build_ui(ui, &mut r, scene, &mut ed, &panel, true);
             if pass < 2 {
