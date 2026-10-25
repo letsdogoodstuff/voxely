@@ -17,13 +17,19 @@ pub struct State {
     centers: HashMap<usize, [Option<i32>; 3]>,
     /// The tool being run, so whole-model ops aren't mirrored.
     tool: Option<String>,
+    /// The axes the last committed edit was mirrored across.
+    mirrored: [bool; 3],
 }
 
 pub const PART_TOOLS: &[&str] = &["draw_tube", "extrude_polygon", "place_stamp"];
 
 /// Edits that move or regenerate the whole model; mirroring their changes
 /// would garble them.
-const UNMIRRORED: &[&str] = &["edit_model", "transform_model", "resize_canvas", "run_shader", "move_selection"];
+const UNMIRRORED: &[&str] = &[
+    "edit_model", "transform_model", "resize_canvas", "run_shader", "move_selection",
+    // Surface passes: per-voxel noise and images shouldn't be forced symmetric.
+    "vary_colors", "shade_edges", "paint_faces", "voxelize_image",
+];
 
 pub const SHAPES: &[&str] =
     &["box", "ellipsoid", "sphere", "cylinder", "cone", "pyramid", "frustum", "torus", "capsule", "rounded_box", "wedge"];
@@ -86,7 +92,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Va
             let path = sample_curve(&pts, curve, boolean(a, "closed").unwrap_or(false))?;
             let len = path.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>();
             let new = tube_volume(&ctx.scene.volume, &path, r0, r1, c);
-            let what = format!("Drew tube through {} points, {len:.0} voxels long{}", pts.len(), mirrored_note(ctx));
+            let what = format!("Drew tube through {} points, {len:.0} voxels long", pts.len());
             let changed = apply(ctx, new);
             Ok(edited(ctx, changed, &what))
         })(),
@@ -109,7 +115,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Va
             };
             let c = color_arg(ctx.scene, a, "color")?;
             let new = extrude_volume(&ctx.scene.volume, ax, &outline, &holes, d0.min(d1), d0.max(d1), c, boolean(a, "hollow").unwrap_or(false));
-            let what = format!("Extruded polygon of {} points{}", outline.len(), mirrored_note(ctx));
+            let what = format!("Extruded polygon of {} points", outline.len());
             let changed = apply(ctx, new);
             Ok(edited(ctx, changed, &what))
         })(),
@@ -132,10 +138,12 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Va
 pub fn before_commit(ctx: &mut Ctx, new: Volume) -> Volume {
     let tool = ctx.ed.tools.build.tool.take();
     let axes = ctx.ed.editor.mirror;
+    ctx.ed.tools.build.mirrored = [false; 3];
     let Some(id) = ctx.scene.editing() else { return new };
     if !axes.iter().any(|&on| on) || tool.as_deref().is_some_and(|t| UNMIRRORED.contains(&t)) {
         return new;
     }
+    ctx.ed.tools.build.mirrored = axes;
     let planes = planes(ctx, id);
     mirror_edit(&ctx.scene.volume, new, axes, planes)
 }
@@ -184,9 +192,10 @@ pub fn mirror_edit(old: &Volume, new: Volume, axes: [bool; 3], planes: IVec3) ->
     out
 }
 
-fn mirrored_note(ctx: &Ctx) -> String {
-    let m = ctx.ed.editor.mirror;
-    if ctx.ed.tools.build.tool.as_deref().is_some_and(|t| UNMIRRORED.contains(&t)) || !m.iter().any(|&on| on) {
+/// " (mirrored xz)" when the edit just made was mirrored, else "".
+pub(super) fn mirrored_note(ctx: &Ctx) -> String {
+    let m = ctx.ed.tools.build.mirrored;
+    if !m.iter().any(|&on| on) {
         return String::new();
     }
     let axes: String = ["x", "y", "z"].iter().zip(m).filter(|(_, on)| *on).map(|(n, _)| *n).collect();
@@ -762,7 +771,7 @@ fn place_stamp(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             skipped += 1;
         }
     }
-    let mut what = format!("Placed stamp {name:?} ({}x{}x{}) at {:?}{}", size.x, size.y, size.z, arr(lo), mirrored_note(ctx));
+    let mut what = format!("Placed stamp {name:?} ({}x{}x{}) at {:?}", size.x, size.y, size.z, arr(lo));
     if skipped > 0 {
         what.push_str(&format!("; {skipped} of its voxels fell outside the canvas"));
     }

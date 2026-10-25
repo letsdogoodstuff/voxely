@@ -18,7 +18,8 @@ use crate::ui::{Op, TransformKind};
 
 // Tool families kept in their own files. Each has `tools()` (definitions),
 // `PART_TOOLS` (tools that take a `part`), `dispatch` (None if the name
-// isn't one of its tools) and a `State` kept in `EditState::tools`.
+// isn't one of its tools) and, if it needs one, a `State` kept in
+// `EditState::tools`.
 mod build;
 pub mod guide;
 mod inspect;
@@ -32,7 +33,6 @@ pub struct ToolState {
     pub build: build::State,
     pub inspect: inspect::State,
     pub surface: surface::State,
-    pub view: view::State,
 }
 
 /// What the most recent committed edit changed, in the edited part's
@@ -91,8 +91,15 @@ voxely is a MagicaVoxel-style voxel editor and path tracer. Coordinates are inte
 \"#rrggbb\" strings, which pick the nearest palette color (use set_palette_colors to define exact colors). \
 Projects live in a workspace folder and show in the window's Project list; use new_project to start \
 a named one, list_projects / open_project to flip between them, and save_file to save. \
-Typical flow: new_project -> draw with fill_box / draw_shape / draw_line / set_voxels -> look with \
-screenshot (fast) -> set_material and set_render_settings -> render (path traced) -> save_file. \
+Typical flow: new_project -> draw with fill_box / draw_shape (incl. torus, capsule, rounded_box, \
+rotation) / draw_tube / extrude_polygon / set_voxels -> look with screenshot (fast; views \"quad\" \
+shows front/side/top/3-4 with coordinate rulers, highlight_last_edit shows where the last edit landed) \
+-> finish with vary_colors / shade_edges / paint_faces -> set_material and set_render_settings -> \
+render (path traced) -> save_file. set_symmetry mirrors every edit. Edit results report what changed \
+and warn when shapes were clipped by the canvas. get_slice / get_projection give exact text maps. \
+checkpoint / restore snapshot the whole scene before risky changes; autosave saves every 25 edits. \
+save_stamp / place_stamp reuse pieces; apply_palette_preset loads a coherent palette; \
+voxelize_image turns a picture into voxels. \
 For loops, procedural builds or anything needing many calls, use run_script: one JavaScript program \
 that calls every tool as voxely.<camelCaseName>({...}) and can edit a part's whole grid as a Uint8Array. \
 Every edit is undoable. If the voxely window is open, edits appear in it live. \
@@ -157,7 +164,7 @@ fn base_tools() -> Value {
             "top_scale": { "type": "number", "description": "cylinder/cone/frustum/pyramid: size of the +axis end relative to the base (cylinder 1, cone and pyramid 0, frustum 0.5); >1 widens" },
             "radius": { "type": "number", "description": "rounded_box: corner radius in voxels; torus: tube radius" },
             "up": { "type": "string", "enum": ["x", "y", "z"], "description": "wedge: the axis it's tall along (default z)" },
-            "rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees about the box center, applied x then y then z, e.g. a tilted cylinder or a leaning cone; the shape may extend past from/to" },
+            "rotation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] degrees about the box center, applied x then y then z, e.g. a tilted cylinder or a leaning cone; the shape may extend past from/to" },
             "hollow": { "type": "boolean", "description": "Only the outer shell" },
         }), &["shape", "from", "to", "color"]),
         tool("draw_line", "Draw a straight line of voxels between two points.", json!({
@@ -203,9 +210,12 @@ fn base_tools() -> Value {
         tool("set_material", "Set the render material of a palette color.", json!({
             "color": color_schema(),
             "type": { "type": "string", "enum": ["diffuse", "metal", "glass", "emit", "blend", "cloud"] },
-            "roughness": { "type": "number" }, "metallic": { "type": "number" }, "ior": { "type": "number", "description": "Index of refraction, e.g. 1.5" },
-            "transparency": { "type": "number" }, "emission": { "type": "number", "description": "Emit strength, e.g. 1-20" },
-            "density": { "type": "number", "description": "Cloud density" },
+            "roughness": { "type": "number", "minimum": 0, "maximum": 1, "description": "0 mirror-smooth, 1 matte; metal looks good at 0.2-0.5" },
+            "metallic": { "type": "number", "minimum": 0, "maximum": 1 },
+            "ior": { "type": "number", "minimum": 1, "maximum": 3, "description": "Index of refraction: water 1.33, glass 1.5, diamond 2.4" },
+            "transparency": { "type": "number", "minimum": 0, "maximum": 1, "description": "Glass: 0.7-0.95" },
+            "emission": { "type": "number", "minimum": 0, "description": "Emit strength: 1-3 soft glow, 5-20 lamps" },
+            "density": { "type": "number", "minimum": 0, "description": "Cloud density" },
         }), &["color"]),
         tool("select", "Change the selection, which limits fill/clear/run_shader/move_selection.", json!({
             "mode": { "type": "string", "enum": ["all", "none", "invert", "box", "color", "region"],
@@ -218,25 +228,30 @@ fn base_tools() -> Value {
         tool("redo", "Redo edits.", json!({ "steps": { "type": "integer" } }), &[]),
         tool("set_camera", "Aim the camera (used by screenshot, render and the window). Angles in degrees.", json!({
             "frame": { "type": "boolean", "description": "Reset to a three-quarter view of the whole canvas first" },
-            "yaw": { "type": "number", "description": "Orbit angle around z" },
-            "pitch": { "type": "number", "description": "Elevation, -89 to 89" },
-            "distance": { "type": "number" },
-            "target": { "type": "array", "items": { "type": "number" } },
+            "yaw": { "type": "number", "description": "Orbit angle around z in degrees; 35-45 gives a three-quarter view" },
+            "pitch": { "type": "number", "minimum": -89, "maximum": 89, "description": "Elevation in degrees; 25-35 shows the top and two sides" },
+            "distance": { "type": "number", "exclusiveMinimum": 0, "description": "From the target, in voxels" },
+            "target": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] world point to orbit around" },
             "projection": { "type": "string", "enum": ["perspective", "orthographic", "isometric", "stereographic", "panorama"] },
-            "fov": { "type": "number" },
+            "fov": { "type": "number", "minimum": 1, "maximum": 179, "description": "Field of view in degrees" },
         }), &[]),
         tool("set_render_settings", "Lighting, sky, film and display settings for render. Colors are \"#rrggbb\".", json!({
-            "sun_pitch": { "type": "number" }, "sun_yaw": { "type": "number" }, "sun_intensity": { "type": "number" },
-            "sun_area": { "type": "number" }, "sun_color": { "type": "string" },
+            "sun_pitch": { "type": "number", "minimum": -90, "maximum": 90, "description": "Sun elevation in degrees; 30-50 gives readable shadows" },
+            "sun_yaw": { "type": "number", "description": "Sun direction around z in degrees" },
+            "sun_intensity": { "type": "number", "minimum": 0 },
+            "sun_area": { "type": "number", "minimum": 0, "description": "Larger is softer shadows" },
+            "sun_color": { "type": "string" },
             "sky": { "type": "string", "enum": ["uniform", "atmosphere", "image"] },
-            "sky_intensity": { "type": "number" }, "sky_color": { "type": "string" },
-            "exposure": { "type": "number" }, "gamma": { "type": "number" }, "aces": { "type": "boolean" },
+            "sky_intensity": { "type": "number", "minimum": 0 }, "sky_color": { "type": "string" },
+            "exposure": { "type": "number", "description": "Brightness multiplier, 1 = neutral" },
+            "gamma": { "type": "number", "exclusiveMinimum": 0, "description": "Usually 2.2" },
+            "aces": { "type": "boolean", "description": "Filmic tone mapping" },
             "bloom": { "type": "boolean" }, "denoise": { "type": "boolean" },
-            "fog_density": { "type": "number" }, "fog_color": { "type": "string" },
+            "fog_density": { "type": "number", "minimum": 0 }, "fog_color": { "type": "string" },
             "ground": { "type": "boolean" }, "ground_color": { "type": "string" },
             "background": { "type": "string", "enum": ["sky", "color", "transparent"] }, "background_color": { "type": "string" },
             "edges": { "type": "boolean" }, "grid": { "type": "boolean" },
-            "aperture": { "type": "number", "description": "Depth of field, 0 = off" },
+            "aperture": { "type": "number", "minimum": 0, "description": "Depth of field, 0 = off" },
         }), &[]),
         tool("render", "Path-traced image from the current camera and render settings.", json!({
             "width": { "type": "integer" }, "height": { "type": "integer" },
@@ -275,19 +290,19 @@ fn base_tools() -> Value {
             "rotate_axis": axis,
             "quarter_turns": { "type": "integer", "description": "Counter-clockwise quarter turns about rotate_axis (negative for clockwise)" },
             "flip_axis": axis,
-            "free_rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees about the pivot, applied x then y then z; replaces any previous free rotation. [0, 0, 0] straightens." },
+            "free_rotation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] degrees about the pivot, applied x then y then z; replaces any previous free rotation. [0, 0, 0] straightens." },
             "attach_to": { "type": "string", "description": "\"part:socket\" (e.g. \"body:shoulder_r\") to snap onto a socket and attach, or \"part\" to attach where it is. Attached parts follow their parent's moves and turns (and nest in glTF exports)." },
             "link": { "type": "boolean", "description": "With attach_to: false only lines it up without attaching (default true)" },
             "attach_socket": { "type": "string", "description": "With attach_to: this part's own socket to line up (default: its pivot). It becomes the pivot if none was set, so later turns keep it attached." },
         }), &["part"]),
         tool("set_pivot", "Set the point a part or group turns about (and its origin in glTF exports), in the part's own coordinates (the ones the voxel tools use while editing it; world coordinates for groups). E.g. a shoulder for an arm, the hinge for a door.", json!({
             "part": { "type": ["string", "integer"] },
-            "pivot": { "type": ["array", "string"], "items": { "type": "number" }, "description": "[x, y, z], or \"center\" (default), or \"bottom\" (middle of the bottom face)" },
+            "pivot": { "type": ["array", "string"], "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z], or \"center\" (default), or \"bottom\" (middle of the bottom face)" },
         }), &["part", "pivot"]),
         tool("set_socket", "Add, move or remove a named attachment point (socket) on a part, in its own coordinates. Other parts attach to sockets with transform_part attach_to; glTF exports them as empty nodes engines can parent things to (hand, muzzle, seat ...).", json!({
             "part": { "type": ["string", "integer"] },
             "name": { "type": "string" },
-            "position": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z]; omit to remove the socket" },
+            "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] in the part's own coordinates; omit to remove the socket" },
         }), &["part", "name"]),
         tool("modify_part", "Rename, duplicate, delete, hide, show or ungroup a part or group.", json!({
             "part": { "type": ["string", "integer"] },
@@ -1507,7 +1522,23 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             }
             Ok(vec![text(format!("View: {}", if modeling { "model" } else { "render" }))])
         }
-        other => bail!("unknown tool {other:?}"),
+        other => {
+            let names = tools();
+            let close: Vec<&str> = names
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["name"].as_str())
+                .filter(|n| {
+                    let bare = |s: &str| s.replace(['_', '-', ' '], "").to_lowercase();
+                    bare(n).contains(&bare(other)) || bare(other).contains(&bare(n)) || other.split('_').any(|w| w.len() > 3 && n.contains(w))
+                })
+                .collect();
+            if close.is_empty() {
+                bail!("unknown tool {other:?}; see tools/list")
+            }
+            bail!("unknown tool {other:?}; did you mean {}?", close.join(", "))
+        }
     }
 }
 

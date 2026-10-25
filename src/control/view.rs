@@ -11,9 +11,6 @@ use crate::scene::Projection;
 mod draw;
 use draw::{BLUE, Canvas, GREEN, RED, Rgb, WHITE, text_size};
 
-#[derive(Default)]
-pub struct State {}
-
 pub const PART_TOOLS: &[&str] = &[];
 
 pub fn tools() -> Vec<Value> {

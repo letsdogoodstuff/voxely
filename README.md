@@ -75,14 +75,18 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
 | Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup, detach), `group_parts` |
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
-| Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid), `draw_line` |
-| Reading | `get_voxels`, `get_slice` (a text map of one layer) |
+| Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid, frustum, torus, capsule, rounded_box, wedge; any `rotation`), `draw_line`, `draw_tube` (curves with tapering radius), `extrude_polygon`, `set_symmetry` (mirror every edit) |
+| Stamps | `save_stamp`, `list_stamps`, `place_stamp`, `delete_stamp` (reusable pieces saved in `<workspace>/stamps`) |
+| Surface | `vary_colors` (noise/dither color variation), `shade_edges` (edge darkening, highlights, cavity AO), `paint_faces` (snow on top, moss on north faces …), `voxelize_image` |
+| Reading | `get_voxels`, `get_slice` (text maps of one or more layers), `get_projection` (color/height map seen along an axis) |
+| Safety | `checkpoint` / `restore` (whole-scene snapshots), `set_autosave` (default: every 25 edits) |
+| Guidance | `get_guide` (voxel-art craft notes by topic); MCP prompts `build_character`, `build_prop`, `build_environment`, `review_model` |
 | Model tools | `edit_model` (MagicaVoxel's Edit panel: fill, hull, mirror, rotate, …), `transform_model` (scale/shear/rotate/repeat) |
 | Shaders | `list_shaders`, `run_shader` (MagicaVoxel voxel shaders, or inline GLSL) |
-| Color | `get_palette`, `set_palette_colors`, `load_palette`, `set_material` (metal, glass, emit, …) |
+| Color | `get_palette`, `set_palette_colors`, `load_palette`, `list_palette_presets`, `apply_palette_preset` (PICO-8, DawnBringer, Endesga …), `set_material` (metal, glass, emit, …) |
 | Selection | `select`, `move_selection` |
 | History | `undo`, `redo` |
-| Viewing | `set_camera`, `screenshot` (fast modeler image), `set_render_settings`, `render` (path traced), `set_view_mode` |
+| Viewing | `set_camera`, `screenshot` (fast modeler image; `views: "quad"` for front/side/top/3-4 with rulers and gizmo, `highlight_last_edit`), `set_render_settings`, `render` (path traced), `set_view_mode` |
 | Export | `export`: **gltf** (`.glb` for game engines), plus MagicaVoxel's formats: obj, ply, mc, cube (meshes), xraw, slab, qb, vox (volumes), iso, 2d, slice (sprite images), point (point cloud) |
 | Scripting | `run_script`: a JavaScript program instead of many tool calls (see [Scripting](#scripting)) |
 
@@ -92,7 +96,9 @@ Conventions:
   coordinates of the part's minimum corner.
 - Colors are palette indices 1–255, or `"#rrggbb"`, which picks the nearest palette color.
   Use `set_palette_colors` for exact colors.
-- `screenshot` and `render` return PNG images that the agent can see.
+- `screenshot` and `render` return PNG images that the agent can see; `screenshot` also returns a short scene summary.
+- Edit tools report what changed (added/removed/recolored, bounds), warn when a shape was clipped by
+  the canvas, and say when symmetry mirrored the edit.
 
 ## Parts and the World view
 

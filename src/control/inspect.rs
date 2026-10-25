@@ -213,6 +213,7 @@ pub(super) fn report(ctx: &Ctx, changed: bool, what: &str, why: Option<String>, 
         match ctx.ed.tools.last_edit.as_ref().filter(|_| fresh) {
             Some(e) if e.resized => s.push_str(": canvas resized"),
             Some(e) => {
+                s.push_str(&super::build::mirrored_note(ctx));
                 s.push_str(&format!(": +{} -{} voxels, {} recolored", thousands(e.added), thousands(e.removed), thousands(e.recolored)));
                 if let Some((lo, hi)) = e.bounds {
                     s.push_str(&format!("; changed {:?}..{:?}", arr(lo), arr(hi)));
