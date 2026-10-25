@@ -1850,7 +1850,13 @@ struct Mouse {
     /// Fractional brush-size change from Ctrl+Alt+drag.
     size_drag: f32,
     pos: Option<(f64, f64)>,
+    /// Held camera keys W S A D Q E, and when the camera last moved.
+    fly: [bool; 6],
+    flown: Option<std::time::Instant>,
 }
+
+/// The camera keys, in `Mouse::fly` order.
+const FLY_KEYS: [&str; 6] = ["w", "s", "a", "d", "q", "e"];
 
 /// Events sent to the window from other threads.
 pub enum UserEvent {
@@ -2183,9 +2189,6 @@ impl App {
         let Some(g) = self.gfx.as_mut() else { return };
         let ed = &mut self.edit.editor;
         let r = &mut g.renderer;
-        let step = self.scene.volume.dims.max_element() as f32 * 0.05;
-        let (fwd, right, _) = r.camera.basis();
-        let flat = Vec3::new(fwd.x, fwd.y, 0.0).normalize_or_zero();
         let mut command = None;
         match event.logical_key.as_ref() {
             Key::Named(NamedKey::Delete | NamedKey::Backspace) => command = Some(Command::Op(Op::Clear)),
@@ -2240,13 +2243,14 @@ impl App {
                         r.camera = cam;
                     }
                 }
-                // Camera movement.
-                "w" => r.camera.target += flat * step,
-                "s" => r.camera.target -= flat * step,
-                "a" => r.camera.target -= right * step,
-                "d" => r.camera.target += right * step,
-                "q" => r.camera.target.z -= step,
-                "e" => r.camera.target.z += step,
+                // Camera movement, while held (see `fly`).
+                k if FLY_KEYS.contains(&k) => {
+                    let i = FLY_KEYS.iter().position(|&f| f == k).unwrap();
+                    if !self.mouse.fly[i] {
+                        self.mouse.fly[i] = true;
+                        self.mouse.flown = Some(std::time::Instant::now());
+                    }
+                }
                 "z" => self.mouse.zoom = true,
                 "x" => self.mouse.focus = true,
                 _ => return,
@@ -2266,8 +2270,39 @@ impl App {
             Key::Named(NamedKey::Space) => self.mouse.space = false,
             Key::Character(c) if c.eq_ignore_ascii_case("z") => self.mouse.zoom = false,
             Key::Character(c) if c.eq_ignore_ascii_case("x") => self.mouse.focus = false,
+            Key::Character(c) => {
+                let c = c.to_ascii_lowercase();
+                if let Some(i) = FLY_KEYS.iter().position(|&f| f == c) {
+                    self.mouse.fly[i] = false;
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Move the camera while W/A/S/D/Q/E are held, like MagicaVoxel: about
+    /// half the view distance a second. The free camera flies where it
+    /// looks; the orbit camera slides its target along the ground. Q/E go
+    /// down/up.
+    fn fly(&mut self) {
+        let Some(last) = self.mouse.flown else { return };
+        let f = self.mouse.fly;
+        if !f.contains(&true) {
+            self.mouse.flown = None;
+            return;
+        }
+        let Some(g) = self.gfx.as_mut() else { return };
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(last).as_secs_f32().min(0.1);
+        self.mouse.flown = Some(now);
+        let cam = &mut g.renderer.camera;
+        let (fwd, right, _) = cam.basis();
+        let ahead = if self.edit.free_look { fwd } else { Vec3::new(fwd.x, fwd.y, 0.0).normalize_or_zero() };
+        let axis = |pos: bool, neg: bool| pos as i32 as f32 - neg as i32 as f32;
+        let dir = ahead * axis(f[0], f[1]) + right * axis(f[3], f[2]) + Vec3::Z * axis(f[5], f[4]);
+        cam.target += dir.normalize_or_zero() * cam.dist.max(8.0) * 0.5 * dt;
+        g.renderer.reset();
+        g.window.request_redraw();
     }
 
     fn camera_slot(&mut self, slot: usize, store: bool) {
@@ -2320,8 +2355,8 @@ impl App {
             let eye = cam.eye();
             if self.edit.free_look {
                 // Look around from where the camera is.
-                cam.yaw -= dx * 0.003;
-                cam.pitch = (cam.pitch + dy * 0.003).clamp(-1.55, 1.55);
+                cam.yaw -= dx * 0.006;
+                cam.pitch = (cam.pitch + dy * 0.006).clamp(-1.55, 1.55);
                 cam.target = eye - (cam.eye() - cam.target);
             } else {
                 cam.yaw -= dx * 0.005;
@@ -2490,6 +2525,7 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        self.fly();
         if let Some(f) = self.edit.timeline.tick(&self.scene) {
             self.command(Command::Frame(f));
         }
@@ -2599,6 +2635,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Let go of held camera keys even when the panels take the key, or
+        // the camera would keep flying.
+        match &event {
+            WindowEvent::KeyboardInput { event: e, .. } if e.state == ElementState::Released => self.key_released(&e.logical_key),
+            WindowEvent::Focused(false) => self.mouse.fly = [false; 6],
+            _ => {}
+        }
         if let Some(g) = self.gfx.as_mut() {
             let resp = g.egui_state.on_window_event(&g.window, &event);
             if resp.repaint {
