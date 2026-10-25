@@ -121,7 +121,7 @@ pub fn tools() -> Vec<Value> {
         tool("checkpoint", "Save a named in-memory snapshot of the whole scene (every part and group, palette and materials) before trying something risky; restore returns to it in one step. Without `name`, lists checkpoints. Reusing a name replaces it; the newest 16 are kept until voxely exits (they aren't saved to disk).", json!({
             "name": { "type": "string" },
         }), &[]),
-        tool("restore", "Return the whole scene to a checkpoint. Undo reverts a restore's part and voxel changes, but not the palette and materials it brought back.", json!({
+        tool("restore", "Return the whole scene to a checkpoint. Undo reverts it, palette and materials included.", json!({
             "name": { "type": "string", "description": "A checkpoint name (checkpoint without a name lists them)" },
         }), &["name"]),
         tool("set_autosave", "Autosave saves the project (as save_file without a path does) after every `every` voxel edits, and before open_project/open_file/new_project/new_scene replace a scene with unsaved edits. On by default, every 25 edits. Edit reports show the unsaved count once it reaches 10.", json!({
@@ -756,13 +756,14 @@ fn checkpoint(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
 /// Put a checkpoint's scene in place (the tree change is one undo step).
 fn put_back(ctx: &mut Ctx, cp: Checkpoint) {
     let scene = &mut *ctx.scene;
+    let before = scene.palette_state();
     scene.change(|w| *w = cp.world);
     scene.palette = cp.palette;
     scene.materials = cp.materials;
     scene.notes = cp.notes;
-    // Palette undo steps and remembered colors are about the replaced palette.
-    ctx.ed.palette.history.clear();
-    ctx.ed.palette.look = vec![None; 256];
+    // Remembered colors are about the replaced palette.
+    scene.look = vec![None; 256];
+    scene.palette_step(before);
     scene.render_dicts = cp.render_dicts;
     ctx.ed.source = cp.source;
     ctx.ed.save_path = cp.save_path;
@@ -791,7 +792,7 @@ fn restore(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     if other {
         msg.push_str(&format!("; it came from another project, so saving now goes to {}", ctx.ed.save_path.display()));
     }
-    msg.push_str(". undo reverts the parts and voxels (not the palette and materials).");
+    msg.push_str(". undo reverts it, palette included.");
     msg.push_str(&tail(ctx));
     Ok(vec![text(msg)])
 }

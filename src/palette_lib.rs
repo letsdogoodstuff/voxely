@@ -1,17 +1,18 @@
 //! Palette-wide edits and the palette library: swapping, moving, copying
 //! and blending swatches, sorting and packing, loading palettes (with an
 //! option to match colors so the model keeps its look), saving them,
-//! previewing one before it is applied, and a palette undo.
+//! previewing one before it is applied. Each edit is a step of the normal
+//! undo history.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use crate::app::{EditState, workspace_dir};
-use crate::edit::SelMode;
+use crate::edit::{Editor, SelMode};
 use crate::gpu::Renderer;
 use crate::palette_ops::{self as ops, SortKey};
-use crate::scene::{GpuMaterial, Mode, Scene, Volume};
+use crate::scene::{Mode, Scene, Volume};
 
 /// Where a palette comes from.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,86 +71,6 @@ pub fn list_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The palette, materials and ramp names before a palette edit. Edits
-/// that move colors to new indices keep the order they used, so undoing
-/// can move the voxels back.
-pub struct Snap {
-    palette: Vec<[u8; 4]>,
-    materials: Vec<GpuMaterial>,
-    notes: Vec<String>,
-    /// The remembered original colors (`PaletteState::look`).
-    look: Vec<Option<[u8; 4]>>,
-    /// New index -> old index of the edit, if it moved colors.
-    order: Option<Vec<usize>>,
-    /// Pack: per volume (and its size then), the voxels whose duplicate
-    /// color it merged into another, as (cell, own color, merged-into
-    /// color) in old indices.
-    unmerge: Vec<(Held, glam::IVec3, Vec<(usize, u8, u8)>)>,
-}
-
-/// A volume of voxels in the scene: the edited one (or World mode's
-/// flattened view), the others shown around it, a part, or a part's
-/// flipbook drawing.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Held {
-    Volume,
-    Context,
-    Model(usize),
-    Drawing(usize, usize),
-}
-
-/// The voxels a pack's `order` / `remap` merges into another color (see
-/// `Snap::unmerge`).
-fn merges(scene: &mut Scene, order: &[usize], remap: &[u8; 256]) -> Vec<(Held, glam::IVec3, Vec<(usize, u8, u8)>)> {
-    let mut out = Vec::new();
-    each_volume(scene, |at, v| {
-        let cells: Vec<(usize, u8, u8)> = v.cells.filled().map(|(i, c)| (i, c, order[remap[c as usize] as usize] as u8)).filter(|&(_, c, into)| c != into).collect();
-        if !cells.is_empty() {
-            out.push((at, v.dims, cells));
-        }
-    });
-    out
-}
-
-/// Undoing a pack (colors back at their old indices): split merged
-/// duplicates again where nothing repainted them since.
-fn split(scene: &mut Scene, unmerge: &[(Held, glam::IVec3, Vec<(usize, u8, u8)>)]) {
-    let held: std::collections::HashMap<Held, (glam::IVec3, &Vec<(usize, u8, u8)>)> = unmerge.iter().map(|(at, d, cells)| (*at, (*d, cells))).collect();
-    each_volume(scene, |at, v| {
-        let Some(&(_, cells)) = held.get(&at).filter(|h| h.0 == v.dims) else { return };
-        for &(i, own, into) in cells {
-            if v.cells[i] == into {
-                v.set_index(i, own);
-            }
-        }
-    });
-}
-
-/// Every volume holding voxels, for `f`.
-fn each_volume(scene: &mut Scene, mut f: impl FnMut(Held, &mut Volume)) {
-    f(Held::Volume, &mut scene.volume);
-    if let Some((ctx, _)) = &mut scene.context {
-        f(Held::Context, ctx);
-    }
-    for (id, n) in scene.world.nodes.iter_mut().enumerate() {
-        let Some(n) = n else { continue };
-        if let crate::world::Kind::Model(v) = &mut n.kind {
-            f(Held::Model(id), v);
-        }
-        for (k, slot) in n.flip.iter_mut().enumerate() {
-            if let Some(v) = &mut slot.volume {
-                f(Held::Drawing(id, k), v);
-            }
-        }
-    }
-}
-
-const HISTORY: usize = 64;
-
-pub fn snapshot(scene: &Scene, look: &[Option<[u8; 4]>]) -> Snap {
-    Snap { palette: scene.palette.clone(), materials: scene.materials.clone(), notes: scene.notes.clone(), look: look.to_vec(), order: None, unmerge: Vec::new() }
-}
-
 /// Stop remembering the original colors of `slots` (their colors were
 /// edited by hand).
 pub fn forget(look: &mut [Option<[u8; 4]>], slots: impl IntoIterator<Item = usize>) {
@@ -160,12 +81,30 @@ pub fn forget(look: &mut [Option<[u8; 4]>], slots: impl IntoIterator<Item = usiz
     }
 }
 
-/// Remember the palette before an edit (for `Cmd::Undo`).
-pub fn push(h: &mut Vec<Snap>, snap: Snap) {
-    h.push(snap);
-    if h.len() > HISTORY {
-        h.remove(0);
+/// Start a palette edit as its own undo step, after the voxel edits so
+/// far (which stay steps of their own); `Scene::palette_step_update`
+/// finishes it.
+pub fn begin_step(scene: &mut Scene, editor: &mut Editor) {
+    crate::app::keep_history(scene, editor);
+    let before = scene.palette_state();
+    scene.begin_change();
+    scene.palette_step(before);
+}
+
+/// For a GUI drag that edits colors over many frames: begin its undo step,
+/// unless the drag goes on (`fresh` is false) and the step begun at `mark`
+/// is still the latest change.
+pub fn drag_step(scene: &mut Scene, editor: &mut Editor, mark: &mut Option<(u64, usize)>, fresh: bool) {
+    let open = !fresh && *mark == Some(scene.history_mark()) && !editor.can_undo() && !editor.can_redo();
+    if !open {
+        begin_step(scene, editor);
+        *mark = Some(scene.history_mark());
     }
+}
+
+/// Whether the next undo step is a palette edit (for `Cmd::Undo`).
+pub fn can_undo(scene: &Scene, editor: &Editor) -> bool {
+    !(scene.editing().is_some() && editor.can_undo()) && scene.undoes_palette()
 }
 
 /// A palette-wide edit.
@@ -196,6 +135,8 @@ pub enum Cmd {
     SelectVoxels(usize, SelMode),
     /// Delete the voxels of a color from the part being edited.
     RemoveVoxels(usize),
+    /// Undo the last change if it was a palette edit (palette edits are
+    /// steps of the normal undo history).
     Undo,
 }
 
@@ -218,22 +159,24 @@ pub fn apply(cmd: Cmd, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) 
         }
         Cmd::Copy(a, b) => {
             let (a, b) = (slot(a)?, slot(b)?);
-            push(&mut ed.palette.history, snapshot(scene, &ed.palette.look));
-            ed.palette.look[b] = ed.palette.look[a];
+            begin_step(scene, &mut ed.editor);
+            scene.look[b] = scene.look[a];
             scene.palette[b] = scene.palette[a];
             scene.materials[b] = scene.materials[a];
             upload(r, scene);
+            scene.palette_step_update(None);
             (format!("Copied color {a} onto {b}"), false)
         }
         Cmd::Gradient(a, b) => {
             let (a, b) = (slot(a)?, slot(b)?);
-            push(&mut ed.palette.history, snapshot(scene, &ed.palette.look));
-            forget(&mut ed.palette.look, a.min(b) + 1..a.max(b));
+            begin_step(scene, &mut ed.editor);
+            forget(&mut scene.look, a.min(b) + 1..a.max(b));
             ops::gradient(&mut scene.palette, a, b);
             for i in a.min(b) + 1..a.max(b) {
                 scene.sync_color(i);
             }
             upload(r, scene);
+            scene.palette_step_update(None);
             (format!("Blended colors {}-{}", a.min(b), a.max(b)), false)
         }
         Cmd::Sort(key) => {
@@ -249,19 +192,14 @@ pub fn apply(cmd: Cmd, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) 
             let n = used.iter().filter(|&&u| u).count();
             let kept = order.iter().skip(1).take_while(|&&i| used[i]).count();
             let merged = n - kept;
-            // Remember the merged voxels' own colors, for undo.
-            let unmerge = if merged > 0 { merges(scene, &order, &remap) } else { Vec::new() };
             reorder(r, scene, ed, order, Some(remap));
-            if let Some(s) = ed.palette.history.last_mut() {
-                s.unmerge = unmerge;
-            }
             (format!("Packed {kept} used colors into 1-{kept}{}", if merged > 0 { format!(", merged {merged} duplicates") } else { String::new() }), true)
         }
         Cmd::Load(src, matched) => {
             let colors = src.colors()?;
             let n = colors.len();
+            begin_step(scene, &mut ed.editor);
             if matched {
-                let mut snap = snapshot(scene, &ed.palette.look);
                 // Move the model's colors out of 1..=n (when there's room)
                 // so the new palette shows there whole; nothing merges.
                 let used = scene.used_colors();
@@ -270,13 +208,13 @@ pub fn apply(cmd: Cmd, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) 
                 if let Some(order) = &order {
                     scene.palette = ops::permute(&scene.palette, order);
                     scene.materials = ops::permute(&scene.materials, order);
-                    ed.palette.look = ops::permute(&ed.palette.look, order);
+                    scene.look = ops::permute(&scene.look, order);
                     remap_voxels(scene, ed, &ops::remap_from_order(order));
                 }
                 let used = scene.used_colors();
-                let new = matched_palette(&scene.palette, &ed.palette.look, &used, &colors);
+                let new = matched_palette(&scene.palette, &scene.look, &used, &colors);
                 for c in 1..256 {
-                    let look = &mut ed.palette.look[c];
+                    let look = &mut scene.look[c];
                     *look = if used[c] { Some(look.unwrap_or(scene.palette[c])) } else { None };
                 }
                 scene.palette = new;
@@ -284,17 +222,16 @@ pub fn apply(cmd: Cmd, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) 
                     scene.sync_color(c);
                 }
                 upload(r, scene);
-                snap.order = order;
-                push(&mut ed.palette.history, snap);
+                scene.palette_step_update(order.as_deref().map(remaps));
                 (format!("Loaded {} ({n} colors); the model's colors matched to it", src.name()), moved)
             } else {
-                push(&mut ed.palette.history, snapshot(scene, &ed.palette.look));
-                forget(&mut ed.palette.look, 1..=n);
+                forget(&mut scene.look, 1..=n);
                 scene.palette = loaded(&scene.palette, &colors);
                 for i in 1..=n {
                     scene.sync_color(i);
                 }
                 upload(r, scene);
+                scene.palette_step_update(None);
                 (format!("Loaded {} into colors 1-{n}", src.name()), false)
             }
         }
@@ -324,19 +261,9 @@ pub fn apply(cmd: Cmd, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) 
             (format!("Removed {n} voxels of color {i}"), ed.editor.commit(&mut scene.volume, new))
         }
         Cmd::Undo => {
-            let Some(s) = ed.palette.history.pop() else { bail!("no palette change to undo") };
-            let moved = s.order.is_some();
-            if let Some(order) = &s.order {
-                let back: [u8; 256] = std::array::from_fn(|k| order.get(k).copied().unwrap_or(k) as u8);
-                remap_voxels(scene, ed, &back);
-            }
-            split(scene, &s.unmerge);
-            scene.palette = s.palette;
-            scene.materials = s.materials;
-            scene.notes = s.notes;
-            ed.palette.look = s.look;
-            upload(r, scene);
-            ("Undid palette change".to_string(), moved)
+            ensure!(can_undo(scene, &ed.editor), "the last change isn't a palette edit; palette edits are steps of the normal undo, so use undo");
+            crate::app::history_step(scene, ed, false);
+            ("Undid palette change".to_string(), true)
         }
     };
     Ok(out)
@@ -387,21 +314,38 @@ pub fn matched_palette(palette: &[[u8; 4]], look: &[Option<[u8; 4]>], used: &[bo
 /// the voxels, history, selection and recent colors with them. `remap`
 /// overrides the voxel remap (for packing, which merges duplicates).
 fn reorder(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState, order: Vec<usize>, remap: Option<[u8; 256]>) {
-    let remap = remap.unwrap_or_else(|| ops::remap_from_order(&order));
-    let mut snap = snapshot(scene, &ed.palette.look);
-    scene.palette = ops::permute(&scene.palette, &order);
-    scene.materials = ops::permute(&scene.materials, &order);
-    ed.palette.look = ops::permute(&ed.palette.look, &order);
-    remap_voxels(scene, ed, &remap);
+    reorder_scene(scene, ed, order, remap);
     upload(r, scene);
-    snap.order = Some(order);
-    push(&mut ed.palette.history, snap);
 }
 
-/// Recolor every voxel (and the undo history, brush color, swatch
-/// selection and recent colors) through `remap`.
+/// `reorder` without the GPU upload.
+fn reorder_scene(scene: &mut Scene, ed: &mut EditState, order: Vec<usize>, remap: Option<[u8; 256]>) {
+    let [fwd, back] = remaps(&order);
+    let remap = remap.unwrap_or(fwd);
+    begin_step(scene, &mut ed.editor);
+    scene.palette = ops::permute(&scene.palette, &order);
+    scene.materials = ops::permute(&scene.materials, &order);
+    scene.look = ops::permute(&scene.look, &order);
+    remap_voxels(scene, ed, &remap);
+    scene.palette_step_update(Some([remap, back]));
+}
+
+/// The color remaps of `order` (new index -> old index): old to new, and
+/// new back to old.
+fn remaps(order: &[usize]) -> [[u8; 256]; 2] {
+    [ops::remap_from_order(order), std::array::from_fn(|k| order.get(k).copied().unwrap_or(k) as u8)]
+}
+
+/// Recolor every voxel (and the brush color, swatch selection and recent
+/// colors) through `remap`.
 fn remap_voxels(scene: &mut Scene, ed: &mut EditState, remap: &[u8; 256]) {
     scene.remap(remap);
+    remap_tools(ed, remap);
+}
+
+/// Recolor the voxel editor's brush color, clipboard and history, the
+/// swatch selection and recent colors through `remap`.
+pub fn remap_tools(ed: &mut EditState, remap: &[u8; 256]) {
     ed.editor.remap_colors(remap);
     ed.tools.surface.remap_colors(remap);
     let p = &mut ed.palette;
@@ -447,7 +391,7 @@ pub fn sync_preview(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState, for
     p.previewing = key;
     match want.and_then(|(k, m, s)| p.cache_colors(&k, &s).map(|c| (c, m))) {
         Some((colors, matched)) => {
-            let pal = preview_palette(scene, &p.look, &colors, matched);
+            let pal = preview_palette(scene, &scene.look, &colors, matched);
             let mut mats = scene.materials.clone();
             for (i, m) in mats.iter_mut().enumerate().skip(1) {
                 let c = crate::scene::material(i as u32, pal[i], None).color;
@@ -502,10 +446,11 @@ pub fn strip(ui: &mut egui::Ui, colors: &[[u8; 4]], size: egui::Vec2) -> egui::R
 
 /// The Palettes window: favorites, saved palettes, MagicaVoxel's and the
 /// presets. Hover one to see it on the model; click to load it.
-pub fn window(ctx: &egui::Context, ed: &mut EditState, cmds: &mut Vec<crate::ui::Command>) {
+pub fn window(ctx: &egui::Context, scene: &Scene, ed: &mut EditState, cmds: &mut Vec<crate::ui::Command>) {
     if !ed.palette.library_open {
         return;
     }
+    let undo_ok = can_undo(scene, &ed.editor);
     if ed.palette.saved_scanned.is_none_or(|t| t.elapsed().as_secs() > 2) {
         ed.palette.saved = list_files(&saved_dir());
         ed.palette.saved_scanned = Some(std::time::Instant::now());
@@ -522,7 +467,7 @@ pub fn window(ctx: &egui::Context, ed: &mut EditState, cmds: &mut Vec<crate::ui:
             if ui.button("Load file…").on_hover_text("PNG (MagicaVoxel or Lospec), .act, .gpl or .hex; or drop one on the window").clicked() {
                 cmds.push(crate::ui::Command::PalettePick(p.match_colors));
             }
-            if ui.add_enabled(!p.history.is_empty(), egui::Button::new("Undo")).on_hover_text("Undo the last palette change").clicked() {
+            if ui.add_enabled(undo_ok, egui::Button::new("Undo")).on_hover_text("Undo the last palette change").clicked() {
                 cmds.push(crate::ui::Command::Palette(Cmd::Undo));
             }
         });
@@ -621,29 +566,45 @@ pub fn handle_drops(ctx: &egui::Context, ed: &EditState, cmds: &mut Vec<crate::u
 mod tests {
     use super::*;
 
+    fn set(scene: &mut Scene, ed: &mut EditState, p: glam::IVec3, c: u8) {
+        let mut new = scene.volume.clone();
+        new.set(p, c);
+        assert!(ed.editor.commit(&mut scene.volume, new));
+    }
+
     #[test]
-    fn undoing_a_pack_splits_merged_duplicates() {
+    fn a_pack_is_an_undo_step_in_order_with_voxel_edits() {
         let mut scene = Scene::empty(glam::IVec3::splat(4));
+        let mut ed = EditState::new(1, None, PathBuf::from("x.vox"));
         // Colors 5 and 9 are the same; pack merges 9 into 5.
         scene.palette[9] = scene.palette[5];
         scene.sync_color(9);
-        scene.volume.set(glam::IVec3::ZERO, 5);
-        scene.volume.set(glam::IVec3::X, 9);
-        scene.volume.set(glam::IVec3::Y, 9);
+        set(&mut scene, &mut ed, glam::IVec3::ZERO, 5);
+        set(&mut scene, &mut ed, glam::IVec3::X, 200);
+        set(&mut scene, &mut ed, glam::IVec3::Y, 9);
+        let before = (scene.volume.filled_sorted(), scene.palette.clone());
+        ed.editor.color = 200;
         let keys: Vec<([u8; 4], &[u8])> = scene.palette.iter().zip(&scene.materials).map(|(c, m)| (*c, bytemuck::bytes_of(m))).collect();
         let (order, remap) = ops::compact(&keys, &scene.used_colors());
-        let unmerge = merges(&mut scene, &order, &remap);
-        scene.remap(&remap);
-        let packed: Vec<u8> = scene.volume.filled().map(|(_, c)| c).collect();
-        assert_eq!(packed, vec![1, 1, 1]);
-        // Undo: colors back at their old indices, then the split. A voxel
-        // repainted since stays as it is.
-        let back: [u8; 256] = std::array::from_fn(|k| order.get(k).copied().unwrap_or(k) as u8);
-        scene.remap(&back);
-        scene.volume.set(glam::IVec3::Y, 7);
-        split(&mut scene, &unmerge);
-        let get = |p: glam::IVec3| scene.volume.get(p);
-        assert_eq!((get(glam::IVec3::ZERO), get(glam::IVec3::X), get(glam::IVec3::Y)), (5, 9, 7));
+        reorder_scene(&mut scene, &mut ed, order, Some(remap));
+        let packed = (scene.volume.filled_sorted(), scene.palette.clone());
+        assert_eq!(packed.0.iter().map(|v| v.1).collect::<Vec<_>>(), vec![1, 2, 1]);
+        assert_eq!(ed.editor.color, 2, "the brush follows its color");
+        assert!(can_undo(&scene, &ed.editor));
+        // Undo takes back the pack (merged duplicates split again), then
+        // the voxel edits one at a time.
+        assert!(crate::app::history_step(&mut scene, &mut ed, false));
+        assert_eq!((scene.volume.filled_sorted(), scene.palette.clone()), before);
+        assert_eq!(ed.editor.color, 200);
+        assert!(!can_undo(&scene, &ed.editor), "the next undo is a voxel edit");
+        assert!(crate::app::history_step(&mut scene, &mut ed, false));
+        assert_eq!(scene.volume.count(), 2);
+        // Redo brings both back, in order.
+        assert!(crate::app::history_step(&mut scene, &mut ed, true));
+        assert_eq!(scene.volume.filled_sorted(), before.0);
+        assert!(crate::app::history_step(&mut scene, &mut ed, true));
+        assert_eq!((scene.volume.filled_sorted(), scene.palette.clone()), packed);
+        assert!(!crate::app::history_step(&mut scene, &mut ed, true));
     }
 
     /// Load `colors` the way `Cmd::Load(_, true)` does, without moving

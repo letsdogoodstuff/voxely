@@ -212,7 +212,7 @@ fn base_tools() -> Value {
             "preset": { "type": "string", "description": "A name from list_palette_presets" },
             "match": { "type": "boolean", "description": "Recolor the model to the nearest new colors, reversibly (default false)" },
         }), &[]),
-        tool("edit_palette", "Rearrange or tidy the palette. swap / move (from, to): colors change places and voxels follow, so the model looks the same; copy (from, to): copy a color and its material onto another slot; gradient (from, to): blend the slots between two colors evenly; sort (by: hue | saturation | value): used colors first; pack: used colors into 1.. with duplicates merged; save (name): save the palette to the workspace's palettes folder; name_ramp (row, name): name a row of 8 colors (row k holds 8k+1..8k+8; saved in the .vox); undo: undo the last palette edit.", json!({
+        tool("edit_palette", "Rearrange or tidy the palette. swap / move (from, to): colors change places and voxels follow, so the model looks the same; copy (from, to): copy a color and its material onto another slot; gradient (from, to): blend the slots between two colors evenly; sort (by: hue | saturation | value): used colors first; pack: used colors into 1.. with duplicates merged; save (name): save the palette to the workspace's palettes folder; name_ramp (row, name): name a row of 8 colors (row k holds 8k+1..8k+8; saved in the .vox); undo: undo the last change if it is a palette edit. Palette edits are steps of the normal undo too.", json!({
             "action": { "type": "string", "enum": ["swap", "move", "copy", "gradient", "sort", "pack", "save", "name_ramp", "undo"] },
             "from": { "type": "integer", "minimum": 1, "maximum": 255 }, "to": { "type": "integer", "minimum": 1, "maximum": 255 },
             "by": { "type": "string", "enum": ["hue", "saturation", "value"] },
@@ -269,9 +269,9 @@ fn base_tools() -> Value {
             views path traces several auto-framed views tiled side by side with labels, same lighting: \"turnaround\" (front, right, back, left), \
             \"quad\", \"all\", or a list of front, back, left, right, top, bottom, iso, 3/4. Named views are orthographic except 3/4 unless projection says otherwise. \
             Neither changes the window's camera; the result lists the cameras used.", json!({
-            "width": { "type": "integer", "description": "Whole image width (default 960; with views 480 per tile)" },
-            "height": { "type": "integer", "description": "Whole image height (default 640; with views 600 per tile)" },
-            "samples": { "type": "integer", "description": "Samples per pixel (default 128; more is smoother and slower)" },
+            "width": { "type": "integer", "minimum": 16, "maximum": 8192, "description": "Whole image width (default 960; with views 480 per tile, at least 16 per tile)" },
+            "height": { "type": "integer", "minimum": 16, "maximum": 8192, "description": "Whole image height (default 640; with views 600 per tile, at least 16 per tile)" },
+            "samples": { "type": "integer", "minimum": 1, "maximum": 65536, "description": "Samples per pixel (default 128; more is smoother and slower)" },
             "frame": { "type": "boolean", "description": "Fit the camera to the whole scene from its current angle" },
             "views": { "type": ["string", "array"], "items": { "type": "string" }, "description": "\"turnaround\", \"quad\", \"all\", a view name, or a list of view names" },
             "projection": { "type": "string", "enum": ["orthographic", "perspective"], "description": "For frame/views (default: each view's own; frame keeps the current projection)" },
@@ -316,8 +316,8 @@ fn base_tools() -> Value {
             "attach_socket": { "type": "string", "description": "With attach_to: this part's own socket to line up (default: its pivot). It becomes the pivot if none was set, so later turns keep it attached." },
         }), &["part"]),
         tool("set_animation", "Set up the animation timeline. Frames are numbered from 0. With more than one frame, moving or turning a part (transform_part, or set_keyframe) records a keyframe on the current frame; the first key off frame 0 also keys frame 0 with where the part was. Attached parts follow their parent, so animate joints from the root down.", json!({
-            "frames": { "type": "integer", "description": "Number of frames, e.g. 24" },
-            "fps": { "type": "number", "description": "Playback speed, e.g. 12" },
+            "frames": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Number of frames, e.g. 24" },
+            "fps": { "type": "number", "minimum": 0.5, "maximum": 120, "description": "Playback speed, e.g. 12" },
             "loop": { "type": "boolean", "description": "Loop playback; with smooth keys the last key blends back into the first" },
             "smooth": { "type": "boolean", "description": "Blend between keys (default) or hold each key until the next, like MagicaVoxel" },
         }), &[]),
@@ -351,10 +351,10 @@ fn base_tools() -> Value {
             "from_frame": { "type": "integer", "description": "Start from this frame (default: where it is)" },
         }), &[]),
         tool("frame_strip", "See the motion: modeler images of several frames side by side in one picture, left to right then top to bottom, from the current camera.", json!({
-            "frames": { "type": "array", "items": { "type": "integer" }, "description": "Which frames (default: up to 12 spread over the animation)" },
-            "width": { "type": "integer", "description": "Each frame's width (default 240)" },
-            "height": { "type": "integer", "description": "Each frame's height (default 240)" },
-            "columns": { "type": "integer", "description": "Frames per row (default 6)" },
+            "frames": { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1, "maxItems": 64, "description": "Which frames (default: up to 12 spread over the animation)" },
+            "width": { "type": "integer", "minimum": 32, "maximum": 1024, "description": "Each frame's width (default 240)" },
+            "height": { "type": "integer", "minimum": 32, "maximum": 1024, "description": "Each frame's height (default 240)" },
+            "columns": { "type": "integer", "minimum": 1, "description": "Frames per row (default 6; at most the number of frames)" },
         }), &[]),
         tool("create_rig", "Add a ready-to-animate character made of blocks: parts with joints (pivots) attached in a chain, named so apply_motion and animation imports find them. humanoid: hips (root), torso, head, upper_arm_l/r, lower_arm_l/r (hand_l/r sockets), upper_leg_l/r, lower_leg_l/r. quadruped: body (root), head, tail, leg_front_l/r, leg_back_l/r. Facing -y, left is +x. Then redraw each part (voxel tools with `part`) to make it your character; keep each part's joint end where it is.", json!({
             "template": { "type": "string", "enum": ["humanoid", "quadruped"] },
@@ -489,6 +489,20 @@ fn num(args: &Value, key: &str) -> Option<f32> {
 
 fn int(args: &Value, key: &str) -> Option<i64> {
     get(args, key).and_then(Value::as_i64)
+}
+
+/// Integer `key` (or `default`), which must be `lo..=hi`.
+pub(crate) fn int_in(args: &Value, key: &str, default: i64, lo: i64, hi: i64) -> Result<i64> {
+    let v = int(args, key).unwrap_or(default);
+    if !(lo..=hi).contains(&v) {
+        bail!("`{key}` must be {lo} to {hi}, not {v}");
+    }
+    Ok(v)
+}
+
+/// The largest image side the GPU renders.
+pub(crate) fn max_image_side(ctx: &Ctx) -> i64 {
+    ctx.r.device.limits().max_texture_dimension_2d.min(8192) as i64
 }
 
 fn boolean(args: &Value, key: &str) -> Option<bool> {
@@ -797,12 +811,11 @@ pub(crate) fn focus_part(ctx: &mut Ctx, part: Option<&Value>) -> Result<()> {
 /// Tools that only edit the part's voxels through the voxel editor (or
 /// don't edit at all). Any other tool may change the tree, so the voxel
 /// edits so far move into the tree's history first, one step each.
-const KEEPS_VOXEL_HISTORY: [&str; 36] = [
+const KEEPS_VOXEL_HISTORY: [&str; 34] = [
     "set_voxels", "fill_box", "draw_shape", "draw_line", "draw_tube", "extrude_polygon", "place_stamp", "paint_faces", "vary_colors",
     "shade_edges", "select", "move_selection", "undo", "redo", "get_scene_info", "get_voxels", "get_slice", "get_projection", "get_palette",
     "list_parts", "list_projects", "list_shaders", "list_stamps", "list_palette_presets", "list_references", "render", "screenshot",
-    "set_camera", "set_render_settings", "set_view_mode", "set_symmetry", "save_stamp", "save_file", "set_material", "set_palette_colors",
-    "checkpoint",
+    "set_camera", "set_render_settings", "set_view_mode", "set_symmetry", "save_stamp", "save_file", "checkpoint",
 ];
 
 fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
@@ -955,11 +968,14 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "set_animation" => {
             let mut an = ctx.scene.world.anim.clone();
-            if let Some(f) = int(a, "frames") {
-                an.frames = f.clamp(1, 10_000) as u32;
+            if get(a, "frames").is_some() {
+                an.frames = int_in(a, "frames", 1, 1, 10_000)? as u32;
             }
             if let Some(f) = get(a, "fps").and_then(Value::as_f64) {
-                an.fps = (f as f32).clamp(0.5, 120.0);
+                if !(0.5..=120.0).contains(&f) {
+                    bail!("`fps` must be 0.5 to 120, not {f}");
+                }
+                an.fps = f as f32;
             }
             an.looping = boolean(a, "loop").unwrap_or(an.looping);
             an.smooth = boolean(a, "smooth").unwrap_or(an.smooth);
@@ -1064,7 +1080,16 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "frame_strip" => {
             let total = ctx.scene.world.anim.frames;
             let frames: Vec<u32> = match get(a, "frames").and_then(Value::as_array) {
-                Some(list) => list.iter().filter_map(Value::as_u64).map(|f| (f as u32).min(total - 1)).take(64).collect(),
+                Some(list) => {
+                    let mut frames = Vec::new();
+                    for f in list {
+                        match f.as_u64() {
+                            Some(f) if f < total as u64 => frames.push(f as u32),
+                            _ => bail!("frame {f} isn't in the animation: frames are 0 to {}", total - 1),
+                        }
+                    }
+                    frames
+                }
                 None => {
                     let n = total.min(12);
                     (0..n).map(|i| i * total / n).collect()
@@ -1073,8 +1098,8 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if frames.is_empty() {
                 bail!("no frames");
             }
-            let (w, h) = (int(a, "width").unwrap_or(240).clamp(32, 1024) as u32, int(a, "height").unwrap_or(240).clamp(32, 1024) as u32);
-            let cols = (int(a, "columns").unwrap_or(6).max(1) as usize).min(frames.len());
+            let (w, h) = (int_in(a, "width", 240, 32, 1024)? as u32, int_in(a, "height", 240, 32, 1024)? as u32);
+            let cols = (int_in(a, "columns", 6, 1, i64::MAX)? as usize).min(frames.len());
             let rows = frames.len().div_ceil(cols);
             let (sw, sh) = (w as usize * cols, h as usize * rows);
             let mut sheet = vec![0u8; sw * sh * 4];
@@ -1738,13 +1763,19 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "set_palette_colors" => {
             let list = get(a, "colors").and_then(Value::as_array).context("`colors` must be [{index, color}, ...]")?;
+            // Check every entry before changing anything.
+            let mut set = Vec::new();
             for item in list {
                 let i = item.get("index").and_then(Value::as_u64).filter(|&i| (1..=255).contains(&i)).context("index must be 1..=255")? as usize;
-                let c = parse_hex(item.get("color").and_then(Value::as_str).context("color must be \"#rrggbb\"")?)?;
+                set.push((i, parse_hex(item.get("color").and_then(Value::as_str).context("color must be \"#rrggbb\"")?)?));
+            }
+            crate::palette_lib::begin_step(ctx.scene, &mut ctx.ed.editor);
+            for (i, c) in set {
                 ctx.scene.palette[i] = [c[0], c[1], c[2], 255];
-                ctx.ed.palette.look[i] = None;
+                ctx.scene.look[i] = None;
                 ctx.scene.sync_color(i);
             }
+            ctx.scene.palette_step_update(None);
             materials_changed(ctx);
             Ok(vec![text(format!("Set {} palette colors", list.len()))])
         }
@@ -1780,11 +1811,12 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "name_ramp" => {
                     let row = int(a, "row").filter(|r| (0..32).contains(r)).context("name_ramp needs `row` 0-31 (colors 8*row+1 ..= 8*row+8)")? as usize;
                     let name = string(a, "name").unwrap_or_default().to_string();
-                    crate::palette_lib::push(&mut ctx.ed.palette.history, crate::palette_lib::snapshot(ctx.scene, &ctx.ed.palette.look));
+                    crate::palette_lib::begin_step(ctx.scene, &mut ctx.ed.editor);
                     if ctx.scene.notes.len() < 32 {
                         ctx.scene.notes.resize(32, String::new());
                     }
                     ctx.scene.notes[row] = name.clone();
+                    ctx.scene.palette_step_update(None);
                     return Ok(vec![text(format!("Ramp {row} (colors {}-{}) is now {name:?}", row * 8 + 1, (row * 8 + 8).min(255)))]);
                 }
                 other => bail!("unknown action {other:?}"),
@@ -1824,6 +1856,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 }
                 values[k] = Some(v);
             }
+            crate::palette_lib::begin_step(ctx.scene, &mut ctx.ed.editor);
             let m = &mut ctx.scene.materials[i];
             m.kind = kind;
             if m.kind == MaterialKind::Emit as u32 && m.emit <= 0.0 {
@@ -1839,6 +1872,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             m.trans = trans.unwrap_or(m.trans);
             m.emit = emit.unwrap_or(m.emit);
             m.density = density.unwrap_or(m.density);
+            ctx.scene.palette_step_update(None);
             materials_changed(ctx);
             Ok(vec![text(format!("Set material of color {i}"))])
         }
@@ -2080,8 +2114,9 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if get(a, "views").is_some() || boolean(a, "frame").unwrap_or(false) {
                 return view::render_framed(ctx, a);
             }
-            let (w, h) = (int(a, "width").unwrap_or(960).clamp(16, 8192) as u32, int(a, "height").unwrap_or(640).clamp(16, 8192) as u32);
-            let spp = int(a, "samples").unwrap_or(128).clamp(1, 65536) as u32;
+            let max = max_image_side(ctx);
+            let (w, h) = (int_in(a, "width", 960, 16, max)? as u32, int_in(a, "height", 640, 16, max)? as u32);
+            let spp = int_in(a, "samples", 128, 1, 65536)? as u32;
             let t = std::time::Instant::now();
             let px = render_pixels(ctx, w, h, spp)?;
             let mut out = vec![image(w, h, &px)?];

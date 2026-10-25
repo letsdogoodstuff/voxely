@@ -338,11 +338,21 @@ pub struct Scene {
     /// Tree undo steps pushed so far (`history` is capped, so its length
     /// doesn't say).
     steps: u64,
-    /// Tree steps that also changed the palette (an import): the step's
-    /// position, and the palette and materials before and after it.
-    palette_steps: Vec<(u64, PaletteState, PaletteState)>,
+    /// Tree steps that also changed the palette (palette edits, an
+    /// import): the step's position, the palette before and after it, and
+    /// for edits that moved colors to new indices, the color remaps
+    /// forward and back.
+    palette_steps: Vec<(u64, PaletteState, PaletteState, Option<Box<[[u8; 256]; 2]>>)>,
     /// The palette or materials changed by undo/redo, for the GPU.
     pub palette_dirty: bool,
+    /// Colors the last undo/redo moved to new indices, so the brush color
+    /// and recent colors can follow (taken by `app::history_step`).
+    pub recolor: Option<[u8; 256]>,
+    /// For each slot a matched palette load recolored, the color it had
+    /// before the first of them, so later loads match against the model's
+    /// real colors and loading the original palette back restores them
+    /// exactly. Editing a slot's color forgets it.
+    pub look: Vec<Option<[u8; 4]>>,
     /// sRGB palette as stored in the file, indexed by color index.
     pub palette: Vec<[u8; 4]>,
     /// Palette row names (ramps), as in MagicaVoxel's `NOTE` chunk: entry
@@ -365,8 +375,15 @@ pub struct Scene {
     pub settings: RenderSettings,
 }
 
-/// A palette and its materials.
-pub type PaletteState = (Vec<[u8; 4]>, Vec<GpuMaterial>);
+/// A palette, its materials, ramp names and remembered colors, to restore
+/// with an undo step.
+#[derive(Clone)]
+pub struct PaletteState {
+    pub palette: Vec<[u8; 4]>,
+    pub materials: Vec<GpuMaterial>,
+    pub notes: Vec<String>,
+    pub look: Vec<Option<[u8; 4]>>,
+}
 
 fn luminance(c: [f32; 4]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
@@ -955,6 +972,8 @@ impl Scene {
             steps: 0,
             palette_steps: Vec::new(),
             palette_dirty: false,
+            recolor: None,
+            look: vec![None; 256],
             palette,
             notes: Vec::new(),
             render_dicts,
@@ -1042,7 +1061,9 @@ impl Scene {
     /// `past` holds the model before each edit, oldest first (see
     /// `Editor::take_history`), so undo after a tree change still steps
     /// back one edit at a time.
-    pub fn keep_steps(&mut self, past: Vec<Volume>) {
+    /// `future` holds the model after each undone edit, next redo first:
+    /// they become the tree's redo steps.
+    pub fn keep_steps(&mut self, past: Vec<Volume>, future: Vec<Volume>) {
         let Mode::Edit(id) = self.mode else { return };
         let mut last = self.world.checkout(id).filter(|(_, o)| *o == self.origin).map(|(v, _)| v);
         for v in past {
@@ -1053,6 +1074,18 @@ impl Scene {
             last = Some(v);
         }
         self.store();
+        if !future.is_empty() {
+            // Undone voxel edits came after any tree step that was undone.
+            let at = self.position();
+            self.palette_steps.retain(|s| s.0 <= at);
+            self.future.clear();
+            for v in future.into_iter().rev() {
+                let mut w = self.world.clone();
+                w.checkin(id, &v, self.origin);
+                self.future.push(w);
+                self.steps += 1;
+            }
+        }
     }
 
     /// Most voxel edits `keep_steps` turns into tree steps.
@@ -1077,7 +1110,7 @@ impl Scene {
 
     /// The palette and materials, to restore with an undo step.
     pub fn palette_state(&self) -> PaletteState {
-        (self.palette.clone(), self.materials.clone())
+        PaletteState { palette: self.palette.clone(), materials: self.materials.clone(), notes: self.notes.clone(), look: self.look.clone() }
     }
 
     /// The last tree step also changed the palette from `before`: undoing
@@ -1085,7 +1118,32 @@ impl Scene {
     pub fn palette_step(&mut self, before: PaletteState) {
         let at = self.position();
         self.palette_steps.retain(|s| s.0 != at);
-        self.palette_steps.push((at, before, self.palette_state()));
+        self.palette_steps.push((at, before, self.palette_state(), None));
+    }
+
+    /// The last tree step's palette change went on: redoing it gives the
+    /// palette as it is now. `moved`: it put colors at new indices, with
+    /// these remaps forward and back.
+    pub fn palette_step_update(&mut self, moved: Option<[[u8; 256]; 2]>) {
+        let at = self.position();
+        let after = self.palette_state();
+        if let Some(s) = self.palette_steps.iter_mut().find(|s| s.0 == at) {
+            s.2 = after;
+            if let Some(m) = moved {
+                s.3 = Some(Box::new(m));
+            }
+        }
+    }
+
+    /// Whether the next tree undo step is a palette change.
+    pub fn undoes_palette(&self) -> bool {
+        let at = self.position();
+        !self.history.is_empty() && self.palette_steps.iter().any(|s| s.0 == at)
+    }
+
+    /// Changes whenever a tree step is pushed, undone or redone.
+    pub fn history_mark(&self) -> (u64, usize) {
+        (self.steps, self.future.len())
     }
 
     /// Tree undo steps pushed so far, for `squash_tree`.
@@ -1177,8 +1235,10 @@ impl Scene {
         to.push(std::mem::replace(&mut self.world, w));
         // The step's palette change, if it made one.
         let step = if forward { at + 1 } else { at };
-        if let Some((_, before, after)) = self.palette_steps.iter().find(|s| s.0 == step) {
-            (self.palette, self.materials) = if forward { after.clone() } else { before.clone() };
+        if let Some((_, before, after, moved)) = self.palette_steps.iter().find(|s| s.0 == step) {
+            let p = if forward { after.clone() } else { before.clone() };
+            (self.palette, self.materials, self.notes, self.look) = (p.palette, p.materials, p.notes, p.look);
+            self.recolor = moved.as_ref().map(|m| m[if forward { 0 } else { 1 }]);
             self.palette_dirty = true;
         }
         self.view(self.mode);
@@ -1269,21 +1329,19 @@ impl Scene {
     }
 
     /// Recolor every model through `remap` (palette sorting, swapping,
-    /// packing), including flipbook drawings and the tree's undo steps, so
-    /// undoing later brings back the same colors.
+    /// packing), including flipbook drawings. The tree's undo steps keep
+    /// their colors: the edit is an undo step that puts the palette back.
     pub fn remap(&mut self, remap: &[u8]) {
         let fix = |v: &mut Volume| v.cells.update_filled(|c| *c = remap[*c as usize]);
         fix(&mut self.volume);
         if let Some((ctx, _)) = &mut self.context {
             fix(ctx);
         }
-        for w in std::iter::once(&mut self.world).chain(&mut self.history).chain(&mut self.future) {
-            for n in w.nodes.iter_mut().flatten() {
-                if let crate::world::Kind::Model(v) = &mut n.kind {
-                    fix(v);
-                }
-                n.flip.iter_mut().filter_map(|s| s.volume.as_mut()).for_each(fix);
+        for n in self.world.nodes.iter_mut().flatten() {
+            if let crate::world::Kind::Model(v) = &mut n.kind {
+                fix(v);
             }
+            n.flip.iter_mut().filter_map(|s| s.volume.as_mut()).for_each(fix);
         }
     }
 
@@ -1464,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn remap_reaches_tree_history() {
+    fn remap_leaves_tree_history() {
         let mut s = Scene::empty(IVec3::splat(4));
         s.volume.set_index(0, 3);
         s.store();
@@ -1479,7 +1537,7 @@ mod tests {
         assert!(s.used_colors()[9] && !s.used_colors()[3]);
         let old = s.history.last().unwrap();
         let cells: Vec<u8> = old.nodes.iter().flatten().filter_map(|n| n.volume()).flat_map(|v| v.cells.iter().copied()).filter(|&c| c != 0).collect();
-        assert_eq!(cells, vec![9], "the undo step was recolored too");
+        assert_eq!(cells, vec![3], "undo steps keep the colors they had (with the palette they had)");
     }
 
     fn save_and_load(s: &Scene) -> Scene {
@@ -1757,6 +1815,7 @@ mod tests {
         if s.editing().is_some() && (if forward { e.can_redo() } else { e.can_undo() }) {
             return if forward { e.redo(&mut s.volume) } else { e.undo(&mut s.volume) };
         }
+        crate::app::keep_history(s, e);
         let done = s.undo_tree(forward);
         if done {
             e.reset();

@@ -613,7 +613,7 @@ fn write_slots(ctx: &mut Ctx, slots: &[u8], colors: &[[u8; 4]], used: &[bool; 25
     for (&i, &c) in slots.iter().zip(colors) {
         let i = i as usize;
         ctx.scene.palette[i] = [c[0], c[1], c[2], 255];
-        ctx.ed.palette.look[i] = None;
+        ctx.scene.look[i] = None;
         if used[i] {
             ctx.scene.sync_color(i);
         } else {
@@ -657,7 +657,9 @@ fn apply_preset(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         },
     };
     let colors: Vec<[u8; 4]> = preset.colors.iter().map(|c| super::parse_hex(c)).collect::<Result<_>>()?;
+    crate::palette_lib::begin_step(ctx.scene, &mut ctx.ed.editor);
     write_slots(ctx, &slots, &colors, &used);
+    ctx.scene.palette_step_update(None);
     let replaced: Vec<u8> = slots.iter().copied().filter(|&i| used[i as usize]).collect();
     let used = used_slots(ctx.scene);
     let reserved = &ctx.ed.tools.surface.reserved;

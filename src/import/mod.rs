@@ -391,7 +391,7 @@ mod tests {
     fn undoing_an_import_restores_the_palette() {
         let mut s = Scene::empty(IVec3::splat(4));
         s.volume.set(IVec3::ZERO, 1);
-        let (before, mats) = s.palette_state();
+        let crate::scene::PaletteState { palette: before, materials: mats, .. } = s.palette_state();
         add_to_scene(&mut s, &[model(&[([0, 0, 0], [1, 2, 3, 255])])], "file", true).unwrap();
         let after = s.palette.clone();
         assert_ne!(after, before);
