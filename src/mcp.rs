@@ -21,7 +21,7 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// MagicaVoxel's install folder (for shaders, palettes and models).
-fn assets_dir(arg: Option<PathBuf>) -> Option<PathBuf> {
+pub(crate) fn assets_dir(arg: Option<PathBuf>) -> Option<PathBuf> {
     arg.or_else(|| std::env::var_os("VOXELY_ASSETS").map(PathBuf::from)).or_else(|| {
         let home = std::env::var_os("HOME")?;
         let guess = PathBuf::from(home).join("Downloads/MagicaVoxel-0.99.6.2-macos-10.15");
@@ -30,14 +30,14 @@ fn assets_dir(arg: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 /// The in-process session used when no window is open.
-struct Headless {
+pub(crate) struct Headless {
     r: Renderer,
     scene: Scene,
     ed: EditState,
 }
 
 impl Headless {
-    fn new(assets: Option<&PathBuf>) -> Result<Self> {
+    pub(crate) fn new(assets: Option<&PathBuf>) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let (_adapter, device, queue) = pollster::block_on(gpu::request_device(&instance, None))?;
         let scene = Scene::empty(glam::IVec3::splat(40));
@@ -54,14 +54,14 @@ impl Headless {
         Ok(Headless { r, scene, ed })
     }
 
-    fn call(&mut self, name: &str, args: &Value) -> Value {
+    pub(crate) fn call(&mut self, name: &str, args: &Value) -> Value {
         let mut ctx = Ctx { r: &mut self.r, scene: &mut self.scene, ed: &mut self.ed, live: false };
         control::call(&mut ctx, name, args)
     }
 }
 
 /// Send a tool call to the open window. None if no window is listening.
-fn call_live(name: &str, args: &Value) -> Option<Result<Value>> {
+pub(crate) fn call_live(name: &str, args: &Value) -> Option<Result<Value>> {
     let stream = UnixStream::connect(socket_path()).ok()?;
     Some((|| {
         let mut writer = stream.try_clone()?;

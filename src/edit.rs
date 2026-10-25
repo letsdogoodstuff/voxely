@@ -987,6 +987,22 @@ impl Editor {
         }
     }
 
+    /// Entries in the undo history.
+    pub fn history_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Fold the edits made since the history had `len` entries into one,
+    /// given the volume as it was then.
+    pub fn squash(&mut self, v: &mut Volume, len: usize, before: Volume) {
+        if self.undo.len() <= len + 1 {
+            return;
+        }
+        self.undo.truncate(len);
+        let after = std::mem::replace(v, before);
+        self.commit(v, after);
+    }
+
     pub fn undo(&mut self, v: &mut Volume) -> bool {
         let Some(entry) = self.undo.pop() else { return false };
         let entry = Self::step(v, entry, false);
@@ -1111,6 +1127,26 @@ mod tests {
         assert_eq!(v.get(IVec3::new(1, 1, 1)), 4);
         assert!(e.redo(&mut v));
         assert_eq!(v.get(IVec3::new(2, 2, 1)), 4);
+    }
+
+    #[test]
+    fn squash_folds_edits_into_one_undo() {
+        let mut v = vol();
+        let mut e = Editor::new(1);
+        let before = v.clone();
+        for k in 0..3 {
+            let mut new = v.clone();
+            new.set(IVec3::new(k, 0, 0), 2);
+            assert!(e.commit(&mut v, new));
+        }
+        let bigger = ops::resize(&v, IVec3::new(10, 10, 10));
+        assert!(e.commit(&mut v, bigger));
+        e.squash(&mut v, 0, before);
+        assert_eq!((e.history_len(), v.dims), (1, IVec3::splat(10)));
+        assert!(e.undo(&mut v));
+        assert_eq!(v.dims, IVec3::splat(8));
+        assert!(v.cells.iter().all(|&c| c == 0));
+        assert!(!e.can_undo());
     }
 
     #[test]

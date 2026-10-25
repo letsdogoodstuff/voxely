@@ -17,6 +17,7 @@ naga = { version = "30.0.1", features = ["glsl-in"] }
 png = "0.18.1"
 pollster = "1.0.1"
 rfd = "0.17.2"
+rquickjs = "0.14"
 serde_json = "1.0.154"
 wgpu = { version = "30.0.1", features = ["naga-ir"] }
 winit = "0.30.13"

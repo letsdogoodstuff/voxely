@@ -83,12 +83,47 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | History | `undo`, `redo` |
 | Viewing | `set_camera`, `screenshot` (fast modeler image), `set_render_settings`, `render` (path traced), `set_view_mode` |
 | Export | `export`: **gltf** (`.glb` for game engines), plus MagicaVoxel's formats: obj, ply, mc, cube (meshes), xraw, slab, qb, vox (volumes), iso, 2d, slice (sprite images), point (point cloud) |
+| Scripting | `run_script`: a JavaScript program instead of many tool calls (see [Scripting](#scripting)) |
 
 Conventions:
 - Coordinates are voxel cells `[x, y, z]`, with z up.
 - Colors are palette indices 1–255, or `"#rrggbb"`, which picks the nearest palette color.
   Use `set_palette_colors` for exact colors.
 - `screenshot` and `render` return PNG images that the agent can see.
+
+## Scripting
+
+voxely runs JavaScript (QuickJS, built in). Every MCP tool is a function under `voxely`, renamed to
+camelCase with the same arguments: `fill_box` becomes `voxely.fillBox({ from, to, color })`. Tools
+return parsed JSON or text, and throw if they fail.
+
+```js
+voxely.newProject({ name: "hills", size: [64, 64, 32] });
+const grass = voxely.color("#55aa33"), dirt = voxely.color("#7a5230");
+const v = voxely.getVolume();          // v.cells is a Uint8Array, x fastest, then y, then z
+for (let x = 0; x < 64; x++) for (let y = 0; y < 64; y++) {
+  const h = 6 + Math.round(4 * Math.sin(x / 7) * Math.cos(y / 9));
+  for (let z = 0; z <= h; z++) v.set(x, y, z, z === h ? grass : dirt);
+}
+voxely.setVolume(v);
+voxely.export({ format: "gltf" });
+voxely.saveFile();
+```
+
+```sh
+voxely script hills.js                 # in the open window (edits show live), else headless
+voxely script build.js -- oak 12       # words after -- arrive as the `args` array
+voxely script --types > voxely.d.ts    # TypeScript declarations for editor autocomplete
+```
+
+- **Bulk edits:** `voxely.getVolume()` / `voxely.setVolume(v)` move the whole grid at once. Use them
+  for per-voxel work instead of calling `setVoxels` in a loop. `new Volume([x, y, z])` starts an empty
+  grid, and setting it resizes the canvas.
+- **Undo:** a whole script is one undo step, unless it opens or creates a project or calls undo/redo.
+- **Output:** `console.log` lines and the value of the last expression are returned.
+- **Limits:** no file or network access except through voxely's tools; scripts stop after 120 s
+  (`--timeout <s>`, or `timeout` on `run_script`).
+- **Agents:** the `run_script` MCP tool runs a script in one call (`source` or `path`, plus `args`).
 
 ## glTF export
 

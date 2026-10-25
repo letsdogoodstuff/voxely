@@ -11,6 +11,7 @@ mod modeler;
 mod ops;
 mod palette_ops;
 mod scene;
+mod script;
 mod ui;
 mod vox;
 mod xs;
@@ -29,6 +30,8 @@ usage: voxely <model.vox> [options]
        voxely mcp [--headless] [--assets <MagicaVoxel folder>]
                         MCP server on stdio for agents; drives the open
                         window if there is one, otherwise runs headless
+       voxely script <file.js> [--headless] [-- <args>...]
+                        run a JavaScript script (see `voxely script --help`)
 
   --new [size]         start from a solid block (default 40x40x40)
   --out <file.vox>     where Ctrl+S saves (default export/<name>.vox)
@@ -474,6 +477,9 @@ fn main() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().is_some_and(|a| a == "mcp") {
         return mcp::run(&argv[1..]);
+    }
+    if argv.first().is_some_and(|a| a == "script") {
+        return script::cli(&argv[1..]);
     }
     let args = parse_args()?;
     let mut scene = load_scene(&args)?;
