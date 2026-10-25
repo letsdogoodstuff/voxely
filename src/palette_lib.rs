@@ -520,14 +520,27 @@ pub fn window(ctx: &egui::Context, ed: &mut EditState, cmds: &mut Vec<crate::ui:
     ed.palette.library_open = open;
 }
 
-/// Load palette files dropped on the window (and open dropped models).
+/// A picture small enough to be a palette strip rather than a model,
+/// a heightmap or a reference.
+fn palette_strip(p: &Path) -> bool {
+    !crate::import::is_importable(p) || crate::control::surface::load_image(p).is_ok_and(|i| i.h <= 32 || i.w * i.h <= 4096)
+}
+
+/// Load palette files dropped on the window, open dropped models, import
+/// other formats and pictures (Shift: show a picture as the reference).
 pub fn handle_drops(ctx: &egui::Context, ed: &EditState, cmds: &mut Vec<crate::ui::Command>) {
     let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+    let shift = ctx.input(|i| i.modifiers.shift);
     for p in dropped {
-        if ops::is_palette_file(&p) {
+        let picture = crate::import::IMAGES.iter().any(|e| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(e)));
+        if shift && picture {
+            cmds.push(crate::ui::Command::Reference(crate::backdrop::RefCmd::Load(p)));
+        } else if ops::is_palette_file(&p) && palette_strip(&p) {
             cmds.push(crate::ui::Command::Palette(Cmd::Load(Source::File(p), ed.palette.match_colors)));
         } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vox")) {
             cmds.push(crate::ui::Command::OpenPath(p));
+        } else if crate::import::is_importable(&p) || p.is_dir() {
+            cmds.push(crate::ui::Command::ImportPath(p));
         }
     }
     let hovering = ctx.input(|i| i.raw.hovered_files.iter().any(|f| f.path.as_deref().is_some_and(ops::is_palette_file)));

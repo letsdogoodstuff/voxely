@@ -127,6 +127,87 @@ impl Gltf {
         Ok(out)
     }
 
+    /// The file's JSON.
+    pub(crate) fn json(&self) -> &Value {
+        &self.doc
+    }
+
+    /// Where an accessor's data lives: (count, components, componentType,
+    /// component size, (buffer, first byte, stride) when it has a view),
+    /// checked to fit inside its buffer.
+    #[allow(clippy::type_complexity)]
+    fn layout(&self, index: usize) -> Result<(usize, usize, u64, usize, Option<(&[u8], usize, usize)>)> {
+        let a = &self.doc["accessors"][index];
+        let count = a["count"].as_u64().context("accessor count")? as usize;
+        let comps = match a["type"].as_str() {
+            Some("SCALAR") => 1,
+            Some("VEC2") => 2,
+            Some("VEC3") => 3,
+            Some("VEC4") => 4,
+            Some("MAT4") => 16,
+            t => bail!("accessor type {t:?}"),
+        };
+        let ct = a["componentType"].as_u64().unwrap_or(5126);
+        let size = match ct {
+            5126 | 5125 => 4,
+            5122 | 5123 => 2,
+            _ => 1,
+        };
+        let Some(view) = a["bufferView"].as_u64() else {
+            if count > 1 << 26 {
+                bail!("accessor {index} is too large");
+            }
+            return Ok((count, comps, ct, size, None));
+        };
+        let v = &self.doc["bufferViews"][view as usize];
+        let buf = self.buffers.get(v["buffer"].as_u64().unwrap_or(0) as usize).context("missing buffer")?;
+        let base = (v["byteOffset"].as_u64().unwrap_or(0) as usize).saturating_add(a["byteOffset"].as_u64().unwrap_or(0) as usize);
+        let stride = v["byteStride"].as_u64().map_or(comps * size, |s| s as usize);
+        if count > 0 {
+            let end = (count - 1).checked_mul(stride).and_then(|x| x.checked_add(base)).and_then(|x| x.checked_add(comps * size));
+            if end.is_none_or(|e| e > buf.len()) {
+                bail!("accessor {index} runs past the end of its buffer");
+            }
+        }
+        Ok((count, comps, ct, size, Some((buf.as_slice(), base, stride))))
+    }
+
+    /// An accessor's values as floats (like `accessor`), after checking it
+    /// fits its buffer.
+    pub(crate) fn read_floats(&self, index: usize) -> Result<Vec<f32>> {
+        self.layout(index)?;
+        self.accessor(index)
+    }
+
+    /// An integer accessor's values, unnormalized (indices).
+    pub(crate) fn read_uints(&self, index: usize) -> Result<Vec<u32>> {
+        let (count, comps, ct, size, data) = self.layout(index)?;
+        let Some((buf, base, stride)) = data else { return Ok(vec![0; count * comps]) };
+        let mut out = Vec::with_capacity(count * comps);
+        for i in 0..count {
+            for c in 0..comps {
+                let o = base + i * stride + c * size;
+                let b = buf.get(o..o + size).context("accessor out of range")?;
+                out.push(match ct {
+                    5125 => u32::from_le_bytes(b.try_into().unwrap()),
+                    5123 => u16::from_le_bytes(b.try_into().unwrap()) as u32,
+                    5121 => b[0] as u32,
+                    t => bail!("accessor {index}: component type {t} isn't an unsigned integer"),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// A buffer view's bytes (embedded images).
+    pub(crate) fn view_bytes(&self, view: usize) -> Result<&[u8]> {
+        let v = &self.doc["bufferViews"][view];
+        let buf = self.buffers.get(v["buffer"].as_u64().unwrap_or(0) as usize).context("missing buffer")?;
+        let start = v["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let len = v["byteLength"].as_u64().context("bufferView byteLength")? as usize;
+        buf.get(start..start.saturating_add(len)).with_context(|| format!("bufferView {view} runs past the end of its buffer"))
+    }
+
     pub fn clips(&self) -> Vec<Clip> {
         self.doc["animations"]
             .as_array()

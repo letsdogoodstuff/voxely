@@ -22,6 +22,7 @@ use crate::ui::{Op, TransformKind};
 // `EditState::tools`.
 mod build;
 pub mod guide;
+mod import;
 mod inspect;
 mod reference;
 pub(crate) mod surface;
@@ -395,7 +396,7 @@ const PART_TOOLS: &[&str] = &[
 ];
 
 fn is_part_tool(name: &str) -> bool {
-    [PART_TOOLS, build::PART_TOOLS, guide::PART_TOOLS, inspect::PART_TOOLS, reference::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
+    [PART_TOOLS, build::PART_TOOLS, guide::PART_TOOLS, import::PART_TOOLS, inspect::PART_TOOLS, reference::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
 }
 
 /// Tools that pull agents away from the house style (noise, painted
@@ -406,7 +407,7 @@ const UNLISTED: &[&str] = &["vary_colors", "shade_edges", "paint_from_reference"
 /// The tool list for MCP `tools/list`, with the shared `part` argument.
 pub fn tools() -> Value {
     let mut list = base_tools();
-    let extra = [build::tools(), guide::tools(), inspect::tools(), reference::tools(), surface::tools(), view::tools()];
+    let extra = [build::tools(), guide::tools(), import::tools(), inspect::tools(), reference::tools(), surface::tools(), view::tools()];
     list.as_array_mut().unwrap().extend(extra.into_iter().flatten());
     list.as_array_mut().unwrap().retain(|t| !UNLISTED.contains(&t["name"].as_str().unwrap_or_default()));
     for t in list.as_array_mut().into_iter().flatten() {
@@ -776,7 +777,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
     if is_part_tool(name) {
         focus_part(ctx, get(a, "part"))?;
     }
-    for family in [build::dispatch, guide::dispatch, inspect::dispatch, reference::dispatch, surface::dispatch, view::dispatch] {
+    for family in [build::dispatch, guide::dispatch, import::dispatch, inspect::dispatch, reference::dispatch, surface::dispatch, view::dispatch] {
         if let Some(result) = family(ctx, name, a) {
             return result;
         }

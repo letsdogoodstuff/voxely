@@ -990,7 +990,10 @@ impl Renderer {
             view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
+        // Agents' views show the model alone, without the window's reference.
+        let plane = m.reference_plane.take();
         m.draw(&self.device, &self.queue, &view, (width, height), (0, 0, width, height), camera, self.settings.fov, projection);
+        m.reference_plane = plane;
         let bgra = matches!(format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb);
         read_texture(&self.device, &self.queue, &tex, width, height, bgra)
     }

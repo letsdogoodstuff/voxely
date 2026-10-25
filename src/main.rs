@@ -2,6 +2,7 @@
 mod agents;
 mod anim;
 mod app;
+mod backdrop;
 mod control;
 mod edit;
 mod env;

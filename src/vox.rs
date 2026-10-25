@@ -101,7 +101,8 @@ impl<'a> Reader<'a> {
 pub fn decode_rotation(r: u8) -> Mat3 {
     let i0 = (r & 3) as usize;
     let i1 = ((r >> 2) & 3) as usize;
-    let i2 = 3 - i0 - i1;
+    // Invalid bytes (i0 + i1 > 3) wrap and clamp below, as in release builds.
+    let i2 = 3usize.wrapping_sub(i0 + i1);
     let mut rows = [[0.0f32; 3]; 3];
     rows[0][i0.min(2)] = if r & 0x10 != 0 { -1.0 } else { 1.0 };
     rows[1][i1.min(2)] = if r & 0x20 != 0 { -1.0 } else { 1.0 };

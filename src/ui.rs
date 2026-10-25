@@ -94,6 +94,18 @@ pub enum Command {
     Frame(u32),
     /// Pick a glTF file to import clips from (None), or import clip k.
     ImportAnimation(Option<(PathBuf, usize)>),
+    /// Pick a file to import (another voxel format, a mesh, a picture).
+    ImportPick,
+    /// Open the Import window for this file.
+    ImportPath(PathBuf),
+    Import(crate::import::window::ImportCmd),
+    /// Show or hide the Reference window.
+    ToggleReference,
+    Reference(crate::backdrop::RefCmd),
+    /// Ask before moving this project file to the Trash.
+    DeleteProject(PathBuf),
+    /// Asked and confirmed: move it to the Trash.
+    DeleteProjectConfirmed(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -560,6 +572,7 @@ pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, history: (bool, boo
             ui.separator();
             command(ui, cmds, "Save As", "Save as [Ctrl+Shift+S]", Command::SaveAs);
             command(ui, cmds, "Save", "Save [Ctrl+S]", Command::Save);
+            command(ui, cmds, "Import", "Import another voxel format, a mesh, a heightmap, slices or a picture [Ctrl+Shift+O]", Command::ImportPick);
             command(ui, cmds, "Open", "Open [Ctrl+O]", Command::Open);
             command(ui, cmds, "New", "New [Ctrl+P]", Command::New);
             ui.separator();
@@ -1314,8 +1327,26 @@ pub fn project_panel(
                                 if ui.selectable_label(pattern == Some(name.as_str()), name).clicked() {
                                     cmds.push(Command::LoadPattern(p.clone()));
                                 }
-                            } else if ui.selectable_label(p == current, name).on_hover_text(p.display().to_string()).clicked() {
-                                cmds.push(Command::OpenPath(p.clone()));
+                            } else {
+                                let item = ui.selectable_label(p == current, name);
+                                let mine = title == "My projects";
+                                let tip = if mine { format!("{}\nRight-click to delete", p.display()) } else { p.display().to_string() };
+                                let item = item.on_hover_text(tip);
+                                if item.clicked() {
+                                    cmds.push(Command::OpenPath(p.clone()));
+                                }
+                                if mine {
+                                    item.context_menu(|ui| {
+                                        if ui.button("Open").clicked() {
+                                            cmds.push(Command::OpenPath(p.clone()));
+                                            ui.close();
+                                        }
+                                        if ui.button("Delete…").clicked() {
+                                            cmds.push(Command::DeleteProject(p.clone()));
+                                            ui.close();
+                                        }
+                                    });
+                                }
                             }
                         }
                     });
@@ -1366,6 +1397,7 @@ pub fn view_bar(ui: &mut Ui, dims: IVec3, canvas: &mut IVec3, part: Option<&str>
             ui.weak(format!("{models} model{}", if models == 1 { "" } else { "s" }));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 command(ui, cmds, "Focus", "Center the view on the picked objects [5]", Command::Focus);
+                command(ui, cmds, "Ref", "A reference picture to model over", Command::ToggleReference);
             });
             return;
         };
@@ -1383,6 +1415,7 @@ pub fn view_bar(ui: &mut Ui, dims: IVec3, canvas: &mut IVec3, part: Option<&str>
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             command(ui, cmds, "Focus", "Center the view on the selection or model [5]", Command::Focus);
+            command(ui, cmds, "Ref", "A reference picture to model over", Command::ToggleReference);
         });
     });
 }

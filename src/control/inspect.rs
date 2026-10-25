@@ -30,7 +30,7 @@ const SPILL_WORK: u64 = 32 << 20;
 
 /// Tools after which the scene is replaced; unsaved edits are autosaved
 /// first.
-const REPLACES_SCENE: [&str; 4] = ["open_project", "open_file", "new_project", "new_scene"];
+const REPLACES_SCENE: [&str; 5] = ["open_project", "open_file", "new_project", "new_scene", "import_file"];
 
 pub struct State {
     /// Committed edits since the project was last saved.

@@ -71,6 +71,35 @@ The window's Project column lists them under **My projects**, above MagicaVoxel'
 re-reads the folder every second, so projects an agent creates show up while you watch. Ctrl+S saves
 the current project there; opening a sample and saving makes a copy, leaving the original alone.
 Exports (the Export box at the bottom of the Project column) go to `<workspace>/export` by default.
+Right-click a project under **My projects** to delete it: after you confirm, the `.vox` (and any
+references saved with it) moves to the Trash. Samples can't be deleted from the list.
+
+## Importing
+
+**Import** in the top bar (Ctrl+Shift+O), or dropping a file on the window, opens the Import
+window. Pick how to read the file, then **Add as parts** (to the right of the scene, one undo step,
+grouped when the file holds several models) or **New project** (named after the file, with a
+palette made from its colors). Added parts put their colors into unused palette slots, or match the
+nearest palette colors once those run out (or when that option is off).
+
+| Source | Reads |
+|---|---|
+| Voxel formats | Qubicle `.qb` (all matrices, with positions), MagicaVoxel `.xraw`, Ace of Spades `.vxl` maps, `.kvx`, `.binvox`, Minecraft `.schematic` and Sponge `.schem` (block colors from a table) |
+| Meshes | `.obj` (with `.mtl` colors and textures, vertex colors) and `.glb` / `.gltf` (node transforms, base color, textures, vertex colors), voxelized at a size you choose, solid or as a shell; y-up or z-up |
+| Heightmaps | A PNG or JPEG where brighter is higher: terrain colors by height (sand, grass, forest, rock, snow, with soil underneath), the picture's own colors or grays; optional water level |
+| Slice sheets | Every z layer side by side, bottom first, seen from above, as MagicaVoxel's slice export writes them (the layout is found from the 1 px gaps, or a strip of squares; or give a grid), or a folder of one image per layer |
+| Pictures | A flat, extruded or relief picture, standing up facing front or lying on the ground |
+
+Models bigger than a part may be (1024 per side) come in as several parts. Agents use `import_file`.
+
+### Reference picture
+
+**Ref** in the strip above the 3D view opens the Reference window: load a picture (or drop one
+with Shift held) and it shows on a plane behind the model as seen from the view you choose (front,
+back, left, right or top, where it lies under the model), at an opacity you set, sized and placed in
+voxels, or over the model instead. It stays put in the world while you switch parts, and is
+remembered with the project. Views an agent pinned with `set_reference` can be shown there too, at
+their pinned scale. Agents' screenshots leave it out.
 
 ### Tools
 
@@ -80,7 +109,7 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Animation | `set_animation`, `go_to_frame`, `play` (plays it in the window), `set_keyframe`, `delete_keyframe`, `new_drawing`, `remove_drawing`, `frame_strip` (several frames in one image) |
 | Rigs | `create_rig` (humanoid, quadruped), `apply_motion` (idle, walk, run, jump, attack, wave, death, quad_walk, quad_idle), `import_animation` (glTF clips) |
 | Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup, detach), `group_parts` |
-| Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
+| Scene | `get_scene_info`, `new_scene`, `open_file`, `import_file` (other voxel formats, meshes, heightmaps, slice sheets, pictures; as parts or a new project), `resize_canvas` |
 | Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid, frustum, torus, capsule, rounded_box, wedge; any `rotation`), `draw_line`, `draw_tube` (curves with tapering radius), `extrude_polygon`, `set_symmetry` (mirror every edit) |
 | Stamps | `save_stamp`, `list_stamps`, `place_stamp`, `delete_stamp` (reusable pieces saved in `<workspace>/stamps`) |
 | Surface | `vary_colors` (noise/dither color variation) and `shade_edges` (edge darkening, highlights, cavity AO), both callable by name but not listed to agents since they fight the flat house style; `paint_faces` (snow on top, moss on north faces …), `voxelize_image` |
