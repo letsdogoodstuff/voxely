@@ -53,7 +53,8 @@ pub enum TreeOp {
     Extras(usize, Extras, bool),
 }
 
-/// A node's voxely-only settings, in its own coordinates.
+/// A node's voxely-only settings, in its own coordinates (the free
+/// rotation about world axes, see `World::tilt_world`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Extras {
     pub pivot: Option<Vec3>,
@@ -62,8 +63,9 @@ pub struct Extras {
 }
 
 impl Extras {
-    pub fn of(n: &crate::world::Node) -> Extras {
-        Extras { pivot: n.pivot, tilt: n.tilt, sockets: n.sockets.clone() }
+    pub fn of(w: &World, id: usize) -> Option<Extras> {
+        let n = w.node(id)?;
+        Some(Extras { pivot: n.pivot, tilt: w.tilt_world(id), sockets: n.sockets.clone() })
     }
 }
 
@@ -231,8 +233,7 @@ fn vec3_ui(ui: &mut Ui, v: &mut Vec3, speed: f64, suffix: &str) -> (bool, bool) 
 /// Pivot, free rotation and sockets of node `id`. Positions show in part
 /// coordinates (what the voxel tools use while editing it).
 fn extras_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
-    let Some(n) = w.node(id) else { return };
-    let mut x = Extras::of(n);
+    let (Some(n), Some(mut x)) = (w.node(id), Extras::of(w, id)) else { return };
     let (mut changed, mut begin) = (false, false);
     let mut track = |(c, b): (bool, bool)| {
         changed |= c;
@@ -295,7 +296,7 @@ fn extras_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
             track((true, true));
         }
     });
-    if changed && x != Extras::of(n) {
+    if changed && Some(&x) != Extras::of(w, id).as_ref() {
         cmds.push(Command::Tree(TreeOp::Extras(id, x, begin)));
     }
 }

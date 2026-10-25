@@ -410,7 +410,8 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
     match op {
         TreeOp::New => {
             let near = picked.first().copied().unwrap_or(ROOT);
-            let at = w.bounds(near).or_else(|| w.bounds(ROOT)).map_or(IVec3::ZERO, |(lo, size)| IVec3::new(lo.x + size.x + 2, lo.y, lo.z.max(0)));
+            // Beside the picked one (or everything), on the ground.
+            let at = picked.first().and_then(|&p| w.bounds_all(p)).or_else(|| w.reach()).map_or(IVec3::ZERO, |(lo, size)| IVec3::new(lo.x + size.x + 2, lo.y, 0));
             let parent = w.node(near).and_then(|n| n.parent).unwrap_or(ROOT);
             let id = scene.change(|w| w.add_model(parent, "", crate::scene::Volume::new(IVec3::splat(NEW_PART)), at));
             scene.picked = vec![id];
@@ -432,10 +433,10 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
                 picked
                     .iter()
                     .filter_map(|&p| {
-                        let width = w.bounds(p)?.1.x;
+                        let width = w.bounds_all(p)?.1.x;
                         let c = w.duplicate(p)?;
                         // Beside the original, so it's easy to see.
-                        w.translate(c, IVec3::new(width + 1, 0, 0));
+                        w.shift(c, IVec3::new(width + 1, 0, 0));
                         Some(c)
                     })
                     .collect::<Vec<_>>()
@@ -507,16 +508,16 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
             scene.change_quiet(|w| w.merge_frame(id));
         }
         TreeOp::AddRig(quad) => {
-            let at = w.bounds(ROOT).map_or(IVec3::ZERO, |(lo, size)| IVec3::new(lo.x + size.x + 3, lo.y, 0));
+            let at = w.reach().map_or(IVec3::ZERO, |(lo, size)| IVec3::new(lo.x + size.x + 3, lo.y, 0));
             let colors = rig_colors(&scene.palette);
             let root = scene.change_quiet(|w| if quad { crate::rig::quadruped(w, at, 1, "", colors) } else { crate::rig::humanoid(w, at, 1, "", colors) });
             scene.picked = vec![root];
         }
         TreeOp::Motion(name, frames) => {
             let rig = scene.picked.first().copied();
-            let res = scene.change_quiet(|w| crate::rig::apply_motion(w, rig, &name, frames, 1.0));
+            // Tried on a copy first, so a failure changes nothing.
+            let res = crate::rig::apply_motion(&mut scene.world.clone(), rig, &name, frames, 1.0).and_then(|_| scene.change_quiet(|w| crate::rig::apply_motion(w, rig, &name, frames, 1.0)));
             match res {
-                Ok(a) if a.bones.is_empty() => eprintln!("motion {name}: no rig parts found (name parts hips, torso, head, upper_arm_l ...)"),
                 Ok(a) => {
                     ed.timeline.open = true;
                     if !a.missing.is_empty() {
@@ -532,7 +533,7 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
                     n.pivot = x.pivot;
                     n.sockets = x.sockets.clone();
                 }
-                w.set_tilt(id, x.tilt);
+                w.set_tilt_world(id, x.tilt);
             };
             if begin {
                 scene.change(set);
@@ -540,11 +541,18 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
                 scene.apply(set);
             }
         }
-        TreeOp::Rename(id, name) => scene.change(|w| {
-            if let Some(n) = w.node_mut(id) {
-                n.name = name.trim().to_string();
+        TreeOp::Rename(id, name) => {
+            // Names can't be empty; a taken one gets a number.
+            if name.trim().is_empty() {
+                return false;
             }
-        }),
+            scene.change(|w| {
+                let name = w.unique_name(&name, Some(id));
+                if let Some(n) = w.node_mut(id) {
+                    n.name = name;
+                }
+            })
+        }
         _ => return false,
     }
     ed.editor.reset();
@@ -1017,9 +1025,10 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             if f == scene.world.frame {
                 false
             } else {
-                keep_history(scene, &mut ed.editor);
-                scene.set_frame(f);
-                ed.editor.reset();
+                let e = &mut ed.editor;
+                if !scene.set_frame(f, |v| e.undo(v)) {
+                    ed.editor.reset();
+                }
                 true
             }
         }

@@ -1124,11 +1124,40 @@ impl Scene {
         r
     }
 
-    /// Show another frame of the animation (edits so far are kept).
-    pub fn set_frame(&mut self, frame: u32) {
+    /// Show another frame of the animation (edits so far are kept). When
+    /// the edited part shows the same voxels there, its unsaved edits stay
+    /// unsaved (true: callers keep the voxel editor's history). Otherwise
+    /// they become tree undo steps, one per edit: `undo` steps a volume back
+    /// through the voxel editor's history.
+    pub fn set_frame(&mut self, frame: u32, mut undo: impl FnMut(&mut Volume) -> bool) -> bool {
+        if let Mode::Edit(id) = self.mode {
+            if self.world.same_view(id, frame) {
+                let edited = std::mem::replace(&mut self.volume, Volume::new(IVec3::ONE));
+                self.world.set_frame(frame);
+                self.view(self.mode);
+                if edited.dims == self.volume.dims {
+                    self.volume = edited;
+                    return true;
+                }
+                self.volume = edited;
+            } else {
+                let mut v = self.volume.clone();
+                let mut older = Vec::new();
+                while undo(&mut v) {
+                    older.push(v.clone());
+                }
+                let last = std::mem::replace(&mut self.volume, Volume::new(IVec3::ONE));
+                for v in older.into_iter().rev() {
+                    self.volume = v;
+                    self.store();
+                }
+                self.volume = last;
+            }
+        }
         self.store();
         self.world.set_frame(frame);
         self.view(self.mode);
+        false
     }
 
     /// Recolor every model through `remap` (palette sorting, swapping,

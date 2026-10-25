@@ -179,6 +179,9 @@ pub struct Node {
     pub sockets: Vec<Socket>,
     /// Transform keyframes, sorted by frame (see `anim`).
     pub keys: Vec<crate::anim::Key>,
+    /// The pose before a motion or clip was keyed on (see `rig`), so
+    /// applying another one replaces it instead of adding to it.
+    pub rest: Option<crate::anim::Key>,
     /// Flipbook models of a part, sorted by frame; empty if it has one.
     pub flip: Vec<crate::anim::Slot>,
     /// The flipbook slot whose voxels are in `kind`.
@@ -187,7 +190,7 @@ pub struct Node {
 
 impl Node {
     fn new(name: &str, parent: Option<usize>, layer: i32, kind: Kind) -> Node {
-        Node { name: name.to_string(), hidden: false, layer, rot: Rot::IDENTITY, t: IVec3::ZERO, parent, children: Vec::new(), kind, pivot: None, tilt: Vec3::ZERO, sockets: Vec::new(), keys: Vec::new(), flip: Vec::new(), flip_active: 0 }
+        Node { name: name.to_string(), hidden: false, layer, rot: Rot::IDENTITY, t: IVec3::ZERO, parent, children: Vec::new(), kind, pivot: None, tilt: Vec3::ZERO, sockets: Vec::new(), keys: Vec::new(), rest: None, flip: Vec::new(), flip_active: 0 }
     }
 
     pub fn tilted(&self) -> bool {
@@ -206,17 +209,44 @@ impl Node {
 
     /// The node's transform into its parent (continuous).
     pub fn local_affine(&self) -> Affine3A {
-        let r = rot_mat(self.rot);
+        self.affine_of(self.rot, self.t, self.tilt)
+    }
+
+    /// The point a free rotation turns about, in the node's own coordinates.
+    fn tilt_pivot(&self) -> Vec3 {
+        self.pivot.unwrap_or_else(|| self.volume().map_or(Vec3::ZERO, |v| v.dims.as_vec3() * 0.5))
+    }
+
+    /// `local_affine` for another pose (a key's).
+    pub fn affine_of(&self, rot: Rot, t: IVec3, tilt: Vec3) -> Affine3A {
+        let r = rot_mat(rot);
         let half = self.half();
-        if !self.tilted() {
-            return Affine3A::from_translation(self.t.as_vec3()) * Affine3A::from_mat3(r) * Affine3A::from_translation(-half);
+        if tilt == Vec3::ZERO {
+            return Affine3A::from_translation(t.as_vec3()) * Affine3A::from_mat3(r) * Affine3A::from_translation(-half);
         }
-        let pivot = self.pivot.unwrap_or_else(|| self.volume().map_or(Vec3::ZERO, |v| v.dims.as_vec3() * 0.5));
-        Affine3A::from_translation(self.t.as_vec3())
+        let pivot = self.tilt_pivot();
+        Affine3A::from_translation(t.as_vec3())
             * Affine3A::from_mat3(r)
             * Affine3A::from_translation(pivot - half)
-            * Affine3A::from_quat(self.tilt_quat())
+            * Affine3A::from_quat(crate::anim::tilt_quat(tilt))
             * Affine3A::from_translation(-pivot)
+    }
+
+    /// The pose whose transform into the parent is closest to `l`: a 90°
+    /// turn (`rot`, unless `l` is one exactly) with the free rotation
+    /// taking the rest (`tilt` if that still fits), and the translation
+    /// rounded to whole voxels at the pivot.
+    fn pose_for(&self, l: Affine3A, rot: Rot, tilt: Vec3) -> (Rot, IVec3, Vec3) {
+        let m = Mat3::from(l.matrix3);
+        let close = |a: Mat3| (a - m).abs().to_cols_array().iter().all(|v| *v < 1e-4);
+        let (rot, tilt) = match exact_rot(m) {
+            Some(r) => (r, Vec3::ZERO),
+            None if close(rot_mat(rot) * Mat3::from_quat(crate::anim::tilt_quat(tilt))) => (rot, tilt),
+            None => (rot, crate::anim::tilt_deg(Quat::from_mat3(&(rot_mat(rot).transpose() * m)).normalize())),
+        };
+        let p = self.tilt_pivot();
+        let at = l.transform_point3(p) - self.affine_of(rot, IVec3::ZERO, tilt).transform_point3(p);
+        (rot, at.round().as_ivec3(), tilt)
     }
 
     pub fn is_group(&self) -> bool {
@@ -393,6 +423,18 @@ impl World {
         }
     }
 
+    /// World box of a node with everything in or attached to it.
+    pub fn bounds_all(&self, id: usize) -> Option<(IVec3, IVec3)> {
+        let mut ids = Vec::new();
+        self.visit(id, &mut |i, _| ids.push(i));
+        let mut b: Option<(IVec3, IVec3)> = None;
+        for (lo, size) in ids.into_iter().filter_map(|i| self.bounds(i)) {
+            let hi = lo + size;
+            b = Some(b.map_or((lo, hi), |(a, z)| (a.min(lo), z.max(hi))));
+        }
+        b.map(|(lo, hi)| (lo, hi - lo))
+    }
+
     /// Flatten visible models (except `skip`) into one volume covering
     /// their boxes. Later models win where they overlap.
     pub fn composite(&self, skip: Option<usize>) -> Option<Composite> {
@@ -523,8 +565,10 @@ impl World {
         }
     }
 
-    /// Add an unrotated model under `parent` whose box starts at world `origin`.
+    /// Add an unrotated model under `parent` whose box starts at world
+    /// `origin`. A name that's taken gets a number (`hips 2`).
     pub fn add_model(&mut self, parent: usize, name: &str, volume: Volume, origin: IVec3) -> usize {
+        let name = &self.unique_name(name, None);
         let parent = self.group_of(parent);
         let pp = self.frame(parent);
         let layer = self.layers.first().map_or(-1, |l| l.id);
@@ -534,16 +578,52 @@ impl World {
         id
     }
 
-    /// Copy a node (and everything under it) next to the original.
+    /// `want`, or `want` numbered (`hips 2`, `hips 3` ...) if another node
+    /// (not `skip`) is called that. Empty stays empty (a default label).
+    pub fn unique_name(&self, want: &str, skip: Option<usize>) -> String {
+        let want = want.trim();
+        let taken = |s: &str| (0..self.nodes.len()).any(|i| Some(i) != skip && i != ROOT && self.node(i).is_some() && self.label(i).eq_ignore_ascii_case(s));
+        if want.is_empty() || !taken(want) {
+            return want.to_string();
+        }
+        let base = match want.rsplit_once(' ') {
+            Some((b, n)) if !b.trim().is_empty() && n.parse::<u32>().is_ok() => b.trim(),
+            _ => want,
+        };
+        (2..).map(|k| format!("{base} {k}")).find(|s| !taken(s)).expect("a free number")
+    }
+
+    /// Copy a node (and everything under it) next to the original; copied
+    /// names get numbers (`hips 2`).
     pub fn duplicate(&mut self, id: usize) -> Option<usize> {
         let parent = self.node(id)?.parent?;
         let copy = self.copy_into(id, parent);
-        if let Some(n) = self.node_mut(copy) {
-            if !n.name.is_empty() {
-                n.name = format!("{} copy", n.name);
+        let mut ids = Vec::new();
+        self.visit(copy, &mut |i, _| ids.push(i));
+        for i in ids {
+            let name = self.node(i).map(|n| n.name.clone()).unwrap_or_default();
+            let name = self.unique_name(&name, Some(i));
+            if let Some(n) = self.node_mut(i) {
+                n.name = name;
             }
         }
         Some(copy)
+    }
+
+    /// Move a node and all its keys by `delta` world cells (a copy put
+    /// beside its original keeps its animation there).
+    pub fn shift(&mut self, id: usize, delta: IVec3) {
+        let Some(parent) = self.node(id).and_then(|n| n.parent) else { return };
+        let local = |w: &World, f: u32| (Mat3::from(w.affine_at(parent, f).matrix3).inverse() * delta.as_vec3()).round().as_ivec3();
+        let keys: Vec<IVec3> = self.node(id).map(|n| n.keys.iter().map(|k| local(self, k.frame)).collect()).unwrap_or_default();
+        let (now, rest) = (local(self, self.frame), local(self, 0));
+        if let Some(n) = self.node_mut(id) {
+            n.t += now;
+            n.keys.iter_mut().zip(keys).for_each(|(k, d)| k.t += d);
+            if let Some(r) = &mut n.rest {
+                r.t += rest;
+            }
+        }
     }
 
     fn copy_into(&mut self, id: usize, parent: usize) -> usize {
@@ -575,20 +655,38 @@ impl World {
         true
     }
 
-    /// Move nodes into a new group under the first one's parent. World
-    /// placement doesn't change.
+    /// Move nodes into a new group inside the innermost group holding them
+    /// all. A part attached to another comes with what it hangs from (it
+    /// stays attached), and one inside another picked node comes along with
+    /// it. World placement doesn't change.
     pub fn group(&mut self, ids: &[usize]) -> Option<usize> {
-        let ids: Vec<usize> = ids.iter().copied().filter(|&i| i != ROOT && self.node(i).is_some()).collect();
-        let parent = self.node(*ids.first()?)?.parent?;
+        let mut picked: Vec<usize> = Vec::new();
+        for &i in ids.iter().filter(|&&i| i != ROOT && self.node(i).is_some()) {
+            let top = self.hang_root(i);
+            if !picked.contains(&top) {
+                picked.push(top);
+            }
+        }
+        let all = picked.clone();
+        picked.retain(|&i| !all.iter().any(|&o| o != i && self.is_ancestor(o, i)));
+        let mut parent = self.node(*picked.first()?)?.parent?;
+        while parent != ROOT && !picked.iter().all(|&i| self.is_ancestor(parent, i)) {
+            parent = self.node(parent).and_then(|n| n.parent).unwrap_or(ROOT);
+        }
         let g = Node::new("", Some(parent), self.layers.first().map_or(-1, |l| l.id), Kind::Group);
         let gid = self.push(parent, g);
-        for id in ids {
-            if self.is_ancestor(id, gid) {
-                continue;
-            }
+        for id in picked {
             self.reparent(id, gid);
         }
         Some(gid)
+    }
+
+    /// The part `id` hangs from (through attachments), or `id`.
+    fn hang_root(&self, mut id: usize) -> usize {
+        while let Some(p) = self.node(id).and_then(|n| n.parent).filter(|&p| self.node(p).is_some_and(|n| !n.is_group())) {
+            id = p;
+        }
+        id
     }
 
     fn is_ancestor(&self, a: usize, mut b: usize) -> bool {
@@ -602,46 +700,117 @@ impl World {
     }
 
     /// Move `id` under `to` (a group, or a part to attach it to), keeping
-    /// its world placement.
+    /// its world placement, free rotations included (to the nearest whole
+    /// voxel). Each key is converted with both parents' poses on its own
+    /// frame, so it stays where it was in the world on that frame.
     pub fn reparent(&mut self, id: usize, to: usize) -> bool {
+        self.move_under(id, to, false)
+    }
+
+    /// `reparent`; `bake` also keys the old parent's animation into `id`
+    /// (for a group that's going away).
+    fn move_under(&mut self, id: usize, to: usize, bake: bool) -> bool {
         if id == ROOT || id == to || self.is_ancestor(id, to) || self.node(to).is_none() {
             return false;
         }
-        let world = self.place(id);
         let Some(old) = self.node(id).and_then(|n| n.parent) else { return false };
-        let (from, to_frame) = (self.frame(old), self.frame(to));
-        self.rebase_keys(id, from, to_frame);
+        let (frame, anim) = (self.frame, self.anim.clone());
+        let Some(n) = self.node(id) else { return false };
+        // A change not keyed yet (a move just before attaching) keys this frame.
+        let now = n.key_now(frame);
+        let pending = !n.keys.is_empty() && n.pose(frame, &anim).is_none_or(|k| (k.rot, k.t, k.tilt) != (now.rot, now.t, now.tilt));
+        // A group's default pivot moves with its contents; fix it before
+        // it can pick up a free rotation.
+        let fix_pivot = n.is_group() && n.pivot.is_none() && (self.tilted(id) || self.tilted(to) || self.tilted(old));
+        let mut keys = n.keys.clone();
+        if pending {
+            match keys.binary_search_by_key(&frame, |k| k.frame) {
+                Ok(i) => keys[i] = now,
+                Err(i) => keys.insert(i, now),
+            }
+        }
+        let rest = n.rest;
+        if fix_pivot {
+            let p = self.pivot_local(id);
+            if let Some(n) = self.node_mut(id) {
+                n.pivot = Some(p);
+            }
+        }
+        let Some(n) = self.node(id) else { return false };
+        // Frames to key: its own, plus every frame the old parent moves on
+        // when baking that in.
+        let old_keys: Vec<u32> = self.node(old).map(|o| o.keys.iter().map(|k| k.frame).collect()).unwrap_or_default();
+        let mut frames: Vec<u32> = keys.iter().map(|k| k.frame).collect();
+        if bake && !old_keys.is_empty() {
+            frames.extend(&old_keys);
+            if anim.smooth && old_keys.len() > 1 {
+                frames.extend(0..anim.frames);
+            }
+            frames.sort_unstable();
+            frames.dedup();
+        }
+        // World placement on frame `f` with pose `k` -> the pose under `to`.
+        let convert = |f: u32, k: &crate::anim::Key| {
+            let (from, into) = (self.affine_at(old, f), self.affine_at(to, f));
+            let world = from * n.affine_of(k.rot, k.t, k.tilt);
+            let turn = nearest_rot(Mat3::from(into.matrix3).inverse() * Mat3::from(from.matrix3));
+            let (rot, t, tilt) = n.pose_for(into.inverse() * world, turn.mul(&k.rot), k.tilt);
+            crate::anim::Key { frame: f, rot, t, tilt }
+        };
+        let new_keys: Vec<crate::anim::Key> = frames
+            .iter()
+            .map(|&f| {
+                let k = keys.iter().find(|k| k.frame == f).copied().or_else(|| n.pose(f, &anim)).unwrap_or(now);
+                convert(f, &k)
+            })
+            .collect();
+        let live = convert(frame, &now);
+        let rest = rest.map(|r| convert(0, &r));
         if let Some(o) = self.node_mut(old) {
             o.children.retain(|&x| x != id);
         }
         if let Some(t) = self.node_mut(to) {
             t.children.push(id);
         }
-        let pp = self.frame(to);
-        let inv = pp.rot.inverse();
         if let Some(n) = self.node_mut(id) {
             n.parent = Some(to);
-            n.rot = inv.mul(&world.rot);
-            n.t = inv.apply(world.t - pp.t);
+            (n.rot, n.t, n.tilt) = (live.rot, live.t, live.tilt);
+            n.keys = new_keys;
+            n.rest = rest;
         }
         true
     }
 
-    /// Dissolve a group, moving its children to its parent.
+    /// Dissolve a group, moving its children to its parent; its animation
+    /// is keyed into them.
     pub fn ungroup(&mut self, id: usize) -> bool {
         let Some(n) = self.node(id) else { return false };
         let (Some(parent), true) = (n.parent, n.is_group()) else { return false };
         for c in n.children().to_vec() {
-            self.reparent(c, parent);
+            self.move_under(c, parent, true);
         }
         self.delete(id)
     }
 
-    /// Move a node by `delta` world cells.
+    /// Move a node by `delta` world cells (to the nearest whole voxel in
+    /// a freely rotated parent). A rig part's rest pose moves along, so a
+    /// motion applied later starts where it was moved to.
     pub fn translate(&mut self, id: usize, delta: IVec3) {
-        let inv = self.node(id).and_then(|n| n.parent).map_or(Rot::IDENTITY, |p| self.frame(p).rot.inverse());
+        self.move_by(id, delta, true);
+    }
+
+    fn move_by(&mut self, id: usize, delta: IVec3, rest: bool) {
+        let Some(p) = self.node(id).and_then(|n| n.parent) else { return };
+        let local = if self.tilted(p) {
+            (Mat3::from(self.affine(p).matrix3).inverse() * delta.as_vec3()).round().as_ivec3()
+        } else {
+            self.frame(p).rot.inverse().apply(delta)
+        };
         if let Some(n) = self.node_mut(id) {
-            n.t += inv.apply(delta);
+            n.t += local;
+            if let Some(r) = n.rest.as_mut().filter(|_| rest) {
+                r.t += local;
+            }
         }
     }
 
@@ -657,7 +826,7 @@ impl World {
                 n.rot = pr.inverse().mul(&q).mul(&pr).mul(&n.rot);
             }
             let shift = (before - self.pivot_world(id)).round().as_ivec3();
-            self.translate(id, shift);
+            self.move_by(id, shift, false);
             return;
         }
         let Some((lo, size)) = self.bounds(id) else { return };
@@ -670,7 +839,7 @@ impl World {
         }
         if let Some((lo, size)) = self.bounds(id) {
             let shift = (center2 - (lo * 2 + size)).div_euclid(IVec3::splat(2));
-            self.translate(id, shift);
+            self.move_by(id, shift, false);
         }
     }
 }
@@ -679,6 +848,32 @@ impl World {
 pub fn rot_mat(r: Rot) -> Mat3 {
     let c = |j: usize| Vec3::new(r.m[0][j] as f32, r.m[1][j] as f32, r.m[2][j] as f32);
     Mat3::from_cols(c(0), c(1), c(2))
+}
+
+/// The 90° rotation (or flip) closest to `m`, mirrored only if `m` is.
+fn nearest_rot(m: Mat3) -> Rot {
+    let mirror = m.determinant() < 0.0;
+    let mut best = (f32::MIN, Rot::IDENTITY);
+    for perm in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        for signs in 0..8 {
+            let mut r = Rot { m: [[0; 3]; 3] };
+            for (i, &j) in perm.iter().enumerate() {
+                r.m[i][j] = if signs >> i & 1 == 1 { -1 } else { 1 };
+            }
+            let rm = rot_mat(r);
+            let score: f32 = (0..3).map(|j| rm.col(j).dot(m.col(j))).sum();
+            if (rm.determinant() < 0.0) == mirror && score > best.0 {
+                best = (score, r);
+            }
+        }
+    }
+    best.1
+}
+
+/// `m` as a 90° rotation, if it is one.
+fn exact_rot(m: Mat3) -> Option<Rot> {
+    let r = nearest_rot(m);
+    (rot_mat(r) - m).abs().to_cols_array().iter().all(|v| *v < 1e-4).then_some(r)
 }
 
 // ---- pivots, free rotation, sockets ----
@@ -700,6 +895,69 @@ impl World {
     pub fn affine(&self, id: usize) -> Affine3A {
         let Some(n) = self.node(id) else { return Affine3A::IDENTITY };
         n.parent.map_or(Affine3A::IDENTITY, |p| self.affine(p)) * n.local_affine()
+    }
+
+    /// `affine` on another frame of the animation (the live pose on the
+    /// current one).
+    pub fn affine_at(&self, id: usize, frame: u32) -> Affine3A {
+        if frame == self.frame {
+            return self.affine(id);
+        }
+        let Some(n) = self.node(id) else { return Affine3A::IDENTITY };
+        let k = n.pose(frame, &self.anim).unwrap_or_else(|| n.key_now(frame));
+        n.parent.map_or(Affine3A::IDENTITY, |p| self.affine_at(p, frame)) * n.affine_of(k.rot, k.t, k.tilt)
+    }
+
+    /// World box (min, size) covering every visible part on every frame,
+    /// free rotations included (for placing new things beside them).
+    pub fn reach(&self) -> Option<(IVec3, IVec3)> {
+        let n = self.anim.frames.max(1);
+        let mut frames: Vec<u32> = (0..n).step_by((n as usize / 240).max(1)).collect();
+        frames.extend(self.nodes.iter().flatten().flat_map(|n| n.keys.iter().map(|k| k.frame)));
+        frames.sort_unstable();
+        frames.dedup();
+        let (mut lo, mut hi) = (Vec3::MAX, Vec3::MIN);
+        for m in self.models().into_iter().filter(|&m| self.visible(m)) {
+            let Some(v) = self.node(m).and_then(Node::volume) else { continue };
+            for &f in &frames {
+                let a = self.affine_at(m, f);
+                for c in 0..8 {
+                    let p = a.transform_point3((IVec3::new(c & 1, (c >> 1) & 1, c >> 2) * v.dims).as_vec3());
+                    (lo, hi) = (lo.min(p), hi.max(p));
+                }
+            }
+        }
+        if lo.x > hi.x {
+            return None;
+        }
+        let lo = (lo + 1e-3).floor().as_ivec3();
+        Some((lo, (hi - 1e-3).ceil().as_ivec3() - lo))
+    }
+
+    /// The free rotation as degrees about world axes, like the 90° turns
+    /// (`Node::tilt` is about the node's own axes). A turned or flipped
+    /// parent counts; a parent's free rotation adds on top.
+    pub fn tilt_world(&self, id: usize) -> Vec3 {
+        let Some(n) = self.node(id).filter(|n| n.tilted()) else { return Vec3::ZERO };
+        let r = self.place(id).rot;
+        if r == Rot::IDENTITY {
+            return n.tilt;
+        }
+        let m = rot_mat(r);
+        crate::anim::tilt_deg(Quat::from_mat3(&(m * Mat3::from_quat(n.tilt_quat()) * m.transpose())).normalize())
+    }
+
+    /// Set the free rotation from degrees about world axes (see
+    /// `tilt_world`).
+    pub fn set_tilt_world(&mut self, id: usize, deg: Vec3) {
+        let r = self.place(id).rot;
+        let own = if r == Rot::IDENTITY || deg == Vec3::ZERO {
+            deg
+        } else {
+            let m = rot_mat(r);
+            crate::anim::tilt_deg(Quat::from_mat3(&(m.transpose() * Mat3::from_quat(crate::anim::tilt_quat(deg)) * m)).normalize())
+        };
+        self.set_tilt(id, own);
     }
 
     /// The node's pivot in world space.
@@ -811,6 +1069,9 @@ pub fn write_extras(n: &Node, attrs: &mut crate::vox::Dict) {
         let list: Vec<String> = n.sockets.iter().map(|s| format!("{}:{}", s.name.replace(['|', ':'], "_"), v3(s.pos))).collect();
         attrs.insert("_vx_sockets".into(), list.join("|"));
     }
+    if let Some(r) = n.rest {
+        attrs.insert("_vx_rest".into(), format!("{} {} {} {} {}", r.rot.to_byte(), r.t.x, r.t.y, r.t.z, v3(r.tilt)));
+    }
 }
 
 fn read_extras(n: &mut Node, attrs: &crate::vox::Dict) {
@@ -824,6 +1085,10 @@ fn read_extras(n: &mut Node, attrs: &crate::vox::Dict) {
         .get("_vx_sockets")
         .map(|s| s.split('|').filter_map(|e| e.split_once(':')).filter_map(|(name, p)| Some(Socket { name: name.to_string(), pos: v3(p)? })).collect())
         .unwrap_or_default();
+    n.rest = attrs.get("_vx_rest").and_then(|s| {
+        let v: Vec<f32> = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        (v.len() == 7).then(|| crate::anim::Key { frame: 0, rot: Rot::from_byte(v[0] as u8), t: IVec3::new(v[1] as i32, v[2] as i32, v[3] as i32), tilt: Vec3::new(v[4], v[5], v[6]) })
+    });
 }
 
 // ---- .vox ----
@@ -1091,7 +1356,7 @@ mod tests {
         assert_eq!(w.node(ROOT).unwrap().children(), &[a, b]);
         assert_eq!(w.composite(None).unwrap().volume.cells, before.volume.cells);
         let d = w.duplicate(b).unwrap();
-        assert_eq!(w.label(d), "b copy");
+        assert_eq!(w.label(d), "b 2");
         assert!(w.delete(d) && w.node(d).is_none());
     }
 
@@ -1290,5 +1555,192 @@ mod tests {
         w.node_mut(id).unwrap().pivot = None;
         w.set_tilt(id, Vec3::new(10.0, 0.0, 40.0));
         check(&mut w, "tilted, default pivot");
+    }
+
+    /// Where `id` is in the world: its turn and where its pivot is.
+    fn pose_of(w: &World, id: usize) -> (Mat3, Vec3) {
+        (Mat3::from(w.affine(id).matrix3), w.pivot_world(id))
+    }
+
+    fn assert_same_pose(a: (Mat3, Vec3), b: (Mat3, Vec3), label: &str) {
+        assert!((a.0 - b.0).abs().to_cols_array().iter().all(|v| *v < 1e-3), "{label}: turned {} -> {}", a.0, b.0);
+        // Whole-voxel translations: the pivot stays within half a voxel.
+        assert!((a.1 - b.1).abs().max_element() <= 0.5 + 1e-3, "{label}: pivot {} -> {}", a.1, b.1);
+    }
+
+    fn body_and_arm() -> (World, usize, usize) {
+        let mut w = World::single(vol(IVec3::new(8, 4, 10), &[(IVec3::ZERO, 1)]));
+        let body = w.models()[0];
+        w.node_mut(body).unwrap().sockets.push(Socket { name: "shoulder".into(), pos: Vec3::new(8.0, 2.0, 9.0) });
+        let arm = w.add_model(ROOT, "arm", vol(IVec3::new(2, 2, 6), &[(IVec3::ZERO, 2)]), IVec3::new(20, 0, 0));
+        w.node_mut(arm).unwrap().pivot = Some(Vec3::new(1.0, 1.0, 6.0));
+        (w, body, arm)
+    }
+
+    #[test]
+    fn reparenting_keeps_free_rotations_in_place() {
+        let (mut w, body, arm) = body_and_arm();
+        assert!(w.attach_to(arm, body, Some("shoulder"), None));
+        w.reorient(body, Rot::turn(2, 1));
+        w.set_tilt(body, Vec3::new(0.0, 0.0, 35.0));
+        w.set_tilt(arm, Vec3::new(50.0, 0.0, 0.0));
+        let before = pose_of(&w, arm);
+        assert!(w.detach(arm));
+        assert_same_pose(before, pose_of(&w, arm), "detach");
+        // Attached again where it is, then into and out of a tilted group.
+        assert!(w.reparent(arm, body));
+        assert_same_pose(before, pose_of(&w, arm), "attach where it is");
+        assert!(w.detach(arm));
+        let g = w.group(&[arm]).unwrap();
+        w.set_tilt(g, Vec3::new(10.0, 0.0, 20.0));
+        let before = pose_of(&w, arm);
+        assert!(w.ungroup(g));
+        assert_same_pose(before, pose_of(&w, arm), "ungroup");
+        // Exact turns stay exact: no free rotation appears.
+        let (mut w, body, arm) = body_and_arm();
+        w.reorient(body, Rot::turn(0, 1));
+        assert!(w.reparent(arm, body));
+        assert!(w.detach(arm));
+        assert_eq!(w.node(arm).unwrap().tilt, Vec3::ZERO);
+    }
+
+    #[test]
+    fn reparenting_on_another_frame_converts_each_key_on_its_frame() {
+        let (mut w, body, arm) = body_and_arm();
+        w.anim.frames = 9;
+        assert!(w.attach_to(arm, body, Some("shoulder"), None));
+        // The body walks off and turns; the arm swings.
+        w.key(body);
+        w.key(arm);
+        w.set_frame(8);
+        w.translate(body, IVec3::new(10, 0, 0));
+        w.reorient(body, Rot::turn(2, 1));
+        w.key(body);
+        w.set_tilt(arm, Vec3::new(60.0, 0.0, 0.0));
+        w.key(arm);
+        let at = |w: &mut World, f: u32| {
+            w.set_frame(f);
+            pose_of(w, arm)
+        };
+        let (b0, b8) = (at(&mut w, 0), at(&mut w, 8));
+        w.set_frame(4);
+        assert!(w.detach(arm));
+        assert_same_pose(b0, at(&mut w, 0), "frame 0");
+        assert_same_pose(b8, at(&mut w, 8), "frame 8");
+    }
+
+    #[test]
+    fn ungrouping_keeps_the_groups_animation() {
+        let (mut w, body, arm) = body_and_arm();
+        w.anim.frames = 6;
+        let g = w.group(&[body, arm]).unwrap();
+        w.set_tilt(g, Vec3::new(0.0, 0.0, 1.0));
+        w.set_tilt(g, Vec3::ZERO);
+        w.key(g);
+        w.set_frame(5);
+        w.translate(g, IVec3::new(0, 7, 0));
+        w.set_tilt(g, Vec3::new(0.0, 0.0, 40.0));
+        w.key(g);
+        let poses = |w: &mut World| -> Vec<(Mat3, Vec3)> {
+            (0..6).map(|f| {
+                w.set_frame(f);
+                pose_of(w, body)
+            }).collect()
+        };
+        let before = poses(&mut w);
+        w.set_frame(2);
+        assert!(w.ungroup(g));
+        for (f, (a, b)) in before.into_iter().zip(poses(&mut w)).enumerate() {
+            assert_same_pose(a, b, &format!("frame {f}"));
+        }
+    }
+
+    #[test]
+    fn a_shifted_copy_keeps_its_animation_beside_the_original() {
+        let (mut w, _, arm) = body_and_arm();
+        w.anim.frames = 6;
+        w.key(arm);
+        w.set_frame(5);
+        w.translate(arm, IVec3::new(0, 0, 4));
+        w.key(arm);
+        let c = w.duplicate(arm).unwrap();
+        w.shift(c, IVec3::new(0, 10, 0));
+        assert_eq!(w.label(c), "arm 2");
+        for f in [0, 3, 5] {
+            w.set_frame(f);
+            let (a, b) = (w.bounds(arm).unwrap(), w.bounds(c).unwrap());
+            assert_eq!(b.0, a.0 + IVec3::new(0, 10, 0), "frame {f}");
+        }
+    }
+
+    #[test]
+    fn groups_go_in_groups_and_attachments_stay() {
+        let (mut w, body, arm) = body_and_arm();
+        assert!(w.attach_to(arm, body, Some("shoulder"), None));
+        let rock = w.add_model(ROOT, "rock", vol(IVec3::ONE, &[(IVec3::ZERO, 3)]), IVec3::new(-5, 0, 0));
+        // The arm comes first: the group used to land inside the body.
+        let g = w.group(&[arm, rock]).unwrap();
+        assert_eq!(w.node(g).unwrap().parent, Some(ROOT));
+        assert_eq!(w.node(arm).unwrap().parent, Some(body), "still attached");
+        assert_eq!(w.node(g).unwrap().children(), &[body, rock]);
+        // Nested: the new group goes in the innermost group holding both.
+        let inner = w.group(&[rock]).unwrap();
+        assert_eq!(w.node(inner).unwrap().parent, Some(g));
+    }
+
+    #[test]
+    fn names_get_numbers_instead_of_repeating() {
+        let mut w = World::single(Volume::new(IVec3::ONE));
+        let a = w.add_model(ROOT, "hips", Volume::new(IVec3::ONE), IVec3::ZERO);
+        let b = w.add_model(ROOT, "hips", Volume::new(IVec3::ONE), IVec3::ZERO);
+        assert_eq!((w.label(a), w.label(b)), ("hips".into(), "hips 2".into()));
+        let c = w.duplicate(b).unwrap();
+        assert_eq!(w.label(c), "hips 3");
+        assert_eq!(w.unique_name("HIPS", Some(a)), "HIPS");
+        assert_eq!(w.unique_name("Hips 2", None), "Hips 4");
+    }
+
+    #[test]
+    fn free_rotation_reads_and_sets_about_world_axes() {
+        let mut w = World::single(vol(IVec3::new(4, 2, 6), &[(IVec3::ZERO, 1)]));
+        let m = w.models()[0];
+        w.reorient(m, Rot::turn(2, 1));
+        w.set_tilt_world(m, Vec3::new(30.0, 0.0, 0.0));
+        let want = Mat3::from_rotation_x(30f32.to_radians()) * rot_mat(Rot::turn(2, 1));
+        assert!(Mat3::from(w.affine(m).matrix3).abs_diff_eq(want, 1e-4));
+        assert!((w.tilt_world(m) - Vec3::new(30.0, 0.0, 0.0)).abs().max_element() < 1e-2, "{}", w.tilt_world(m));
+        // Flipped: still a turn the right way round the world's z.
+        w.reorient(m, Rot::flip(0));
+        w.set_tilt_world(m, Vec3::new(0.0, 0.0, 45.0));
+        let want = Mat3::from_rotation_z(45f32.to_radians()) * rot_mat(w.place(m).rot);
+        assert!(Mat3::from(w.affine(m).matrix3).abs_diff_eq(want, 1e-4));
+    }
+
+    #[test]
+    fn reach_covers_every_frame_and_free_rotation() {
+        let (mut w, _, arm) = body_and_arm();
+        w.anim.frames = 4;
+        w.key(arm);
+        w.set_frame(3);
+        w.translate(arm, IVec3::new(30, 0, 0));
+        w.key(arm);
+        w.set_frame(0);
+        let (lo, size) = w.reach().unwrap();
+        assert_eq!(lo.x + size.x, 52);
+        w.set_tilt(arm, Vec3::new(0.0, 45.0, 0.0));
+        let ((lo, size), (blo, bsize)) = (w.reach().unwrap(), w.bounds(arm).unwrap());
+        assert!(lo.cmple(blo).all() && (lo + size).cmpge(blo + bsize).all(), "{lo} {size} vs {blo} {bsize}");
+        assert!(blo.x < 20, "tilted out to the side");
+    }
+
+    #[test]
+    fn rest_pose_round_trips_through_vox() {
+        let (mut w, _, arm) = body_and_arm();
+        w.node_mut(arm).unwrap().rest = Some(crate::anim::Key { frame: 0, rot: Rot::turn(1, 1), t: IVec3::new(3, -2, 7), tilt: Vec3::new(5.0, 0.0, -10.0) });
+        let path = std::env::temp_dir().join(format!("voxely-rest-{}.vox", std::process::id()));
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[], &[]).unwrap();
+        let back = World::from_vox(&VoxFile::load(&path).unwrap());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.node(back.find("arm").unwrap()).unwrap().rest, w.node(arm).unwrap().rest);
     }
 }

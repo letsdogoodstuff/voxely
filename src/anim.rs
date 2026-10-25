@@ -218,6 +218,10 @@ impl World {
         let before = n.keys.len();
         n.keys.retain(|k| k.frame != frame);
         let removed = n.keys.len() != before;
+        if n.keys.is_empty() {
+            // Nothing keyed on any more: a later motion starts from here.
+            n.rest = None;
+        }
         let f = self.frame;
         self.set_frame(f);
         removed
@@ -279,16 +283,22 @@ impl World {
         self.set_frame(f);
     }
 
-    /// Convert `id`'s keys after moving it from parent frame `from` to `to`.
-    pub(crate) fn rebase_keys(&mut self, id: usize, from: crate::world::Place, to: crate::world::Place) {
-        let inv = to.rot.inverse();
-        if let Some(n) = self.node_mut(id) {
-            for k in &mut n.keys {
-                let (wr, wt) = (from.rot.mul(&k.rot), from.rot.apply(k.t) + from.t);
-                k.rot = inv.mul(&wr);
-                k.t = inv.apply(wt - to.t);
-            }
+    /// Whether part `id` shows the same drawing the same way up on `frame`
+    /// as now, so its voxels in the edit view stay the same.
+    pub fn same_view(&self, id: usize, frame: u32) -> bool {
+        let frame = frame.min(self.anim.frames.saturating_sub(1));
+        let Some(n) = self.node(id) else { return false };
+        if !n.flip.is_empty() && n.slot_for(frame) != n.flip_active {
+            return false;
         }
+        let (mut now, mut then) = (Rot::IDENTITY, Rot::IDENTITY);
+        let mut cur = Some(id);
+        while let Some(n) = cur.and_then(|c| self.node(c)) {
+            now = n.rot.mul(&now);
+            then = n.pose(frame, &self.anim).map_or(n.rot, |k| k.rot).mul(&then);
+            cur = n.parent;
+        }
+        now == then
     }
 }
 
@@ -412,5 +422,65 @@ mod tests {
             assert_eq!((na.t, na.rot, na.tilt), (nb.t, nb.rot, nb.tilt), "frame {f}");
             assert_eq!(na.volume().unwrap().cells, nb.volume().unwrap().cells, "frame {f}");
         }
+    }
+
+    #[test]
+    fn same_view_tells_when_the_edit_view_stays() {
+        let (mut w, m) = arm();
+        w.key(m);
+        w.set_frame(4);
+        w.translate(m, IVec3::new(3, 0, 0));
+        w.set_tilt(m, Vec3::new(20.0, 0.0, 0.0));
+        w.key(m);
+        // Moved and tilted: the upright edit view is the same.
+        assert!(w.same_view(m, 0));
+        w.set_frame(8);
+        w.reorient(m, Rot::turn(2, 1));
+        w.key(m);
+        assert!(!w.same_view(m, 0), "turned a quarter");
+        w.set_frame(6);
+        w.split_frame(m);
+        assert!(!w.same_view(m, 2), "another drawing");
+    }
+
+    #[test]
+    fn keys_past_the_end_can_be_removed() {
+        let (mut w, m) = arm();
+        w.set_frame(8);
+        w.key(m);
+        w.set_frames(4);
+        assert!(w.remove_key(m, 8));
+        assert!(w.node(m).unwrap().keys.is_empty());
+    }
+
+    #[test]
+    fn changing_frames_keeps_each_voxel_edit_its_own_undo_step() {
+        let mut s = crate::scene::Scene::empty(IVec3::new(2, 2, 6));
+        let id = s.editing().unwrap();
+        s.change_quiet(|w| {
+            w.anim.frames = 6;
+            w.set_frame(3);
+            w.split_frame(id);
+        });
+        let mut e = crate::edit::Editor::new(1);
+        let edit = |s: &mut crate::scene::Scene, e: &mut crate::edit::Editor, z: i32| {
+            let mut v = s.volume.clone();
+            v.set(IVec3::new(0, 0, z), 7);
+            e.commit(&mut s.volume, v);
+        };
+        edit(&mut s, &mut e, 0);
+        edit(&mut s, &mut e, 1);
+        // Frame 4 shows the same drawing: the edits stay with the editor.
+        assert!(s.set_frame(4, |v| e.undo(v)));
+        assert!(e.can_undo());
+        // Frame 0 shows another drawing: the edits become two tree steps.
+        assert!(!s.set_frame(0, |v| e.undo(v)));
+        e.reset();
+        let shown = |s: &crate::scene::Scene, z: i32| s.world.node(id).unwrap().flip_volumes()[1].1.get(IVec3::new(0, 0, z));
+        assert_eq!((shown(&s, 0), shown(&s, 1)), (7, 7));
+        assert!(s.undo_tree(false));
+        assert_eq!((shown(&s, 0), shown(&s, 1)), (7, 0), "one undo, one edit");
+        assert!(s.undo_tree(false));
+        assert_eq!(shown(&s, 0), 0);
     }
 }
