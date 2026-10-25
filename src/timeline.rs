@@ -7,8 +7,10 @@ use egui::{Color32, RichText, Sense, Ui};
 
 use crate::anim::Anim;
 use crate::outline::TreeOp;
+use crate::rig::Bone;
 use crate::scene::Scene;
 use crate::ui::Command;
+use crate::world::{World, ROOT};
 
 #[derive(Default)]
 pub struct TimelineState {
@@ -117,15 +119,29 @@ pub fn panel(ui: &mut Ui, scene: &Scene, st: &mut TimelineState, cmds: &mut Vec<
         }
         ui.separator();
         let motions = crate::rig::MOTIONS;
-        egui::ComboBox::from_id_salt("motion").selected_text(motions[st.motion.min(motions.len() - 1)].0).show_ui(ui, |ui| {
-            for (k, (name, about)) in motions.iter().enumerate() {
-                ui.selectable_value(&mut st.motion, k, *name).on_hover_text(*about);
+        let rig = scene.picked.first().copied();
+        // Only the motions made for this kind of rig.
+        let fits: Vec<usize> = match rig_kinds(w, rig) {
+            Some(quad) => (0..motions.len()).filter(|&k| motions[k].0.starts_with("quad") == quad).collect(),
+            None => (0..motions.len()).collect(),
+        };
+        if !fits.contains(&st.motion) {
+            st.motion = fits[0];
+        }
+        egui::ComboBox::from_id_salt("motion").selected_text(motions[st.motion].0).show_ui(ui, |ui| {
+            for &k in &fits {
+                let (name, about) = motions[k];
+                ui.selectable_value(&mut st.motion, k, name).on_hover_text(about);
             }
         });
-        if ui.button("Apply motion").on_hover_text("Key this motion onto the rig's parts (found by name: hips, torso, head, upper_arm_l ...), replacing their keys").clicked() {
+        let name = motions[st.motion].0;
+        let on = rig_label(w, rig, name.starts_with("quad"));
+        let tip = format!("Key this motion onto {on}'s parts (found by name: hips, torso, head, upper_arm_l ...), replacing their keys. Pick a part of another rig to animate that one.");
+        if ui.button("Apply motion").on_hover_text(tip).clicked() {
             let frames = if a.frames > 1 { a.frames } else { 24 };
-            cmds.push(Command::Tree(TreeOp::Motion(motions[st.motion].0.to_string(), frames)));
+            cmds.push(Command::Tree(TreeOp::Motion(name.to_string(), frames)));
         }
+        ui.add(egui::Label::new(RichText::new(format!("on: {on}")).weak()).extend());
         ui.separator();
         if ui.button("Import...").on_hover_text("Animation clips from a .glb / .gltf file (e.g. Quaternius's free Universal Animation Library), retargeted onto the rig").clicked() {
             cmds.push(Command::ImportAnimation(None));
@@ -137,9 +153,11 @@ pub fn panel(ui: &mut Ui, scene: &Scene, st: &mut TimelineState, cmds: &mut Vec<
                     ui.selectable_value(&mut st.clip, k, n);
                 }
             });
-            if ui.button("Use clip").clicked() {
+            let on = rig_label(w, rig, false);
+            if ui.button("Use clip").on_hover_text(format!("Retarget this clip onto {on}")).clicked() {
                 cmds.push(Command::ImportAnimation(Some((path.clone(), pick))));
             }
+            ui.add(egui::Label::new(RichText::new(format!("on: {on}")).weak()).extend());
         }
     });
     // The frame strip: click or drag to scrub. Keys of the picked part are
@@ -177,6 +195,44 @@ pub fn panel(ui: &mut Ui, scene: &Scene, st: &mut TimelineState, cmds: &mut Vec<
         if f != frame {
             cmds.push(Command::Frame(f));
         }
+    }
+}
+
+/// Top-level objects that are rigs (have parts named like bones).
+fn rigs(w: &World) -> Vec<usize> {
+    let tops = w.node(ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
+    tops.into_iter().filter(|&t| !crate::rig::find_bones(w, t).is_empty()).collect()
+}
+
+/// Whether `top` is a four-legged rig (true) or a humanoid (false).
+fn is_quad(w: &World, top: usize) -> bool {
+    crate::rig::find_bones(w, top).keys().any(|b| matches!(b, Bone::LegFL | Bone::LegFR | Bone::LegBL | Bone::LegBR))
+}
+
+/// Which kind of rig a motion would go onto: the picked part's, or the
+/// scene's when all its rigs are one kind. None: either.
+fn rig_kinds(w: &World, picked: Option<usize>) -> Option<bool> {
+    if let Some(p) = picked {
+        let top = crate::rig::top_of(w, p);
+        return (!crate::rig::find_bones(w, top).is_empty()).then(|| is_quad(w, top));
+    }
+    let kinds: Vec<bool> = rigs(w).into_iter().map(|t| is_quad(w, t)).collect();
+    kinds.first().copied().filter(|&k| kinds.iter().all(|&o| o == k))
+}
+
+/// The rig a motion (`quad`: a four-legged one) goes onto, as
+/// `rig::apply_motion` picks it: its name, and its number when the scene
+/// has several rigs.
+pub fn rig_label(w: &World, picked: Option<usize>, quad: bool) -> String {
+    let root = crate::rig::rig_root(w, picked, if quad { Bone::LegFL } else { Bone::UpperLegL });
+    if root == ROOT {
+        return "no rig".into();
+    }
+    let all = rigs(w);
+    match all.iter().position(|&t| t == root) {
+        Some(k) if all.len() > 1 => format!("{} (rig {})", w.label(root), k + 1),
+        Some(_) => w.label(root),
+        None => format!("{} (not a rig)", w.label(root)),
     }
 }
 

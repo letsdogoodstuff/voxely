@@ -88,16 +88,21 @@ fn row(ui: &mut Ui, w: &World, id: usize, picked: &[usize], editing: Option<usiz
         if ui.checkbox(&mut shown, "").on_hover_text("Show").changed() {
             cmds.push(Command::Tree(TreeOp::ToggleHidden(id)));
         }
-        let mut text = RichText::new(w.label(id));
+        // Shortened in the middle so a side suffix (_l / _r) stays readable.
+        let label = w.label(id);
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let room = ui.available_width() - 2.0 * ui.spacing().button_padding.x;
+        let shown = fit_middle(ui, &label, &font, room);
+        let hint = "Click to pick, Shift+click to add, double-click to edit";
+        let hint = if shown != label { format!("{label}\n{hint}") } else { hint.to_string() };
+        let mut text = RichText::new(shown);
         if n.hidden {
             text = text.weak();
         }
         if Some(id) == editing || n.is_group() {
             text = text.strong();
         }
-        let r = ui
-            .add(egui::Button::selectable(picked.contains(&id), text).truncate())
-            .on_hover_text("Click to pick, Shift+click to add, double-click to edit");
+        let r = ui.add(egui::Button::selectable(picked.contains(&id), text)).on_hover_text(hint);
         if r.double_clicked() {
             cmds.push(Command::EditPart(id));
         } else if r.clicked() {
@@ -111,6 +116,25 @@ fn row(ui: &mut Ui, w: &World, id: usize, picked: &[usize], editing: Option<usiz
             }
         });
     }
+}
+
+/// `text` shortened in the middle ("upper_a…m_l") to fit `width` points
+/// in `font`, keeping its start and its last word.
+pub fn fit_middle(ui: &Ui, text: &str, font: &egui::FontId, width: f32) -> String {
+    let fits = |s: &str| ui.ctx().fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE).size().x) <= width;
+    if fits(text) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let last_word = chars.iter().rev().position(|c| matches!(c, '_' | ' ' | '-' | '.')).map_or(0, |k| k + 1);
+    for keep in (1..chars.len()).rev() {
+        let tail = (keep * 2 / 5).max(if last_word <= 4 { last_word } else { 0 }).clamp(1, keep);
+        let s: String = chars[..keep - tail].iter().chain(['\u{2026}'].iter()).chain(&chars[chars.len() - tail..]).collect();
+        if fits(&s) {
+            return s;
+        }
+    }
+    "\u{2026}".into()
 }
 
 /// The World panel.
@@ -150,7 +174,9 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                 ui.end_row();
             });
         });
-        CollapsingHeader::new("Rig").default_open(false).show(ui, |ui| {
+        // Open while the scene has no rig yet, to show it can make one.
+        let has_rig = w.node(ROOT).is_some_and(|r| r.children().iter().any(|&t| !crate::rig::find_bones(w, t).is_empty()));
+        CollapsingHeader::new("Rig").default_open(!has_rig).show(ui, |ui| {
             ui.weak("A character of blocks with joints, ready for the motions in the timeline. Redraw each part to taste.");
             ui.horizontal_wrapped(|ui| {
                 op(ui, cmds, "+ Humanoid", "Hips, torso, head, two-piece arms and legs", true, TreeOp::AddRig(false));
@@ -209,7 +235,7 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
         }
         if scene.mode == Mode::World {
             ui.add_space(6.0);
-            ui.weak("Drag a part to move it. Tab edits the picked model.");
+            ui.add(egui::Label::new(RichText::new("Drag a part to move it. Tab edits the picked model.").weak()).wrap());
         }
     });
 }
@@ -219,8 +245,10 @@ fn vec3_ui(ui: &mut Ui, v: &mut Vec3, speed: f64, suffix: &str) -> (bool, bool) 
     let (mut changed, mut begin) = (false, false);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
+        // Three equal fields across the column, so none is cut off.
+        let w = ((ui.available_width() - 4.0) / 3.0).floor();
         for k in 0..3 {
-            let r = ui.add(egui::DragValue::new(&mut v[k]).speed(speed).max_decimals(1).suffix(suffix));
+            let r = ui.add_sized([w, ui.spacing().interact_size.y], egui::DragValue::new(&mut v[k]).speed(speed).max_decimals(1).suffix(suffix));
             if r.changed() {
                 changed = true;
                 begin |= !r.dragged() || r.drag_started();

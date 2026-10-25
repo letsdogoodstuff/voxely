@@ -68,6 +68,27 @@ impl State {
         self.unsaved = 0;
         self.project = Some(path.to_path_buf());
     }
+
+    /// Whether autosave is on, and the edits between autosaves.
+    pub fn autosave_config(&self) -> (bool, usize) {
+        (self.autosave, self.every)
+    }
+
+    pub fn set_autosave_config(&mut self, on: bool, every: usize) {
+        self.autosave = on;
+        self.every = every.clamp(1, 100_000);
+    }
+
+    /// Count one unsaved edit toward the project at `path`. Returns true
+    /// when an autosave is due.
+    fn count(&mut self, path: &Path) -> bool {
+        if self.project.as_deref() != Some(path) {
+            self.project = Some(path.to_path_buf());
+            self.unsaved = 0;
+        }
+        self.unsaved += 1;
+        self.autosave && self.unsaved >= self.every && self.last_autosave.is_none_or(|t| t.elapsed() >= AUTOSAVE_GAP)
+    }
 }
 
 /// A whole-scene snapshot.
@@ -134,15 +155,26 @@ pub fn after_commit(ctx: &mut Ctx) {
 
 /// Count one unsaved edit, autosaving when due.
 fn count_edit(ctx: &mut Ctx) {
-    let st = &mut ctx.ed.tools.inspect;
-    if st.project.as_ref() != Some(&ctx.ed.save_path) {
-        st.project = Some(ctx.ed.save_path.clone());
-        st.unsaved = 0;
-    }
-    st.unsaved += 1;
-    if st.autosave && st.unsaved >= st.every && st.last_autosave.is_none_or(|t| t.elapsed() >= AUTOSAVE_GAP) {
+    let path = ctx.ed.save_path.clone();
+    if ctx.ed.tools.inspect.count(&path) {
         autosave(ctx, "");
     }
+}
+
+/// Count an edit made in the window (same autosave settings as agents'
+/// edits). When an autosave was due: what it saved, or why it failed.
+pub fn count_gui_edit(ctx: &mut Ctx) -> Option<Result<String, String>> {
+    let path = ctx.ed.save_path.clone();
+    let st = &mut ctx.ed.tools.inspect;
+    if !st.count(&path) {
+        return None;
+    }
+    let n = st.unsaved;
+    st.last_autosave = Some(Instant::now());
+    Some(match app::save_project(ctx.r, ctx.scene, ctx.ed, path.clone()) {
+        Ok(p) => Ok(format!("Autosaved {} to {}", plural(n, "edit"), p.display())),
+        Err(e) => Err(format!("Autosave to {} failed: {e:#}; use Save As to keep this work", path.display())),
+    })
 }
 
 fn autosave(ctx: &mut Ctx, when: &str) {
@@ -788,6 +820,24 @@ mod tests {
 
     fn args(v: Value) -> Value {
         v
+    }
+
+    #[test]
+    fn autosave_counts_edits_per_project() {
+        let mut st = State::default();
+        st.set_autosave_config(true, 3);
+        let a = Path::new("a.vox");
+        assert!(!st.count(a) && !st.count(a));
+        assert!(st.count(a), "due on the third edit");
+        st.mark_saved(a);
+        assert!(!st.count(a));
+        // Another project starts over.
+        assert!(!st.count(Path::new("b.vox")));
+        assert_eq!(st.unsaved, 1);
+        st.set_autosave_config(false, 1);
+        assert!(!st.count(Path::new("b.vox")), "off");
+        st.set_autosave_config(true, 0);
+        assert_eq!(st.autosave_config(), (true, 1));
     }
 
     #[test]

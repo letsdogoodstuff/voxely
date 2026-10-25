@@ -1,5 +1,5 @@
 //! User preferences kept between sessions (not per project): the
-//! interface scale. Stored as JSON in the platform's settings folder.
+//! interface scale, palette favorites and autosave. Stored as JSON in the platform's settings folder.
 
 use std::path::PathBuf;
 
@@ -22,11 +22,14 @@ pub struct Prefs {
     /// Starred palettes (file paths, or "preset:<name>"), in the order
     /// starred; the first four fill the palette's quick buttons.
     pub palette_favorites: Vec<String>,
+    /// Save the project after every `autosave_every` edits.
+    pub autosave: bool,
+    pub autosave_every: usize,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, palette_favorites: Vec::new() }
+        Prefs { ui_scale: 1.0, palette_favorites: Vec::new(), autosave: true, autosave_every: 25 }
     }
 }
 
@@ -63,13 +66,19 @@ impl Prefs {
             if let Some(a) = v["palette_favorites"].as_array() {
                 p.palette_favorites = a.iter().filter_map(|s| s.as_str().map(String::from)).collect();
             }
+            if let Some(on) = v["autosave"].as_bool() {
+                p.autosave = on;
+            }
+            if let Some(n) = v["autosave_every"].as_u64() {
+                p.autosave_every = n.clamp(1, 100_000) as usize;
+            }
         }
         p
     }
 
     pub fn save(&self) {
         let Some(path) = Self::path() else { return };
-        let text = serde_json::to_string_pretty(&json!({ "ui_scale": self.ui_scale, "palette_favorites": self.palette_favorites })).unwrap_or_default();
+        let text = serde_json::to_string_pretty(&json!({ "ui_scale": self.ui_scale, "palette_favorites": self.palette_favorites, "autosave": self.autosave, "autosave_every": self.autosave_every })).unwrap_or_default();
         let res = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, text));
         if let Err(e) = res {
             eprintln!("saving preferences to {}: {e}", path.display());
@@ -122,6 +131,10 @@ mod tests {
         assert_eq!(Prefs::from_json(r#"{"ui_scale": 9}"#).ui_scale, 2.0);
         assert_eq!(Prefs::from_json("not json").ui_scale, 1.0);
         assert_eq!(Prefs::from_json(r#"{"palette_favorites": ["preset:pico-8", 3]}"#).palette_favorites, vec!["preset:pico-8"]);
+        let p = Prefs::from_json(r#"{"autosave": false, "autosave_every": 0}"#);
+        assert_eq!((p.autosave, p.autosave_every), (false, 1));
+        let d = Prefs::from_json("{}");
+        assert_eq!((d.autosave, d.autosave_every), (true, 25));
     }
 
     #[test]
