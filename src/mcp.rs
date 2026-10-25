@@ -15,9 +15,10 @@ use crate::control::{self, Ctx};
 use crate::gpu::{self, Renderer};
 use crate::scene::Scene;
 
-/// Where a running window listens for control requests.
+/// Where a running window listens for control requests. `VOXELY_SOCKET`
+/// overrides it, to keep a second window (and its clients) apart.
 pub fn socket_path() -> PathBuf {
-    std::env::temp_dir().join("voxely-control.sock")
+    std::env::var_os("VOXELY_SOCKET").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("voxely-control.sock"))
 }
 
 /// MagicaVoxel's install folder (for shaders, palettes and models).

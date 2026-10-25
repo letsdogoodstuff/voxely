@@ -169,6 +169,8 @@ voxely script --types > voxely.d.ts    # TypeScript declarations for editor auto
 - **Limits:** no file or network access except through voxely's tools; scripts stop after 120 s
   (`--timeout <s>`, or `timeout` on `run_script`).
 - **Agents:** the `run_script` MCP tool runs a script in one call (`source` or `path`, plus `args`).
+- **Several windows:** the newest window takes the control socket. Set `VOXELY_SOCKET` to a path for
+  a window and for the `voxely script` / `voxely mcp` that should drive it, to keep them apart.
 
 ## glTF export
 
