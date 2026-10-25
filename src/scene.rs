@@ -328,6 +328,9 @@ pub struct Scene {
     pub picked: Vec<usize>,
     history: Vec<World>,
     future: Vec<World>,
+    /// Tree undo steps pushed so far (`history` is capped, so its length
+    /// doesn't say).
+    steps: u64,
     /// sRGB palette as stored in the file, indexed by color index.
     pub palette: Vec<[u8; 4]>,
     /// Render chunks from the file, written back unchanged on save.
@@ -867,6 +870,7 @@ impl Scene {
             picked: Vec::new(),
             history: Vec::new(),
             future: Vec::new(),
+            steps: 0,
             palette,
             render_dicts,
             materials,
@@ -952,6 +956,26 @@ impl Scene {
             self.history.remove(0);
         }
         self.future.clear();
+        self.steps += 1;
+    }
+
+    /// Tree undo steps pushed so far, for `squash_tree`.
+    pub fn tree_steps(&self) -> u64 {
+        self.steps
+    }
+
+    /// Fold every tree change since `tree_steps()` was `steps`, plus the
+    /// edited model's unsaved voxels, into one undo step back to `before`.
+    /// Callers reset the voxel editor (its history is now in the tree).
+    pub fn squash_tree(&mut self, steps: u64, before: World) {
+        self.store();
+        let n = (self.steps - steps) as usize;
+        if n == 0 {
+            return;
+        }
+        self.history.truncate(self.history.len().saturating_sub(n));
+        self.remember();
+        *self.history.last_mut().unwrap() = before;
     }
 
     /// Edit model `id` (or the model of a group's first model).

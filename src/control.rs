@@ -34,6 +34,8 @@ Projects live in a workspace folder and show in the window's Project list; use n
 a named one, list_projects / open_project to flip between them, and save_file to save. \
 Typical flow: new_project -> draw with fill_box / draw_shape / draw_line / set_voxels -> look with \
 screenshot (fast) -> set_material and set_render_settings -> render (path traced) -> save_file. \
+For loops, procedural builds or anything needing many calls, use run_script: one JavaScript program \
+that calls every tool as voxely.<camelCaseName>({...}) and can edit a part's whole grid as a Uint8Array. \
 Every edit is undoable. If the voxely window is open, edits appear in it live.
 
 Scenes are a tree of parts (models) and groups, like MagicaVoxel's World editor. Voxel tools work on one part at a time, in that part's own coordinates (0..size-1): the part being edited (see get_scene_info), or the one named by a tool's `part` argument. Build separate pieces (body, head, arms, wheels, props) as separate parts with create_part, place them with transform_part (move, 90° rotate, flip) and group_parts, and inspect the tree with list_parts. Give parts pivots (set_pivot: a shoulder, a hinge) \
@@ -178,6 +180,12 @@ fn base_tools() -> Value {
                 "description": "gltf: a .glb for game engines (Godot, Unity, Unreal, Three.js, Bevy) with metal/roughness, emission and glass materials; use a .gltf path for JSON" },
             "path": { "type": "string", "description": "Output file (default: <workspace>/export/<project>.<ext>)" },
         }), &["format"]),
+        tool("run_script", "Run a JavaScript program (QuickJS) inside voxely: one call instead of many. Every tool is voxely.<camelCase name>(args) with the same arguments, e.g. voxely.fillBox({from: [0, 0, 0], to: [9, 9, 0], color: \"#88aa44\"}); it returns parsed JSON or text and throws on errors. For bulk edits, v = voxely.getVolume({part}) gives a part's grid in its own coordinates (default: the part being edited): v.size and v.cells (a Uint8Array of palette indices, x fastest, then y, then z) with v.get(x, y, z), v.set(x, y, z, c) and v.forEach(fn); voxely.setVolume(v, {part}) writes it back (new Volume([x, y, z]) starts empty and resizes the part). voxely.color(\"#rrggbb\") gives the nearest palette index. Returns console.log output and the last expression's value. The whole script is one undo step. No file or network access.", json!({
+            "source": { "type": "string", "description": "JavaScript source" },
+            "path": { "type": "string", "description": "Or a .js file to run" },
+            "args": { "description": "Any JSON value, available to the script as `args`" },
+            "timeout": { "type": "number", "description": "Seconds before the script is stopped (default 120)" },
+        }), &[]),
         tool("set_view_mode", "Show the modeler or the live path tracer in the window.", json!({
             "mode": { "type": "string", "enum": ["model", "render"] },
         }), &["mode"]),
@@ -350,7 +358,7 @@ fn color_arg(scene: &Scene, args: &Value, key: &str) -> Result<u8> {
 // ---------------------------------------------------------------- helpers
 
 /// Commit an edit to the volume and push it to the GPU.
-fn apply(ctx: &mut Ctx, new: Volume) -> bool {
+pub(crate) fn apply(ctx: &mut Ctx, new: Volume) -> bool {
     let changed = ctx.ed.editor.commit(&mut ctx.scene.volume, new);
     if changed {
         app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
@@ -392,7 +400,7 @@ fn arr(p: IVec3) -> [i32; 3] {
 }
 
 /// A summary line after an edit.
-fn edited(ctx: &Ctx, changed: bool, what: &str) -> Vec<Value> {
+pub(crate) fn edited(ctx: &Ctx, changed: bool, what: &str) -> Vec<Value> {
     let n = count(&ctx.scene.volume);
     let d = ctx.scene.volume.dims;
     if changed {
@@ -524,21 +532,28 @@ fn tree_changed(ctx: &mut Ctx) {
     app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
 }
 
+/// Switch to editing `part` (a name or id) for a voxel tool, or check that
+/// some part is being edited if none is given.
+pub(crate) fn focus_part(ctx: &mut Ctx, part: Option<&Value>) -> Result<()> {
+    if let Some(p) = part.filter(|p| !p.is_null()) {
+        let id = find_part(ctx.scene, Some(p))?;
+        if ctx.scene.editing() != Some(id) {
+            if ctx.scene.world.node(id).is_some_and(|n| n.is_group()) {
+                bail!("`{}` is a group; pass one of its parts", ctx.scene.world.label(id));
+            }
+            app::set_mode(ctx.scene, ctx.ed, Some(id));
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+        }
+    } else if ctx.scene.editing().is_none() {
+        bail!("the window is in World mode; pass `part` or call edit_part first (list_parts shows the parts)");
+    }
+    Ok(())
+}
+
 fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
     let a = args;
     if PART_TOOLS.contains(&name) {
-        if let Some(p) = get(a, "part") {
-            let id = find_part(ctx.scene, Some(p))?;
-            if ctx.scene.editing() != Some(id) {
-                if ctx.scene.world.node(id).is_some_and(|n| n.is_group()) {
-                    bail!("`{}` is a group; pass one of its parts", ctx.scene.world.label(id));
-                }
-                app::set_mode(ctx.scene, ctx.ed, Some(id));
-                app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
-            }
-        } else if ctx.scene.editing().is_none() {
-            bail!("the window is in World mode; pass `part` or call edit_part first (list_parts shows the parts)");
-        }
+        focus_part(ctx, get(a, "part"))?;
     }
     match name {
         "list_parts" => {
@@ -1432,6 +1447,16 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 out.push(json!({ "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(data), "mimeType": "image/png" }));
             }
             Ok(out)
+        }
+        "run_script" => {
+            let (source, file) = match (string(a, "source"), string(a, "path")) {
+                (Some(src), _) => (src.to_string(), "script.js".to_string()),
+                (None, Some(p)) => (std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?, p.to_string()),
+                (None, None) => bail!("give JavaScript `source` or a `path`"),
+            };
+            let timeout = num(a, "timeout").map_or(crate::script::DEFAULT_TIMEOUT, |s| std::time::Duration::from_secs_f32(s.clamp(0.1, 3600.0)));
+            let outcome = crate::script::run(ctx, source, file, get(a, "args").cloned().unwrap_or(Value::Null), timeout);
+            Ok(vec![text(crate::script::report(&outcome)?)])
         }
         "set_view_mode" => {
             let modeling = match string(a, "mode").context("missing `mode`")? {
