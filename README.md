@@ -53,6 +53,7 @@ Projects live in a workspace folder, `~/Documents/voxely` (set `VOXELY_WORKSPACE
 The window's Project column lists them under **My projects**, above MagicaVoxel's **Samples**, and
 re-reads the folder every second, so projects an agent creates show up while you watch. Ctrl+S saves
 the current project there; opening a sample and saving makes a copy, leaving the original alone.
+Exports (the Export box at the bottom of the Project column) go to `<workspace>/export` by default.
 
 ### Tools
 
@@ -68,6 +69,7 @@ the current project there; opening a sample and saving makes a copy, leaving the
 | Selection | `select`, `move_selection` |
 | History | `undo`, `redo` |
 | Viewing | `set_camera`, `screenshot` (fast modeler image), `set_render_settings`, `render` (path traced), `set_view_mode` |
+| Export | `export`: MagicaVoxel's formats: obj, ply, mc, cube (meshes), xraw, slab, qb, vox (volumes), iso, 2d, slice (sprite images), point (point cloud) |
 
 Conventions:
 - Coordinates are voxel cells `[x, y, z]`, with z up.
