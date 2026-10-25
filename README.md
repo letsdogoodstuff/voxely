@@ -19,6 +19,10 @@ Agents such as Claude Code or Codex can use it to build, edit, light and render 
 - Otherwise it runs headless in the MCP process. The scene lives until the client
   disconnects, so ask the agent to `save_file`.
 
+Before changing the agent instructions, guides or prompts, read
+[docs/agent-build-quality.md](docs/agent-build-quality.md): what made agents' models
+worse, and the house style that works.
+
 ### The Agents panel
 
 Click **Agents** in the bottom bar to open the Agents panel under the 3D view:
