@@ -158,9 +158,13 @@ fn base_tools() -> Value {
         tool("get_voxels", "List solid voxels, optionally within a box.", json!({
             "from": xyz(XYZ), "to": xyz(XYZ), "limit": { "type": "integer", "description": "Max voxels returned (default 5000)" },
         }), &[]),
-        tool("get_slice", "A text map of one layer: color indices, '.' for empty. For axis z, rows run from high y (top) to low y.", json!({
-            "axis": axis.clone(), "index": { "type": "integer" },
-        }), &["index"]),
+        tool("get_slice", "A text map of one layer, or a range of layers: color indices, '.' for empty. For axis z, rows run from high y (top) to low y. Rows are labeled with their coordinate and a ruler labels every 5th column. Ranges print each layer under a header and collapse empty layers. Big canvases are downsampled (see max_cells); crop with from/to to zoom in. For an overview, get_projection shows the top surface in one map.", json!({
+            "axis": axis.clone(), "index": { "type": "integer", "description": "The layer" },
+            "from_index": { "type": "integer", "description": "First layer of a range (instead of index)" },
+            "to_index": { "type": "integer", "description": "Last layer of a range, inclusive" },
+            "from": xyz("Crop corner, inclusive (the axis coordinate is ignored)"), "to": xyz("Other crop corner"),
+            "max_cells": { "type": "integer", "description": "Max map width/height before downsampling (default 128)" },
+        }), &[]),
         tool("edit_model", "MagicaVoxel's whole-model tools. fill/clear apply to the selection if there is one.", json!({
             "op": { "type": "string", "enum": ["full", "fill", "clear", "reverse", "double", "half", "flip", "rotate", "fit", "loop", "mirror", "diagonal", "hull", "flood", "dilate", "erode", "maze", "perlin"],
                 "description": "full: fill empty space; fill: recolor voxels; reverse: swap empty/solid; double/half: scale 2x/0.5x; flip/rotate(90 deg)/mirror(make symmetric)/diagonal/loop(shift 1 with wrap) need `axis`; fit: shrink canvas to model; hull: remove hidden voxels; flood: fill enclosed space; dilate/erode: grow/shrink 1; maze/perlin: generate" },
@@ -467,15 +471,26 @@ fn arr(p: IVec3) -> [i32; 3] {
     p.to_array()
 }
 
-/// A summary line after an edit.
+/// The report after an edit: voxels added/removed/recolored and where (when
+/// this call committed one), the part's size and count, and the unsaved
+/// count or an autosave once due (see `inspect::report`).
 pub(crate) fn edited(ctx: &Ctx, changed: bool, what: &str) -> Vec<Value> {
-    let n = count(&ctx.scene.volume);
-    let d = ctx.scene.volume.dims;
-    if changed {
-        vec![text(format!("{what}. Canvas {}x{}x{}, {n} voxels.", d.x, d.y, d.z))]
+    let why = if changed {
+        None
+    } else if what.starts_with("undo") || what.starts_with("redo") {
+        Some(format!("nothing to {}", &what[..4]))
+    } else if ctx.ed.editor.selection().is_some_and(|s| !s.contains(&true)) {
+        Some("the selection is empty; select mode none clears it".to_string())
     } else {
-        vec![text(format!("{what}: nothing changed. Canvas {}x{}x{}, {n} voxels.", d.x, d.y, d.z))]
-    }
+        None
+    };
+    inspect::report(ctx, changed, what, why, Vec::new())
+}
+
+/// `edited` for fill_box / draw_shape / draw_line (`shape` "line"), which
+/// also warns when the shape spilled past the canvas.
+fn edited_shape(ctx: &Ctx, changed: bool, what: &str, shape: &str, args: &Value) -> Vec<Value> {
+    inspect::shape_report(ctx, changed, what, shape, args)
 }
 
 /// Whether cell `p` lies inside `shape` inscribed in [lo, hi].
@@ -980,6 +995,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let list = get(a, "voxels").and_then(Value::as_array).context("`voxels` must be [[x, y, z, color], ...]")?;
             let mut new = ctx.scene.volume.clone();
             let mut skipped = 0;
+            let mut sides = (IVec3::ZERO, new.dims - IVec3::ONE);
             for item in list {
                 let v = item.as_array().filter(|v| v.len() == 4).context("each voxel is [x, y, z, color]")?;
                 let n = |i: usize| v[i].as_f64().map(|f| f.round() as i32).context("voxel coordinates must be numbers");
@@ -989,12 +1005,25 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                     new.set_index(new.index(p), c);
                 } else {
                     skipped += 1;
+                    sides = (sides.0.min(p), sides.1.max(p));
                 }
             }
             let changed = apply(ctx, new);
             let mut out = edited(ctx, changed, &format!("Set {} voxels", list.len() - skipped));
             if skipped > 0 {
-                out.push(text(format!("{skipped} voxels were outside the canvas and skipped; use resize_canvas to grow it.")));
+                let d = ctx.scene.volume.dims;
+                let names = ["x", "y", "z"];
+                let mut past = Vec::new();
+                for k in 0..3 {
+                    if sides.0[k] < 0 {
+                        past.push(format!("{} down to {}", names[k], sides.0[k]));
+                    }
+                    if sides.1[k] >= d[k] {
+                        past.push(format!("{} up to {} (max {})", names[k], sides.1[k], d[k] - 1));
+                    }
+                }
+                let all = if skipped == list.len() { "All " } else { "" };
+                out.push(text(format!("{all}{skipped} voxels were outside the canvas {}x{}x{} ({}) and skipped; use resize_canvas to grow it, or another part.", d.x, d.y, d.z, past.join(", "))));
             }
             Ok(out)
         }
@@ -1003,7 +1032,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let c = color_arg(ctx.scene, a, "color")?;
             let new = shape_volume(&ctx.scene.volume, "box", 2, from, to, c, boolean(a, "hollow").unwrap_or(false));
             let changed = apply(ctx, new);
-            Ok(edited(ctx, changed, "Filled box"))
+            Ok(edited_shape(ctx, changed, "Filled box", "box", a))
         }
         "draw_shape" => {
             let shape = string(a, "shape").context("missing `shape`")?;
@@ -1014,7 +1043,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let c = color_arg(ctx.scene, a, "color")?;
             let new = shape_volume(&ctx.scene.volume, shape, axis(a)?, from, to, c, boolean(a, "hollow").unwrap_or(false));
             let changed = apply(ctx, new);
-            Ok(edited(ctx, changed, &format!("Drew {shape}")))
+            Ok(edited_shape(ctx, changed, &format!("Drew {shape}"), shape, a))
         }
         "draw_line" => {
             let (from, to) = (ivec3(a, "from")?, ivec3(a, "to")?);
@@ -1040,13 +1069,17 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 }
             }
             let changed = apply(ctx, new);
-            Ok(edited(ctx, changed, "Drew line"))
+            Ok(edited_shape(ctx, changed, "Drew line", "line", a))
         }
         "get_voxels" => {
             let v = &ctx.scene.volume;
+            let max = v.dims - IVec3::ONE;
             let lo = opt_ivec3(a, "from")?.unwrap_or(IVec3::ZERO);
-            let hi = opt_ivec3(a, "to")?.unwrap_or(v.dims - IVec3::ONE);
+            let hi = opt_ivec3(a, "to")?.unwrap_or(max);
             let (lo, hi) = (lo.min(hi), lo.max(hi));
+            if hi.cmplt(IVec3::ZERO).any() || lo.cmpgt(max).any() {
+                bail!("the box {:?}..{:?} lies outside the canvas; coordinates run [0, 0, 0]..{:?}", arr(lo), arr(hi), arr(max));
+            }
             let limit = int(a, "limit").unwrap_or(5000).max(1) as usize;
             let mut list = Vec::new();
             let mut total = 0;
@@ -1059,48 +1092,13 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                     }
                 }
             }
-            let out = json!({ "total": total, "returned": list.len(), "voxels": list });
+            let mut out = json!({ "total": total, "returned": list.len(), "voxels": list });
+            if total > limit {
+                out["note"] = json!(format!("Only the first {limit} of {total}; narrow from/to, raise limit, or see get_slice / get_projection for an overview."));
+            }
             Ok(vec![text(serde_json::to_string(&out)?)])
         }
-        "get_slice" => {
-            let v = &ctx.scene.volume;
-            let ax = axis(a)?;
-            let index = int(a, "index").context("missing `index`")? as i32;
-            if index < 0 || index >= v.dims[ax] {
-                bail!("index {index} is outside 0..{}", v.dims[ax]);
-            }
-            // Rows along the second in-plane axis (top = high), columns
-            // along the first.
-            let (u, w) = match ax {
-                0 => (1, 2),
-                1 => (0, 2),
-                _ => (0, 1),
-            };
-            let names = ["x", "y", "z"];
-            let mut out = format!("Slice {}={index}: columns {} 0..{}, rows {} from {} (top) down to 0\n", names[ax], names[u], v.dims[u] - 1, names[w], v.dims[w] - 1);
-            let mut used = std::collections::BTreeSet::new();
-            for row in (0..v.dims[w]).rev() {
-                let mut line = format!("{row:>4} ");
-                for col in 0..v.dims[u] {
-                    let mut p = IVec3::ZERO;
-                    p[ax] = index;
-                    p[u] = col;
-                    p[w] = row;
-                    let c = v.get(p);
-                    if c == 0 {
-                        line.push_str("  .");
-                    } else {
-                        used.insert(c);
-                        line.push_str(&format!("{c:>3}"));
-                    }
-                }
-                out.push_str(line.trim_end());
-                out.push('\n');
-            }
-            let legend: Vec<String> = used.iter().map(|&c| format!("{c}={}", hex(ctx.scene.palette[c as usize]))).collect();
-            out.push_str(&format!("colors: {}", legend.join(" ")));
-            Ok(vec![text(out)])
-        }
+        "get_slice" => Ok(vec![text(inspect::slice(&ctx.scene.volume, &ctx.scene.palette, a)?)]),
         "edit_model" => {
             let op_name = string(a, "op").context("missing `op`")?;
             if let Some(c) = get(a, "color") {

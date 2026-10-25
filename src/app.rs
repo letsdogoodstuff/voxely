@@ -333,6 +333,7 @@ pub fn save_project(scene: &Scene, ed: &mut EditState, path: PathBuf) -> Result<
     ed.save_path = path.clone();
     ed.source = Some(path.clone());
     ed.rescan();
+    ed.tools.inspect.mark_saved(&path);
     Ok(path)
 }
 
