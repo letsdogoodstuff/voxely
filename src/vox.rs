@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use glam::{IVec3, Mat3};
 
 use crate::scene::Volume;
+use crate::anim::Key;
 use crate::world::{Kind, Rot, World, ROOT};
 
 pub type Dict = HashMap<String, String>;
@@ -26,8 +27,11 @@ pub enum Node {
         attrs: Dict,
         child: i32,
         layer: i32,
+        /// The first frame's transform.
         rotation: Mat3,
         translation: IVec3,
+        /// Every frame's dictionary (`_f`, `_r`, `_t`), for animation.
+        frames: Vec<Dict>,
     },
     Group {
         attrs: Dict,
@@ -36,6 +40,8 @@ pub enum Node {
     Shape {
         attrs: Dict,
         models: Vec<i32>,
+        /// Frame each model starts on (`_f`), for flipbook animation.
+        model_frames: Vec<u32>,
     },
 }
 
@@ -101,6 +107,14 @@ pub fn decode_rotation(r: u8) -> Mat3 {
     Mat3::from_cols_array_2d(&rows).transpose()
 }
 
+/// A `nTRN` frame's rotation and translation.
+pub fn frame_transform(fd: &Dict) -> (Mat3, IVec3) {
+    let rotation = fd.get("_r").and_then(|s| s.parse::<u8>().ok()).map_or(Mat3::IDENTITY, decode_rotation);
+    let v: Vec<i32> = fd.get("_t").map(|t| t.split_whitespace().filter_map(|s| s.parse().ok()).collect()).unwrap_or_default();
+    let translation = if v.len() == 3 { IVec3::new(v[0], v[1], v[2]) } else { IVec3::ZERO };
+    (rotation, translation)
+}
+
 impl VoxFile {
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
@@ -156,23 +170,9 @@ impl VoxFile {
                     let _reserved = r.i32()?;
                     let layer = r.i32()?;
                     let frames = r.i32()?;
-                    let mut rotation = Mat3::IDENTITY;
-                    let mut translation = IVec3::ZERO;
-                    for k in 0..frames {
-                        let fd = r.dict()?;
-                        if k == 0 {
-                            if let Some(rv) = fd.get("_r").and_then(|s| s.parse::<u8>().ok()) {
-                                rotation = decode_rotation(rv);
-                            }
-                            if let Some(t) = fd.get("_t") {
-                                let v: Vec<i32> = t.split_whitespace().filter_map(|s| s.parse().ok()).collect();
-                                if v.len() == 3 {
-                                    translation = IVec3::new(v[0], v[1], v[2]);
-                                }
-                            }
-                        }
-                    }
-                    f.nodes.insert(node, Node::Transform { attrs, child, layer, rotation, translation });
+                    let frames: Vec<Dict> = (0..frames.clamp(0, 100_000)).map(|_| r.dict()).collect::<Result<_>>()?;
+                    let (rotation, translation) = frames.first().map_or((Mat3::IDENTITY, IVec3::ZERO), frame_transform);
+                    f.nodes.insert(node, Node::Transform { attrs, child, layer, rotation, translation, frames });
                 }
                 b"nGRP" => {
                     let node = r.i32()?;
@@ -185,12 +185,13 @@ impl VoxFile {
                     let node = r.i32()?;
                     let attrs = r.dict()?;
                     let n = r.i32()?;
-                    let mut models = Vec::new();
-                    for _ in 0..n {
+                    let (mut models, mut model_frames) = (Vec::new(), Vec::new());
+                    for k in 0..n {
                         models.push(r.i32()?);
-                        r.dict()?;
+                        let d = r.dict()?;
+                        model_frames.push(d.get("_f").and_then(|v| v.trim().parse().ok()).unwrap_or(k as u32));
                     }
-                    f.nodes.insert(node, Node::Shape { attrs, models });
+                    f.nodes.insert(node, Node::Shape { attrs, models, model_frames });
                 }
                 b"LAYR" => {
                     let id = r.i32()?;
@@ -242,6 +243,9 @@ fn put_chunk(out: &mut Vec<u8>, id: &[u8; 4], content: &[u8], children: &[u8]) {
     out.extend_from_slice(children);
 }
 
+/// voxely's timeline settings, in a render chunk MagicaVoxel ignores.
+pub const ANIM_TYPE: &str = "_vx_anim";
+
 /// MagicaVoxel models are at most 256 voxels on a side.
 const MAX_MODEL: i32 = 256;
 
@@ -261,32 +265,53 @@ impl Graph {
 
     #[allow(clippy::too_many_arguments)]
     fn transform(&mut self, id: i32, child: i32, name: &str, hidden: bool, layer: i32, rot: u8, t: IVec3) {
-        self.transform_with(id, child, name, hidden, layer, rot, t, Dict::new());
+        self.transform_with(id, child, name, hidden, layer, rot, t, Dict::new(), &[]);
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transform_with(&mut self, id: i32, child: i32, name: &str, hidden: bool, layer: i32, rot: u8, t: IVec3, mut attrs: Dict) {
+    /// `keys` (with their translations already offset) replace the single
+    /// frame when the node is animated.
+    fn transform_with(&mut self, id: i32, child: i32, name: &str, hidden: bool, layer: i32, rot: u8, t: IVec3, mut attrs: Dict, keys: &[Key]) {
         if !name.is_empty() {
             attrs.insert("_name".into(), name.into());
         }
         if hidden {
             attrs.insert("_hidden".into(), "1".into());
         }
-        let mut frame = Dict::new();
-        if rot != Rot::IDENTITY.to_byte() {
-            frame.insert("_r".into(), rot.to_string());
-        }
-        if t != IVec3::ZERO {
-            frame.insert("_t".into(), format!("{} {} {}", t.x, t.y, t.z));
-        }
+        let frame = |rot: u8, t: IVec3| {
+            let mut frame = Dict::new();
+            if rot != Rot::IDENTITY.to_byte() {
+                frame.insert("_r".into(), rot.to_string());
+            }
+            if t != IVec3::ZERO {
+                frame.insert("_t".into(), format!("{} {} {}", t.x, t.y, t.z));
+            }
+            frame
+        };
+        let frames: Vec<Dict> = if keys.is_empty() {
+            vec![frame(rot, t)]
+        } else {
+            keys.iter()
+                .map(|k| {
+                    let mut d = frame(k.rot.to_byte(), k.t);
+                    d.insert("_f".into(), k.frame.to_string());
+                    if k.tilt != glam::Vec3::ZERO {
+                        d.insert("_vx_tilt".into(), format!("{} {} {}", k.tilt.x, k.tilt.y, k.tilt.z));
+                    }
+                    d
+                })
+                .collect()
+        };
         let mut c = Vec::new();
         put_i32(&mut c, id);
         put_dict(&mut c, &attrs);
         put_i32(&mut c, child);
         put_i32(&mut c, -1);
         put_i32(&mut c, layer);
-        put_i32(&mut c, 1);
-        put_dict(&mut c, &frame);
+        put_i32(&mut c, frames.len() as i32);
+        for f in &frames {
+            put_dict(&mut c, f);
+        }
         self.nodes.push((id, chunk(b"nTRN", &c)));
     }
 
@@ -302,6 +327,28 @@ impl Graph {
     }
 
     fn shape(&mut self, id: i32, v: &Volume, origin: IVec3, size: IVec3) {
+        self.shape_frames(id, &[(0, v)], origin, size);
+    }
+
+    /// A shape showing each (first frame, voxels) model in turn.
+    fn shape_frames(&mut self, id: i32, frames: &[(u32, &Volume)], origin: IVec3, size: IVec3) {
+        let mut c = Vec::new();
+        put_i32(&mut c, id);
+        put_dict(&mut c, &Dict::new());
+        put_i32(&mut c, frames.len() as i32);
+        for &(frame, v) in frames {
+            put_i32(&mut c, self.models.len() as i32);
+            let mut d = Dict::new();
+            if frames.len() > 1 {
+                d.insert("_f".into(), frame.to_string());
+            }
+            put_dict(&mut c, &d);
+            self.model_data(v, origin, size);
+        }
+        self.nodes.push((id, chunk(b"nSHP", &c)));
+    }
+
+    fn model_data(&mut self, v: &Volume, origin: IVec3, size: IVec3) {
         let mut xyzi = Vec::new();
         for z in 0..size.z {
             for y in 0..size.y {
@@ -313,13 +360,6 @@ impl Graph {
                 }
             }
         }
-        let mut c = Vec::new();
-        put_i32(&mut c, id);
-        put_dict(&mut c, &Dict::new());
-        put_i32(&mut c, 1);
-        put_i32(&mut c, self.models.len() as i32);
-        put_dict(&mut c, &Dict::new());
-        self.nodes.push((id, chunk(b"nSHP", &c)));
         self.models.push((size, xyzi));
     }
 
@@ -332,24 +372,25 @@ impl Graph {
         let (name, rot, layer, t) = (node.name.as_str(), node.rot.to_byte(), node.layer, node.t + offset);
         let mut extras = Dict::new();
         crate::world::write_extras(node, &mut extras);
+        let keys: Vec<Key> = node.keys.iter().map(|k| Key { t: k.t + offset, ..*k }).collect();
         match &node.kind {
             Kind::Group => {
-                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras, &keys);
                 self.children(w, child, &[], &node.children, IVec3::ZERO);
             }
             Kind::Model(v) if node.children.is_empty() => {
-                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
-                self.model(child, v, layer);
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras, &keys);
+                self.model(child, node, v, layer);
             }
             Kind::Model(v) => {
                 // A part with attached parts: a group holding the part and
                 // them, marked so voxely reads it back as one part.
                 extras.insert("_vx_part".into(), "1".into());
-                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras, &keys);
                 let (shape_trn, shape) = (self.id(), self.id());
                 self.children(w, child, &[shape_trn], &node.children, -(v.dims / 2));
                 self.transform(shape_trn, shape, "", false, layer, Rot::IDENTITY.to_byte(), IVec3::ZERO);
-                self.model(shape, v, layer);
+                self.model(shape, node, v, layer);
             }
         }
     }
@@ -365,9 +406,12 @@ impl Graph {
 
     /// A model's voxels as shape `id`, or a group of tiles when it is over
     /// 256 on a side (landing on the same cells).
-    fn model(&mut self, id: i32, v: &Volume, layer: i32) {
-        if v.dims.cmple(IVec3::splat(MAX_MODEL)).all() {
-            return self.shape(id, v, IVec3::ZERO, v.dims);
+    fn model(&mut self, id: i32, node: &crate::world::Node, v: &Volume, layer: i32) {
+        let frames = node.flip_volumes();
+        // Flipbook models share a size in `.vox`; the largest covers them.
+        let size = frames.iter().fold(v.dims, |a, (_, f)| a.max(f.dims));
+        if size.cmple(IVec3::splat(MAX_MODEL)).all() {
+            return self.shape_frames(id, &frames, IVec3::ZERO, size);
         }
         let tiles = (v.dims + IVec3::splat(MAX_MODEL - 1)) / MAX_MODEL;
         let mut placed = Vec::new();
@@ -458,9 +502,25 @@ pub fn write(
         put_dict(&mut c, d);
         put_chunk(&mut body, b"MATL", &c, &[]);
     }
-    for d in render {
+    for d in render.iter().filter(|d| d.get("_type").is_none_or(|t| t != ANIM_TYPE)) {
         let mut c = Vec::new();
         put_dict(&mut c, d);
+        put_chunk(&mut body, b"rOBJ", &c, &[]);
+    }
+    if world.animated() {
+        let a = &world.anim;
+        let d: Dict = [
+            ("_type", ANIM_TYPE.to_string()),
+            ("_frames", a.frames.to_string()),
+            ("_fps", a.fps.to_string()),
+            ("_loop", (a.looping as u8).to_string()),
+            ("_smooth", (a.smooth as u8).to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let mut c = Vec::new();
+        put_dict(&mut c, &d);
         put_chunk(&mut body, b"rOBJ", &c, &[]);
     }
 

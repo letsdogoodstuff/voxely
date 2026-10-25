@@ -36,6 +36,14 @@ pub enum TreeOp {
     Attach(usize, usize, Option<String>),
     /// Stop following; stays where it is.
     Detach(usize),
+    /// Timeline settings.
+    SetAnim(crate::anim::Anim),
+    /// Key a node's pose on the current frame, or remove that key.
+    Key(usize),
+    DeleteKey(usize),
+    /// Flipbook: own voxels from the current frame on, or drop them.
+    SplitFrame(usize),
+    MergeFrame(usize),
     /// New pivot, free rotation and sockets for a node. `true` starts an
     /// undo step (false continues a drag).
     Extras(usize, Extras, bool),

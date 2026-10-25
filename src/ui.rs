@@ -89,6 +89,8 @@ pub enum Command {
     /// Edit this node's model (a group's first model).
     EditPart(usize),
     Tree(crate::outline::TreeOp),
+    /// Show this animation frame.
+    Frame(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -510,6 +512,8 @@ pub struct Status<'a> {
     /// Free camera: rotating turns the view around the eye.
     pub free: &'a mut bool,
     pub agent: &'a mut crate::agents::AgentState,
+    /// The animation timeline is showing.
+    pub timeline: &'a mut bool,
     pub hint: &'a str,
 }
 
@@ -557,6 +561,7 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
         command(ui, cmds, "Reset", "Reset camera [F12]", Command::ResetCamera);
         command(ui, cmds, "Snap", "Snapshot [6]", Command::Snapshot);
         ui.separator();
+        ui.toggle_value(s.timeline, "Anim").on_hover_text("Animation timeline");
         crate::agents::badge(ui, s.agent);
         ui.separator();
         ui.weak(s.hint);

@@ -1,4 +1,5 @@
 mod agents;
+mod anim;
 mod app;
 mod control;
 mod edit;
@@ -12,6 +13,7 @@ mod outline;
 mod ops;
 mod palette_ops;
 mod scene;
+mod timeline;
 mod ui;
 mod vox;
 mod world;

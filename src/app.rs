@@ -72,6 +72,7 @@ pub struct EditState {
     last_click: Option<(std::time::Instant, usize)>,
     /// World mode: nodes copied with Ctrl+C.
     pub part_clipboard: Vec<usize>,
+    pub timeline: crate::timeline::TimelineState,
     cameras: [Option<Camera>; QUICK_SLOT + 1],
 }
 
@@ -116,6 +117,7 @@ impl EditState {
             world_drag: None,
             last_click: None,
             part_clipboard: Vec::new(),
+            timeline: Default::default(),
             cameras: [None; QUICK_SLOT + 1],
         }
     }
@@ -463,6 +465,24 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
         TreeOp::Detach(id) => {
             scene.change(|w| w.detach(id));
         }
+        TreeOp::SetAnim(a) => {
+            let frame = scene.world.frame;
+            scene.change_quiet(|w| {
+                w.anim = a;
+                w.set_frame(frame);
+            });
+        }
+        TreeOp::Key(id) => scene.change_quiet(|w| w.key(id)),
+        TreeOp::DeleteKey(id) => {
+            let frame = scene.world.frame;
+            scene.change_quiet(|w| w.remove_key(id, frame));
+        }
+        TreeOp::SplitFrame(id) => {
+            scene.change_quiet(|w| w.split_frame(id));
+        }
+        TreeOp::MergeFrame(id) => {
+            scene.change_quiet(|w| w.merge_frame(id));
+        }
         TreeOp::Extras(id, x, begin) => {
             let set = |w: &mut crate::world::World| {
                 if let Some(n) = w.node_mut(id) {
@@ -572,6 +592,8 @@ pub(crate) fn loaded(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     ed.hover = None;
     r.load_scene(scene);
     ed.editor.sel_dirty = false;
+    ed.timeline.play(false);
+    ed.timeline.open |= scene.world.animated();
     eprintln!("Ctrl+S saves to {}", ed.save_path.display());
 }
 
@@ -719,6 +741,15 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             },
         },
         Command::EditPart(id) => set_mode(scene, ed, Some(id)),
+        Command::Frame(f) => {
+            if f == scene.world.frame {
+                false
+            } else {
+                scene.set_frame(f);
+                ed.editor.reset();
+                true
+            }
+        }
         Command::Tree(op) => tree_op(op, scene, ed),
         Command::Op(op) => match apply_op(op, scene, &ed.editor) {
             Some(new) => ed.editor.commit(&mut scene.volume, new),
@@ -1087,7 +1118,7 @@ pub fn build_ui(
             };
             let iso = is_iso(r);
             let options = r.modeler.as_mut().filter(|_| r.modeling).map(|m| &mut m.options);
-            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, agent: &mut ed.agent, hint };
+            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, agent: &mut ed.agent, timeline: &mut ed.timeline.open, hint };
             if ui::status_bar(ui, status, cmds) {
                 iso_camera(r);
             }
@@ -1131,6 +1162,9 @@ pub fn build_ui(
         }
         // Docked under the 3D view (after the side panels, so it spans
         // only the view) instead of floating over the model.
+        if ed.timeline.open {
+            egui::Panel::bottom("timeline").show(ui, |ui| crate::timeline::panel(ui, scene, &mut ed.timeline, cmds));
+        }
         if ed.agent.open {
             egui::Panel::bottom("agents").resizable(true).default_size(190.0).show(ui, |ui| crate::agents::panel(ui, &mut ed.agent));
         }
@@ -1511,6 +1545,13 @@ impl App {
             Key::Named(NamedKey::ArrowUp) => r.settings.sun_pitch = (r.settings.sun_pitch + 5.0).min(90.0),
             Key::Named(NamedKey::ArrowDown) => r.settings.sun_pitch = (r.settings.sun_pitch - 5.0).max(-90.0),
             _ => match c.as_str() {
+                // Animation frames.
+                "," | "." => {
+                    let a = &self.scene.world.anim;
+                    let f = self.scene.world.frame;
+                    command = Some(Command::Frame(if c == "," { f.checked_sub(1).unwrap_or(a.frames - 1) } else { (f + 1) % a.frames.max(1) }));
+                }
+                "/" => self.edit.timeline.play(!self.edit.timeline.playing),
                 // MagicaVoxel's model-editor hotkeys.
                 "v" => ed.brush = edit::Brush::Voxel,
                 "f" => ed.brush = edit::Brush::Face,
@@ -1788,6 +1829,9 @@ impl App {
     }
 
     fn redraw(&mut self) {
+        if let Some(f) = self.edit.timeline.tick(&self.scene) {
+            self.command(Command::Frame(f));
+        }
         let Some(g) = self.gfx.as_mut() else { return };
         if self.edit.editor.sel_dirty {
             sync_selection(&mut g.renderer, &self.scene, &mut self.edit.editor);
@@ -1843,7 +1887,7 @@ impl App {
             format!("voxely — {name} — Render — {} spp", g.renderer.frame)
         };
         g.window.set_title(&title);
-        if converging {
+        if converging || self.edit.timeline.playing {
             g.window.request_redraw();
         }
     }

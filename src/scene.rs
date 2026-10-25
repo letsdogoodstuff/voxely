@@ -653,7 +653,7 @@ impl Scene {
         if cells > 1024 * 1024 * 1024 {
             bail!("scene too large");
         }
-        let render_dicts = f.render_order.iter().filter_map(|k| f.render.get(k).cloned()).collect();
+        let render_dicts = f.render_order.iter().filter(|k| *k != crate::vox::ANIM_TYPE).filter_map(|k| f.render.get(k).cloned()).collect();
         Ok(Self::assemble(world, f.palette.clone(), &f.materials, render_dicts, RenderSettings::from_vox(f)))
     }
 
@@ -847,8 +847,28 @@ impl Scene {
     /// Change the tree without a new undo step, then refresh the view.
     pub fn apply<R>(&mut self, f: impl FnOnce(&mut World) -> R) -> R {
         let r = f(&mut self.world);
+        // When animating, moves and turns record keys on this frame.
+        if let Some(before) = self.history.last() {
+            self.world.autokey(before);
+        }
         self.view(self.mode);
         r
+    }
+
+    /// Change the tree as one undo step without recording keys (for
+    /// changes to the animation itself).
+    pub fn change_quiet<R>(&mut self, f: impl FnOnce(&mut World) -> R) -> R {
+        self.begin_change();
+        let r = f(&mut self.world);
+        self.view(self.mode);
+        r
+    }
+
+    /// Show another frame of the animation (edits so far are kept).
+    pub fn set_frame(&mut self, frame: u32) {
+        self.store();
+        self.world.set_frame(frame);
+        self.view(self.mode);
     }
 
     /// Recolor every model through `remap` (palette sorting).
@@ -981,8 +1001,9 @@ mod tests {
             layer: 0,
             rotation: crate::vox::decode_rotation(r),
             translation: t,
+            frames: vec![[("_r".to_string(), r.to_string()), ("_t".to_string(), format!("{} {} {}", t.x, t.y, t.z))].into()],
         };
-        let shape = |m: i32| Node::Shape { attrs: Dict::new(), models: vec![m] };
+        let shape = |m: i32| Node::Shape { attrs: Dict::new(), models: vec![m], model_frames: vec![0] };
         let group = |c: Vec<i32>| Node::Group { attrs: Dict::new(), children: c };
         // Rotation bytes: 4 identity, 17 = turn about z, 36 = flip y.
         let nodes = [

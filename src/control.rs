@@ -202,8 +202,43 @@ fn base_tools() -> Value {
             "free_rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees about the pivot, applied x then y then z; replaces any previous free rotation. [0, 0, 0] straightens." },
             "attach_to": { "type": "string", "description": "\"part:socket\" (e.g. \"body:shoulder_r\") to snap onto a socket and attach, or \"part\" to attach where it is. Attached parts follow their parent's moves and turns (and nest in glTF exports)." },
             "link": { "type": "boolean", "description": "With attach_to: false only lines it up without attaching (default true)" },
+            "frame": { "type": "integer", "description": "Go to this animation frame first (the change is keyed there when animating)" },
             "attach_socket": { "type": "string", "description": "With attach_to: this part's own socket to line up (default: its pivot). It becomes the pivot if none was set, so later turns keep it attached." },
         }), &["part"]),
+        tool("set_animation", "Set up the animation timeline. Frames are numbered from 0. With more than one frame, moving or turning a part (transform_part, or set_keyframe) records a keyframe on the current frame; the first key off frame 0 also keys frame 0 with where the part was. Attached parts follow their parent, so animate joints from the root down.", json!({
+            "frames": { "type": "integer", "description": "Number of frames, e.g. 24" },
+            "fps": { "type": "number", "description": "Playback speed, e.g. 12" },
+            "loop": { "type": "boolean", "description": "Loop playback; with smooth keys the last key blends back into the first" },
+            "smooth": { "type": "boolean", "description": "Blend between keys (default) or hold each key until the next, like MagicaVoxel" },
+        }), &[]),
+        tool("go_to_frame", "Show a frame: the window, screenshot, render and the voxel tools all use it. A part with flipbook drawings shows (and edits) the drawing for this frame.", json!({
+            "frame": { "type": "integer" },
+        }), &["frame"]),
+        tool("set_keyframe", "Key a part's pose on a frame: goes to the frame, applies any of transform_part's changes (move, position, rotate_axis + quarter_turns, flip_axis, free_rotation, attach_to), then records the key. Free rotations are absolute, about the part's pivot.", json!({
+            "part": { "type": ["string", "integer"] },
+            "frame": { "type": "integer" },
+            "move": xyz("[dx, dy, dz] offset"),
+            "position": xyz("World position of its minimum corner"),
+            "rotate_axis": axis,
+            "quarter_turns": { "type": "integer" },
+            "flip_axis": axis,
+            "free_rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees" },
+        }), &["part", "frame"]),
+        tool("delete_keyframe", "Remove a part's keyframe on a frame.", json!({
+            "part": { "type": ["string", "integer"] }, "frame": { "type": "integer" },
+        }), &["part", "frame"]),
+        tool("new_drawing", "Flipbook animation: from `frame` on (until its next drawing) the part shows its own copy of its voxels, which the voxel tools then edit while on that frame. Copy, then change only what moves (a blink, a lifted foot).", json!({
+            "part": { "type": ["string", "integer"] }, "frame": { "type": "integer" },
+        }), &["part", "frame"]),
+        tool("remove_drawing", "Remove a part's flipbook drawing that starts on `frame` (the previous drawing shows instead).", json!({
+            "part": { "type": ["string", "integer"] }, "frame": { "type": "integer" },
+        }), &["part", "frame"]),
+        tool("frame_strip", "See the motion: modeler images of several frames side by side in one picture, left to right then top to bottom, from the current camera.", json!({
+            "frames": { "type": "array", "items": { "type": "integer" }, "description": "Which frames (default: up to 12 spread over the animation)" },
+            "width": { "type": "integer", "description": "Each frame's width (default 240)" },
+            "height": { "type": "integer", "description": "Each frame's height (default 240)" },
+            "columns": { "type": "integer", "description": "Frames per row (default 6)" },
+        }), &[]),
         tool("set_pivot", "Set the point a part or group turns about (and its origin in glTF exports), in the part's own coordinates (the ones the voxel tools use while editing it; world coordinates for groups). E.g. a shoulder for an arm, the hinge for a door.", json!({
             "part": { "type": ["string", "integer"] },
             "pivot": { "type": ["array", "string"], "items": { "type": "number" }, "description": "[x, y, z], or \"center\" (default), or \"bottom\" (middle of the bottom face)" },
@@ -506,6 +541,12 @@ fn part_json(scene: &Scene, id: usize) -> Value {
             .map(|s| json!({ "name": s.name, "position": w.to_part(id, s.pos).to_array(), "world": w.affine(id).transform_point3(s.pos).to_array() }))
             .collect();
     }
+    if !n.keys.is_empty() {
+        v["keyframes"] = json!(n.keys.iter().map(|k| k.frame).collect::<Vec<_>>());
+    }
+    if !n.flip.is_empty() {
+        v["drawings"] = json!(n.flip.iter().map(|s| s.frame).collect::<Vec<_>>());
+    }
     if !n.children().is_empty() {
         let key = if n.is_group() { "children" } else { "attached" };
         v[key] = n.children().iter().map(|&c| part_json(scene, c)).collect();
@@ -516,6 +557,37 @@ fn part_json(scene: &Scene, id: usize) -> Value {
 fn vec3_value(v: &Value) -> Option<Vec3> {
     let a: Vec<f32> = v.as_array()?.iter().map(|x| x.as_f64().map(|f| f as f32)).collect::<Option<_>>()?;
     (a.len() == 3).then(|| Vec3::new(a[0], a[1], a[2]))
+}
+
+/// Run `f` with World mode's pick highlight off, so agents see the model's
+/// real colors.
+fn unhighlighted<T>(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx) -> T) -> T {
+    if ctx.scene.mode != crate::scene::Mode::World || ctx.scene.picked.is_empty() {
+        return f(ctx);
+    }
+    let picked = std::mem::take(&mut ctx.scene.picked);
+    app::sync_selection(ctx.r, ctx.scene, &mut ctx.ed.editor);
+    let out = f(ctx);
+    ctx.scene.picked = picked;
+    app::sync_selection(ctx.r, ctx.scene, &mut ctx.ed.editor);
+    out
+}
+
+fn frame_arg(ctx: &Ctx, a: &Value) -> Result<u32> {
+    let f = int(a, "frame").context("missing `frame`")?;
+    let n = ctx.scene.world.anim.frames;
+    if f < 0 || f as u32 >= n {
+        bail!("frame {f} is outside 0-{} (set_animation changes the frame count)", n - 1);
+    }
+    Ok(f as u32)
+}
+
+fn go_to(ctx: &mut Ctx, f: u32) {
+    if f != ctx.scene.world.frame {
+        ctx.scene.set_frame(f);
+        ctx.ed.editor.reset();
+        app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+    }
 }
 
 /// After a tree change: reset voxel history and upload.
@@ -589,6 +661,10 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "transform_part" => {
             let id = find_part(ctx.scene, get(a, "part"))?;
+            if get(a, "frame").is_some() {
+                let f = frame_arg(ctx, a)?;
+                go_to(ctx, f);
+            }
             let mv = opt_ivec3(a, "move")?;
             let pos = opt_ivec3(a, "position")?;
             let turn = match (get(a, "rotate_axis"), int(a, "quarter_turns")) {
@@ -670,6 +746,110 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let w = &ctx.scene.world;
             let to = w.node(id).and_then(|n| n.parent).filter(|&p| p != crate::world::ROOT).map(|p| format!(", attached to `{}`", w.label(p))).unwrap_or_default();
             Ok(vec![text(format!("`{}` now at {:?}, size {:?}{to}", w.label(id), arr(lo), arr(size)))])
+        }
+        "set_animation" => {
+            let mut an = ctx.scene.world.anim.clone();
+            if let Some(f) = int(a, "frames") {
+                an.frames = f.clamp(1, 10_000) as u32;
+            }
+            if let Some(f) = get(a, "fps").and_then(Value::as_f64) {
+                an.fps = (f as f32).clamp(0.5, 120.0);
+            }
+            an.looping = boolean(a, "loop").unwrap_or(an.looping);
+            an.smooth = boolean(a, "smooth").unwrap_or(an.smooth);
+            app::tree_op(crate::outline::TreeOp::SetAnim(an), ctx.scene, ctx.ed);
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            ctx.ed.timeline.open = true;
+            Ok(vec![text(format!("Animation: {}; on frame {}", crate::timeline::describe(&ctx.scene.world.anim), ctx.scene.world.frame))])
+        }
+        "go_to_frame" => {
+            let f = frame_arg(ctx, a)?;
+            go_to(ctx, f);
+            Ok(vec![text(format!("On frame {f} of 0-{}", ctx.scene.world.anim.frames - 1))])
+        }
+        "set_keyframe" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            let f = frame_arg(ctx, a)?;
+            go_to(ctx, f);
+            let changes = ["move", "position", "rotate_axis", "flip_axis", "free_rotation", "attach_to"].iter().any(|k| get(a, k).is_some());
+            if changes {
+                dispatch(ctx, "transform_part", a)?;
+            }
+            app::tree_op(crate::outline::TreeOp::Key(id), ctx.scene, ctx.ed);
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            let keys: Vec<u32> = ctx.scene.world.node(id).map(|n| n.keys.iter().map(|k| k.frame).collect()).unwrap_or_default();
+            Ok(vec![text(format!("Keyed `{}` on frame {f}; its keys: {keys:?}", ctx.scene.world.label(id)))])
+        }
+        "delete_keyframe" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            let f = frame_arg(ctx, a)?;
+            if !ctx.scene.world.node(id).is_some_and(|n| n.keys.iter().any(|k| k.frame == f)) {
+                bail!("`{}` has no key on frame {f}", ctx.scene.world.label(id));
+            }
+            go_to(ctx, f);
+            app::tree_op(crate::outline::TreeOp::DeleteKey(id), ctx.scene, ctx.ed);
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            Ok(vec![text(format!("Removed `{}`'s key on frame {f}", ctx.scene.world.label(id)))])
+        }
+        "new_drawing" | "remove_drawing" => {
+            let id = find_part(ctx.scene, get(a, "part"))?;
+            if ctx.scene.world.node(id).is_none_or(|n| n.is_group()) {
+                bail!("drawings belong to parts, not groups");
+            }
+            let f = frame_arg(ctx, a)?;
+            go_to(ctx, f);
+            let has = ctx.scene.world.node(id).is_some_and(|n| n.flip.iter().any(|s| s.frame == f));
+            let op = if name == "new_drawing" {
+                if has || f == 0 && ctx.scene.world.node(id).is_some_and(|n| !n.flip.is_empty()) {
+                    bail!("`{}` already has a drawing starting on frame {f}", ctx.scene.world.label(id));
+                }
+                crate::outline::TreeOp::SplitFrame(id)
+            } else {
+                if !has || f == 0 {
+                    bail!("`{}` has no drawing starting on frame {f} (frame 0's can't be removed)", ctx.scene.world.label(id));
+                }
+                crate::outline::TreeOp::MergeFrame(id)
+            };
+            app::tree_op(op, ctx.scene, ctx.ed);
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            let drawings: Vec<u32> = ctx.scene.world.node(id).map(|n| n.flip.iter().map(|s| s.frame).collect()).unwrap_or_default();
+            Ok(vec![text(format!("`{}` drawings start on frames {drawings:?}; edit this one with the voxel tools (part = `{}`) while on frame {f}", ctx.scene.world.label(id), ctx.scene.world.label(id)))])
+        }
+        "frame_strip" => {
+            let total = ctx.scene.world.anim.frames;
+            let frames: Vec<u32> = match get(a, "frames").and_then(Value::as_array) {
+                Some(list) => list.iter().filter_map(Value::as_u64).map(|f| (f as u32).min(total - 1)).take(64).collect(),
+                None => {
+                    let n = total.min(12);
+                    (0..n).map(|i| i * total / n).collect()
+                }
+            };
+            if frames.is_empty() {
+                bail!("no frames");
+            }
+            let (w, h) = (int(a, "width").unwrap_or(240).clamp(32, 1024) as u32, int(a, "height").unwrap_or(240).clamp(32, 1024) as u32);
+            let cols = (int(a, "columns").unwrap_or(6).max(1) as usize).min(frames.len());
+            let rows = frames.len().div_ceil(cols);
+            let (sw, sh) = (w as usize * cols, h as usize * rows);
+            let mut sheet = vec![0u8; sw * sh * 4];
+            let back = ctx.scene.world.frame;
+            for (k, &f) in frames.iter().enumerate() {
+                go_to(ctx, f);
+                let px = unhighlighted(ctx, |ctx| ctx.r.modeler_image(w, h))?;
+                let (ox, oy) = ((k % cols) * w as usize, (k / cols) * h as usize);
+                for y in 0..h as usize {
+                    let src = &px[y * w as usize * 4..(y + 1) * w as usize * 4];
+                    let at = ((oy + y) * sw + ox) * 4;
+                    sheet[at..at + src.len()].copy_from_slice(src);
+                }
+                // A thin divider between frames.
+                for y in 0..h as usize {
+                    let at = ((oy + y) * sw + ox) * 4;
+                    sheet[at..at + 4].copy_from_slice(&[90, 90, 90, 255]);
+                }
+            }
+            go_to(ctx, back);
+            Ok(vec![text(format!("Frames {frames:?}, left to right then top to bottom")), image(sw as u32, sh as u32, &sheet)?])
         }
         "set_pivot" => {
             let id = find_part(ctx.scene, get(a, "part"))?;
@@ -812,6 +992,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "editing_part": ctx.scene.editing().map(|id| ctx.scene.world.label(id)),
                 "part_position": arr(ctx.scene.origin),
                 "parts": ctx.scene.world.models().len(),
+                "animation": { "frames": ctx.scene.world.anim.frames, "frame": ctx.scene.world.frame, "fps": ctx.scene.world.anim.fps, "loop": ctx.scene.world.anim.looping, "smooth": ctx.scene.world.anim.smooth },
                 "camera": { "yaw": cam.yaw.to_degrees(), "pitch": cam.pitch.to_degrees(), "distance": cam.dist, "target": cam.target.to_array() },
             });
             Ok(vec![text(serde_json::to_string_pretty(&info)?)])
@@ -1394,7 +1575,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "screenshot" => {
             let (w, h) = (int(a, "width").unwrap_or(800).clamp(16, 4096) as u32, int(a, "height").unwrap_or(600).clamp(16, 4096) as u32);
-            let px = ctx.r.modeler_image(w, h)?;
+            let px = unhighlighted(ctx, |ctx| ctx.r.modeler_image(w, h))?;
             Ok(vec![image(w, h, &px)?])
         }
         "render" => {
