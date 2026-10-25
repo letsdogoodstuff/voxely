@@ -145,7 +145,7 @@ fn base_tools() -> Value {
             "fill": color_schema(),
         }), &[]),
         tool("open_file", "Open a MagicaVoxel .vox file, keeping its models and groups as parts.", json!({ "path": { "type": "string" } }), &["path"]),
-        tool("save_file", "Save the project as .vox. Without `path`, saves the current project in the workspace.", json!({ "path": { "type": "string" } }), &[]),
+        tool("save_file", "Save the project as .vox. Without `path`, saves the current project in the workspace. With a `path` it's Save As: that file becomes the current one (later saves and autosave go there) and the project's references are copied to its new name.", json!({ "path": { "type": "string" } }), &[]),
         tool("set_voxels", "Set individual voxels. Color 0 erases.", json!({
             "voxels": { "type": "array", "description": "[[x, y, z, color], ...]; color is an index or \"#rrggbb\"", "items": { "type": "array", "items": { "type": ["integer", "string"] } } },
         }), &["voxels"]),
@@ -276,11 +276,11 @@ fn base_tools() -> Value {
                 "description": "gltf: a .glb for game engines (Godot, Unity, Unreal, Three.js, Bevy) with metal/roughness, emission and glass materials; use a .gltf path for JSON" },
             "path": { "type": "string", "description": "Output file (default: <workspace>/export/<project>.<ext>)" },
         }), &["format"]),
-        tool("run_script", "Run a JavaScript program (QuickJS) inside voxely: one call instead of many. Every tool is voxely.<camelCase name>(args) with the same arguments, e.g. voxely.fillBox({from: [0, 0, 0], to: [9, 9, 0], color: \"#88aa44\"}); it returns parsed JSON or text and throws on errors. For bulk edits, v = voxely.getVolume({part}) gives a part's grid in its own coordinates (default: the part being edited): v.size and v.cells (a Uint8Array of palette indices, x fastest, then y, then z) with v.get(x, y, z), v.set(x, y, z, c) and v.forEach(fn); voxely.setVolume(v, {part}) writes it back (new Volume([x, y, z]) starts empty and resizes the part). voxely.color(\"#rrggbb\") gives the nearest palette index. Returns console.log output and the last expression's value. The whole script is one undo step. No file or network access.", json!({
+        tool("run_script", "Run a JavaScript program (QuickJS) inside voxely: one call instead of many. Every tool is voxely.<camelCase name>(args) with the same arguments, e.g. voxely.fillBox({from: [0, 0, 0], to: [9, 9, 0], color: \"#88aa44\"}); it returns parsed JSON or text and throws on errors. For bulk edits, v = voxely.getVolume({part}) gives a part's grid in its own coordinates (default: the part being edited): v.size and v.cells (a Uint8Array of palette indices, x fastest, then y, then z) with v.get(x, y, z), v.set(x, y, z, c) and v.forEach(fn); voxely.setVolume(v, {part}) writes it back (new Volume([x, y, z]) starts empty and resizes the part). voxely.color(\"#rrggbb\") gives the nearest palette index. Returns console.log output and the last expression's value. The whole script is one undo step. Scripts reach files only through the tools (saveFile, openFile, importFile, export, set_reference ...), with the same access those tools have; there is no other file, network or process access.", json!({
             "source": { "type": "string", "description": "JavaScript source" },
             "path": { "type": "string", "description": "Or a .js file to run" },
             "args": { "description": "Any JSON value, available to the script as `args`" },
-            "timeout": { "type": "number", "description": "Seconds before the script is stopped (default 120)" },
+            "timeout": { "type": "number", "minimum": 0.1, "maximum": 3600, "description": "Seconds before the script is stopped, 0.1-3600 (default 120)" },
         }), &[]),
         tool("set_view_mode", "Show the modeler or the live path tracer in the window.", json!({
             "mode": { "type": "string", "enum": ["model", "render"] },
@@ -1293,9 +1293,15 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "save_file" => {
             let path = string(a, "path").map_or_else(|| ctx.ed.save_path.clone(), |p| PathBuf::from(p).with_extension("vox"));
+            let (old_path, old_name) = (ctx.ed.save_path.clone(), ctx.ed.name());
             let path = app::save_project(ctx.r, ctx.scene, ctx.ed, path)?;
             let full = std::fs::canonicalize(&path).unwrap_or(path);
-            Ok(vec![text(format!("Saved {}", full.display()))])
+            let mut msg = format!("Saved {}", full.display());
+            if std::fs::canonicalize(&old_path).ok().as_ref() != Some(&full) {
+                msg += &format!(". This file is now the current one (was {}); later saves and autosave go here.", old_path.display());
+                msg += &reference::carry_over(&old_name, &ctx.ed.name());
+            }
+            Ok(vec![text(msg)])
         }
         "new_project" => {
             let name = string(a, "name").context("missing `name`")?.trim();
@@ -1916,7 +1922,13 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 (None, Some(p)) => (std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?, p.to_string()),
                 (None, None) => bail!("give JavaScript `source` or a `path`"),
             };
-            let timeout = num(a, "timeout").map_or(crate::script::DEFAULT_TIMEOUT, |s| std::time::Duration::from_secs_f32(s.clamp(0.1, 3600.0)));
+            let timeout = match get(a, "timeout") {
+                None => crate::script::DEFAULT_TIMEOUT,
+                Some(t) => match t.as_f64() {
+                    Some(s) if (0.1..=3600.0).contains(&s) => std::time::Duration::from_secs_f64(s),
+                    _ => bail!("`timeout` must be a number of seconds from 0.1 to 3600, not {t}"),
+                },
+            };
             let outcome = crate::script::run(ctx, source, file, get(a, "args").cloned().unwrap_or(Value::Null), timeout);
             Ok(vec![text(crate::script::report(&outcome)?)])
         }

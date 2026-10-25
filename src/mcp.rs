@@ -53,7 +53,20 @@ impl Headless {
 
     pub(crate) fn call(&mut self, name: &str, args: &Value) -> Value {
         let mut ctx = Ctx { r: &mut self.r, scene: &mut self.scene, ed: &mut self.ed, live: false };
-        control::call(&mut ctx, name, args)
+        call_guarded(&mut ctx, name, args)
+    }
+}
+
+/// `control::call`, with a panic in the tool turned into an error reply
+/// so one bad call can't take the server (or the window) down.
+pub(crate) fn call_guarded(ctx: &mut Ctx, name: &str, args: &Value) -> Value {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| control::call(ctx, name, args))) {
+        Ok(v) => v,
+        Err(p) => {
+            let why = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+            let msg = format!("internal error in {name}: {why}. It may have been partly applied; check get_scene_info, and undo if needed.");
+            json!({ "content": [{ "type": "text", "text": msg }], "isError": true })
+        }
     }
 }
 

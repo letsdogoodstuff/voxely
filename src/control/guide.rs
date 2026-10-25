@@ -22,7 +22,7 @@ const TOPICS: &[(&str, &str, &str)] = &[
     ("animal", "Animals and creatures with organic bodies", ANIMAL),
     ("vehicle", "Cars, ships, aircraft and other vehicles", VEHICLE),
     ("world", "Landscapes, terrain and large scenes", WORLD),
-    ("scripting", "run_script patterns: util shapes, noise, Volume helpers", SCRIPTING),
+    ("scripting", "run_script patterns: util shapes, Volume helpers, repeatable placement", SCRIPTING),
 ];
 
 const IMAGE: &str = "\
@@ -69,7 +69,7 @@ const ANIMAL: &str = "\
 ANIMALS
 - Start from the body mass as chunky stacked boxes (chest, belly, hips), stepped at the edges so it reads \
 rounded, then neck and head, then legs as tapered capsules (util.capsule with two radii), then tail, ears, \
-muzzle. Smooth unions keep joins organic instead of boxy.
+muzzle. Keep joins chunky and stepped rather than smooth-blended.
 - Proportions come from the species: measure them from a side-view reference (reference_profile view left or \
 right). Quadrupeds: legs set at the corners of the ribcage and hips, not the middle; the back is rarely flat.
 - create_rig template quadruped gives named, jointed parts (body, head, tail, legs) ready for apply_motion.
@@ -104,13 +104,17 @@ SCRIPTING PATTERNS (run_script)
 - One script per stage beats hundreds of calls. v = voxely.getVolume({part}); edit v; voxely.setVolume(v, {part}).
 - Volume helpers: v.fillBox(a, b, c), v.fillSdf(shape, color, lo, hi), v.mirrorX(), v.bounds().
 - util shapes are signed distance functions (negative inside): sphere, ellipsoid, box (with round), capsule \
-(two radii for taper), cylinder; combine with union, smoothUnion(k, ...) for organic joins, subtract, intersect, \
-mirrorX(shape, cx) for symmetry, displace(shape, amp, scale) for ragged edges (cloth hems, rock, terrain).
-- color may be a function of (x, y, z, d), e.g. a flat accent color for rims (d near 0); keep colors flat.
-- util.hash(x, y, z, seed) and util.noise(x, y, z, scale, seed) are repeatable, so a rerun gives the same model.
+(two radii for taper), cylinder; combine with union, subtract, intersect, mirrorX(shape, cx) for symmetry. \
+Prefer boxy, chunky forms (box, cylinder) to smooth blobs; smoothUnion and displace make soft, lumpy shapes \
+that read worse at voxel scale.
+- color may be a function of (x, y, z, d), e.g. a flat accent color for rims (d near 0); keep colors flat, \
+one per material, never noise.
+- util.hash(x, y, z, seed) and util.noise(x, y, z, scale, seed) are repeatable, so a rerun gives the same model: \
+use them to place things (scattered trees, rocks) or shape terrain heights, not to color voxels.
 - Shapes that cross the mirror plane: draw them whole (box from x 18 to 30), don't mirror a half-box; a \
 half-box's rounded edge leaves a 1-voxel groove down the middle.
-- Example: v.fillSdf(util.smoothUnion(2, util.ellipsoid([20,16,20],[8,6,10]), util.sphere([20,16,33],6)), 14)";
+- Example, a stone pillar with a cap in two flat colors: v.fillSdf(util.box([18,18,0],[22,22,20]), 14); \
+v.fillSdf(util.box([17,17,21],[23,23,22]), 15)";
 
 const CRAFT: &str = "\
 VOXEL CRAFT RULES (the house style: clean, designed voxel art like MagicaVoxel showcase pieces)
@@ -176,13 +180,15 @@ BUILDINGS AND ENVIRONMENTS
 - Decide a grid unit: e.g. 1 voxel = 10 cm means doors ~20 tall, floors ~30 apart, a person 17-18 tall. \
 Keep every element on that grid.
 - Block out masses (walls, roof, chimney), then openings (doors, windows inset by 1), then trim \
-(sills, beams, corner stones), then texture (brick/plank variation, moss, cracks).
-- Walls are rarely flat single colors: vary bricks/planks slightly; darken bottom rows (dirt) and \
-corners; lighten top edges.
+(sills, beams, corner stones, door frames), then designed details placed by hand (a sign, lanterns, \
+flower boxes, a few deliberate cracks).
+- One flat color per material (plaster, stone, timber, roof tiles). Show bricks, planks or shingles \
+with a regular pattern of seam lines in one accent color, not random shade variation; no darkened \
+rows or lightened edges: the renderer does the lighting.
 - Roofs: pyramids/wedges or stepped layers; overhang by 1-2 voxels so they cast shadow.
 - Repetition (windows, fence posts, shingles, tiles): run_script loops or save_stamp/place_stamp.
-- Terrain: build height with layered shapes or perlin, then paint_faces top for grass/snow and \
-vary colors. Scatter props (rocks, bushes) as stamps with variation.
+- Terrain: build height with layered shapes, then paint_faces top for grass/snow and sides for \
+dirt/rock, each one flat color. Scatter props (rocks, bushes) as stamps.
 - Interiors: leave one wall or the roof off (hide a part) for the camera, and add emissive lights.";
 
 const COLOR: &str = "\
@@ -300,7 +306,10 @@ pub fn tools() -> Vec<Value> {
 
 pub fn dispatch(_ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Value>>> {
     (name == "get_guide").then(|| {
-        let topic = string(args, "topic").unwrap_or("craft");
+        let topic = match args.get("topic").filter(|v| !v.is_null()) {
+            None => "craft",
+            Some(v) => v.as_str().ok_or_else(|| anyhow!("`topic` is a topic name (a string), not {v}"))?,
+        };
         let (_, _, body) = TOPICS.iter().find(|t| t.0 == topic).ok_or_else(|| {
             anyhow!("no guide topic {topic:?}; topics: {}", TOPICS.iter().map(|t| t.0).collect::<Vec<_>>().join(", "))
         })?;

@@ -3,7 +3,7 @@
 //! against them.
 
 mod compare;
-mod pitch;
+pub(super) mod pitch;
 mod segment;
 
 use std::collections::BTreeMap;
@@ -151,6 +151,22 @@ fn refs_dir(project: &str) -> PathBuf {
     crate::app::workspace_dir().join("refs").join(project)
 }
 
+/// After Save As renamed the project from `old` to `new`, copy its saved
+/// references over so they keep showing. Returns a note for the reply.
+pub(super) fn carry_over(old: &str, new: &str) -> String {
+    let (from, to) = (refs_dir(old), refs_dir(new));
+    let Ok(files) = std::fs::read_dir(&from) else { return String::new() };
+    if old == new {
+        return String::new();
+    }
+    if to.exists() {
+        return format!(" Its references stay with {old:?}; {new:?} already has its own.");
+    }
+    let copied = std::fs::create_dir_all(&to).is_ok()
+        && files.flatten().all(|f| !f.path().is_file() || std::fs::copy(f.path(), to.join(f.file_name())).is_ok());
+    if copied { format!(" Copied its references to {new:?}.") } else { format!(" Couldn't copy its references to {}.", to.display()) }
+}
+
 /// Make sure the current project's saved references are loaded.
 fn ensure_loaded(ctx: &mut Ctx) {
     let project = ctx.ed.name();
@@ -291,9 +307,20 @@ fn pct(f: f32) -> String {
     format!("{:.0}%", f * 100.0)
 }
 
+/// The `threshold` argument: 0-255 if given.
+fn threshold_arg(a: &Value) -> Result<Option<f32>> {
+    match get(a, "threshold") {
+        None => Ok(None),
+        Some(v) => match v.as_f64() {
+            Some(t) if (0.0..=255.0).contains(&t) => Ok(Some(t as f32)),
+            _ => bail!("`threshold` is a color difference from 0 to 255, not {v}"),
+        },
+    }
+}
+
 fn analyze_image(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let path = string(a, "path").context("missing `path`")?.to_string();
-    let threshold = num(a, "threshold");
+    let threshold = threshold_arg(a)?;
     let (_, _, img, seg) = analysis(ctx, &path, threshold)?;
     let mut out = Vec::new();
     let subjects: Vec<&segment::Blob> = seg.blobs.iter().filter(|b| !b.text).collect();
@@ -317,17 +344,23 @@ fn analyze_image(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     }
     // Block size over the whole picture and in the box asked about: on busy
     // scenes the blobs are fragments, but the agent can see the subject.
-    let all = |_: usize, _: usize| true;
+    // (Transparent pixels aren't picture.)
+    let all = |x: usize, y: usize| !bg.alpha || img.px[y * img.w + x][3] >= 128;
     let mut boxes = vec![("The whole picture".to_string(), [0, 0, img.w - 1, img.h - 1])];
-    if let Some(c) = get(a, "crop").and_then(Value::as_array) {
-        let v: Vec<usize> = c.iter().filter_map(Value::as_u64).map(|n| n as usize).collect();
+    if let Some(c) = get(a, "crop") {
+        let v: Vec<usize> = c.as_array().into_iter().flatten().filter_map(Value::as_u64).map(|n| n as usize).collect();
         if v.len() != 4 || v[0] >= v[2] || v[1] >= v[3] {
-            bail!("`crop` is [x0, y0, x1, y1] in pixels");
+            bail!("`crop` is [x0, y0, x1, y1] in pixels, x0 < x1 and y0 < y1, all 0 or more");
         }
-        boxes.push((format!("Box [{}, {}]-[{}, {}]", v[0], v[1], v[2], v[3]), [v[0], v[1], v[2].min(img.w - 1), v[3].min(img.h - 1)]));
+        if v[0] >= img.w || v[1] >= img.h {
+            bail!("`crop` starts at [{}, {}], outside the {}x{} picture", v[0], v[1], img.w, img.h);
+        }
+        let bb = [v[0], v[1], v[2].min(img.w - 1), v[3].min(img.h - 1)];
+        let clipped = if bb[2] != v[2] || bb[3] != v[3] { " (clipped to the picture)" } else { "" };
+        boxes.push((format!("Box [{}, {}]-[{}, {}]{clipped}", bb[0], bb[1], bb[2], bb[3]), bb));
     }
     for (what, bb) in boxes {
-        out.push(match pitch::voxel_pitch(&img, &all, bb) {
+        out.push(match pitch::voxel_pitch(img, &all, bb) {
             Some((p, conf)) => format!(
                 "{what}: if it is voxel art, its blocks are {p:.1} px (confidence {:.0}%), so {} px tall = {:.0} blocks: build at that size, one picture block = one voxel. (Photos and textures can show a spacing too; you judge whether it is voxel art.)",
                 conf * 100.0,
@@ -476,7 +509,14 @@ fn set_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         return Ok(vec![text(if had { format!("Removed the {} reference.", view.key()) } else { format!("There was no {} reference.", view.key()) })]);
     }
     let path = string(a, "path").context("missing `path` (or clear: true)")?.to_string();
-    let threshold = num(a, "threshold");
+    let threshold = threshold_arg(a)?;
+    let height = match get(a, "height") {
+        None => None,
+        Some(v) => match v.as_f64() {
+            Some(h) if h > 0.0 => Some(h as f32),
+            _ => bail!("`height` is how many voxels tall the subject is: a number above 0, not {v}"),
+        },
+    };
     let blob_arg = int(a, "blob");
     let crop_arg = match get(a, "crop") {
         Some(v) => {
@@ -542,7 +582,6 @@ fn set_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         }
     }
     drop(keep);
-    let height = num(a, "height");
     let origin = match get(a, "origin") {
         Some(v) => Some(compare_pair(v).context("`origin` is [h, v]")?),
         None => None,
@@ -1091,6 +1130,6 @@ fn paint_from_reference(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     if !lines.is_empty() {
         out.push_str(&format!("\nPer part: {}.", lines.join(", ")));
     }
-    out.push_str("\nNext: compare_reference to check color agreement; shade_edges / vary_colors for depth.");
+    out.push_str("\nNext: screenshot it beside the reference and repaint any speckled or shaded areas in flat colors by hand.");
     Ok(vec![text(out)])
 }

@@ -13,6 +13,9 @@ pub fn voxel_pitch(img: &Image, mask: &dyn Fn(usize, usize) -> bool, bbox: [usiz
     if w < 24 || h < 24 {
         return None;
     }
+    if let Some(g) = crisp_grid(img, mask, bbox) {
+        return Some((g.pitch, 1.0));
+    }
     let luma = |x: usize, y: usize| {
         let p = img.px[y * img.w + x];
         0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32
@@ -63,6 +66,75 @@ pub fn voxel_pitch(img: &Image, mask: &dyn Fn(usize, usize) -> bool, bbox: [usiz
     let pitch = near.iter().map(|v| v.0 * v.1).sum::<f32>() / near.iter().map(|v| v.1).sum::<f32>().max(1e-6);
     let conf = (sup / total).clamp(0.0, 1.0);
     (conf >= 0.22).then_some((pitch, conf))
+}
+
+/// The block grid of crisp (unblurred, unshaded) pixel or voxel art.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grid {
+    /// Pixels per block (not always whole: art scaled by an odd factor).
+    pub pitch: f32,
+    /// Where a block edge falls, in pixels from the box's left / top.
+    pub phase: [f32; 2],
+}
+
+/// Pixels this close in every channel count as the same color.
+const SAME: i32 = 12;
+
+/// The grid of crisp art in the masked area: every color edge (and the
+/// mask's own outline) falls on lines a whole number of blocks apart, and
+/// the largest such spacing is the block size. None if the picture isn't
+/// crisp (photos, rendered or blurred art) or shows too few edges to tell.
+pub fn crisp_grid(img: &Image, mask: &dyn Fn(usize, usize) -> bool, bbox: [usize; 4]) -> Option<Grid> {
+    let [x0, y0, x1, y1] = bbox;
+    let (x1, y1) = (x1.min(img.w - 1), y1.min(img.h - 1));
+    if (x1 + 1 - x0) * (y1 + 1 - y0) > 1 << 24 {
+        return None;
+    }
+    let differ = |a: (usize, usize), b: (usize, usize)| -> bool {
+        match (mask(a.0, a.1), mask(b.0, b.1)) {
+            (false, false) => false,
+            (true, true) => {
+                let (p, q) = (img.px[a.1 * img.w + a.0], img.px[b.1 * img.w + b.0]);
+                (0..3).any(|k| (p[k] as i32 - q[k] as i32).abs() > SAME)
+            }
+            _ => true,
+        }
+    };
+    // Edge lines: a boundary at i lies between pixel i - 1 and i of the box.
+    let mut bx: Vec<usize> = (x0..x1).filter(|&x| (y0..=y1).any(|y| differ((x, y), (x + 1, y)))).map(|x| x + 1 - x0).collect();
+    let mut by: Vec<usize> = (y0..y1).filter(|&y| (x0..=x1).any(|x| differ((x, y), (x, y + 1)))).map(|y| y + 1 - y0).collect();
+    // A subject's outline is block edges, also where it touches the box
+    // (a tight crop); the sides of a picture that's all subject aren't.
+    if (y0..=y1).any(|y| (x0..=x1).any(|x| !mask(x, y))) {
+        if (y0..=y1).any(|y| mask(x0, y)) {
+            bx.insert(0, 0);
+        }
+        if (y0..=y1).any(|y| mask(x1, y)) {
+            bx.push(x1 + 1 - x0);
+        }
+        if (x0..=x1).any(|x| mask(x, y0)) {
+            by.insert(0, 0);
+        }
+        if (x0..=x1).any(|x| mask(x, y1)) {
+            by.push(y1 + 1 - y0);
+        }
+    }
+    if bx.len() + by.len() < 5 || bx.len().max(by.len()) < 3 {
+        return None;
+    }
+    let fits = |b: &[usize], p: f32| -> bool {
+        b.first().is_none_or(|&b0| b.iter().all(|&e| {
+            let r = (e - b0) as f32 / p;
+            (r - r.round()).abs() * p <= 0.6
+        }))
+    };
+    // The largest spacing that every edge line fits: a span between edges
+    // divided into a whole number of blocks.
+    let (axis, other) = if bx.len() >= by.len() { (&bx, &by) } else { (&by, &bx) };
+    let span = axis[axis.len() - 1] - axis[0];
+    let pitch = (1..=span / 2).map(|n| span as f32 / n as f32).find(|&p| fits(axis, p) && fits(other, p))?;
+    let phase = |b: &[usize]| b.first().map_or(0.0, |&b0| b0 as f32 % pitch);
+    Some(Grid { pitch, phase: [phase(&bx), phase(&by)] })
 }
 
 /// The repeat length of a profile (2.5..48 px) from its autocorrelation:
@@ -117,6 +189,44 @@ mod tests {
         let (p, conf) = voxel_pitch(&img, &|_, _| true, [0, 0, w - 1, h - 1]).expect("a grid");
         assert!((p - 7.0).abs() < 0.3, "pitch {p}");
         assert!(conf > 0.3, "confidence {conf}");
+    }
+
+    /// Blocks of `b` pixels from a pattern of rows (one char per block,
+    /// '.' transparent), on `bg` if given.
+    fn blocks(rows: &[&str], b: usize, bg: Option<[u8; 4]>) -> Image {
+        let (bw, bh) = (rows[0].len(), rows.len());
+        let mut px = Vec::new();
+        for y in 0..bh * b {
+            for x in 0..bw * b {
+                let c = rows[y / b].as_bytes()[x / b];
+                px.push(match c {
+                    b'.' => bg.unwrap_or([0, 0, 0, 0]),
+                    c => [c.wrapping_mul(37), c.wrapping_mul(91), c.wrapping_mul(13), 255],
+                });
+            }
+        }
+        Image { w: bw * b, h: bh * b, px }
+    }
+
+    #[test]
+    fn crisp_art_has_its_block_size_even_with_big_flat_areas() {
+        // A character on white: edges mostly every other block.
+        let rows = ["............", "............", "..aaaaaaaa..", "..aaaaaaaa..", "..abaaaaba..", "..aaaaaaaa..", "..aaaaaaaa..", "..cccccccc..", "..cccccccc..", "..cc....cc..", "............"];
+        let img = blocks(&rows, 8, Some([255, 255, 255, 255]));
+        let all = |_: usize, _: usize| true;
+        let g = crisp_grid(&img, &all, [0, 0, img.w - 1, img.h - 1]).expect("a grid");
+        assert_eq!(g.pitch, 8.0);
+        assert_eq!(voxel_pitch(&img, &all, [0, 0, img.w - 1, img.h - 1]).unwrap().0, 8.0);
+        // A margin that isn't whole blocks doesn't matter.
+        assert_eq!(crisp_grid(&img, &all, [3, 5, img.w - 1, img.h - 1]).unwrap(), Grid { pitch: 8.0, phase: [5.0, 3.0] });
+        // Transparent, cropped tight: the outline counts as edges.
+        let img = blocks(&rows[2..10].iter().map(|r| &r[2..10]).collect::<Vec<_>>(), 10, None);
+        let opaque = |x: usize, y: usize| img.px[y * img.w + x][3] >= 128;
+        assert_eq!(crisp_grid(&img, &opaque, [0, 0, img.w - 1, img.h - 1]).unwrap().pitch, 10.0);
+        // Large blocks (80 px).
+        let img = blocks(&["ab.c", "dddd", "e..f"], 80, None);
+        let opaque = |x: usize, y: usize| img.px[y * img.w + x][3] >= 128;
+        assert_eq!(voxel_pitch(&img, &opaque, [0, 0, img.w - 1, img.h - 1]).unwrap().0, 80.0);
     }
 
     #[test]
