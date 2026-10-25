@@ -503,6 +503,7 @@ pub struct Status<'a> {
     pub iso: bool,
     /// Free camera: rotating turns the view around the eye.
     pub free: &'a mut bool,
+    pub agent: &'a mut crate::agents::AgentState,
     pub hint: &'a str,
 }
 
@@ -549,6 +550,8 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
         iso = ui.selectable_label(s.iso, "Iso").on_hover_text("Isometric view").clicked();
         command(ui, cmds, "Reset", "Reset camera [F12]", Command::ResetCamera);
         command(ui, cmds, "Snap", "Snapshot [6]", Command::Snapshot);
+        ui.separator();
+        crate::agents::badge(ui, s.agent);
         ui.separator();
         ui.weak(s.hint);
     });

@@ -52,6 +52,8 @@ pub struct EditState {
     pub image: ui::ImageSettings,
     /// Result of the last export, shown under the Export buttons.
     pub export_status: Option<String>,
+    /// MCP agent control of this window.
+    pub agent: crate::agents::AgentState,
     pub transform_text: ui::TransformText,
     pub palette: ui::PaletteState,
     /// Canvas size being typed into the Canvas panel.
@@ -77,6 +79,7 @@ impl EditState {
             material_clipboard: None,
             image: ui::ImageSettings::default(),
             export_status: None,
+            agent: crate::agents::AgentState::default(),
             transform_text: ui::TransformText::default(),
             palette: ui::PaletteState::default(),
             shaders: ui::ShaderState { files: list_shaders(source.as_deref()), current: None, values: Vec::new(), error: None },
@@ -810,7 +813,7 @@ pub fn build_ui(
             };
             let iso = is_iso(r);
             let options = r.modeler.as_mut().filter(|_| r.modeling).map(|m| &mut m.options);
-            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, hint };
+            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, agent: &mut ed.agent, hint };
             if ui::status_bar(ui, status, cmds) {
                 iso_camera(r);
             }
@@ -842,6 +845,11 @@ pub fn build_ui(
                 let a = ui::matter_panel(ui, &mut r.settings, &ed.editor, scene, state, cmds);
                 edit.materials_changed |= a.materials_changed;
             });
+        }
+        // Docked under the 3D view (after the side panels, so it spans
+        // only the view) instead of floating over the model.
+        if ed.agent.open {
+            egui::Panel::bottom("agents").resizable(true).default_size(190.0).show(ui, |ui| crate::agents::panel(ui, &mut ed.agent));
         }
     }
     actions.viewport = Some(ui.available_rect_before_wrap());
@@ -1454,9 +1462,16 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
         let UserEvent::Control { tool, args, reply } = event;
         let result = match self.gfx.as_mut() {
+            Some(g) if !self.edit.agent.allow => {
+                let result = crate::agents::AgentState::paused_reply();
+                self.edit.agent.record(&tool, &result);
+                g.window.request_redraw();
+                result
+            }
             Some(g) => {
                 let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true };
                 let result = crate::control::call(&mut ctx, &tool, &args);
+                self.edit.agent.record(&tool, &result);
                 g.window.request_redraw();
                 result
             }

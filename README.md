@@ -19,6 +19,19 @@ Agents such as Claude Code or Codex can use it to build, edit, light and render 
 - Otherwise it runs headless in the MCP process. The scene lives until the client
   disconnects, so ask the agent to `save_file`.
 
+### The Agents panel
+
+Click **Agents** in the bottom bar to open the Agents panel under the 3D view:
+
+- **Allow agents to control this window**: turn off to pause agents; their requests get a
+  reply saying control is paused (instead of quietly working headless).
+- Status (active, idle or paused) and the agent's recent actions, with failures in red.
+- **Add to Claude Code** registers voxely for all your Claude Code sessions;
+  **Copy command** and **Copy Codex config** copy the setup for a terminal or `~/.codex/config.toml`.
+
+There is no server to start or stop: agents launch `voxely mcp` themselves for each session.
+Agent edits go through normal undo, so Cmd+Z steps back through them.
+
 ### Claude Code
 
 This repo's `.mcp.json` registers the server for Claude Code sessions started here
