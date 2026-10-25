@@ -26,6 +26,7 @@ mod import;
 mod inspect;
 mod reference;
 pub(crate) mod surface;
+mod validate;
 mod view;
 
 /// Per-session state for the tool families, plus a record of the last edit.
@@ -124,7 +125,12 @@ fn xyz(desc: &str) -> Value {
 }
 
 fn color_schema() -> Value {
-    json!({ "type": ["integer", "string"], "description": COLOR })
+    json!({ "type": ["integer", "string"], "minimum": 0, "maximum": 255, "description": COLOR })
+}
+
+/// A canvas or part size: [x, y, z], 1 to `ops::MAX_DIM` each.
+fn size3(desc: &str) -> Value {
+    json!({ "type": "array", "items": { "type": "integer", "minimum": 1, "maximum": ops::MAX_DIM }, "minItems": 3, "maxItems": 3, "description": desc })
 }
 
 /// Every tool's definition (see `tools`).
@@ -134,20 +140,20 @@ fn base_tools() -> Value {
         tool("get_scene_info", "Canvas size, voxel count and bounds, colors in use, file, selection, camera and mode.", json!({}), &[]),
         tool("new_project", "Create a named project in the workspace (it appears in the window's Project list) and make it current. Empty unless `fill` is given.", json!({
             "name": { "type": "string", "description": "Letters, digits, spaces, - and _" },
-            "size": xyz("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
+            "size": size3("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
             "fill": color_schema(),
             "overwrite": { "type": "boolean", "description": "Replace an existing project with this name" },
         }), &["name"]),
         tool("list_projects", "The workspace's projects (newest first) and MagicaVoxel's sample models.", json!({}), &[]),
         tool("open_project", "Open a project or sample by name.", json!({ "name": { "type": "string" } }), &["name"]),
         tool("new_scene", "Start a new unnamed project (saved as project, project-2, ... in the workspace). Empty unless `fill` is given.", json!({
-            "size": xyz("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
+            "size": size3("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
             "fill": color_schema(),
         }), &[]),
         tool("open_file", "Open a MagicaVoxel .vox file, keeping its models and groups as parts.", json!({ "path": { "type": "string" } }), &["path"]),
         tool("save_file", "Save the project as .vox. Without `path`, saves the current project in the workspace.", json!({ "path": { "type": "string" } }), &[]),
         tool("set_voxels", "Set individual voxels. Color 0 erases.", json!({
-            "voxels": { "type": "array", "description": "[[x, y, z, color], ...]; color is an index or \"#rrggbb\"", "items": { "type": "array", "items": { "type": ["integer", "string"] } } },
+            "voxels": { "type": "array", "description": "[[x, y, z, color], ...]; color is an index or \"#rrggbb\"", "items": { "type": "array", "items": { "type": ["integer", "string"] }, "minItems": 4, "maxItems": 4 } },
         }), &["voxels"]),
         tool("fill_box", "Fill (or with color 0, clear) the box between two corners, inclusive.", json!({
             "from": xyz(XYZ), "to": xyz(XYZ), "color": color_schema(),
@@ -189,7 +195,7 @@ fn base_tools() -> Value {
             "kind": { "type": "string", "enum": ["scale", "shear", "rotate", "repeat"] },
             "args": { "type": "string", "description": "Axes then values, like MagicaVoxel: scale \"xyz 2\", shear \"z 0.2 0.2\", rotate \"z 45\", repeat \"xy 2\"" },
         }), &["kind", "args"]),
-        tool("resize_canvas", "Change the canvas size, keeping the model centered in x/y and on the floor.", json!({ "size": xyz("New size") }), &["size"]),
+        tool("resize_canvas", "Change the canvas size, keeping the model centered in x/y and on the floor.", json!({ "size": size3("New size") }), &["size"]),
         tool("list_shaders", "MagicaVoxel voxel shaders available to run_shader, with their arguments.", json!({}), &[]),
         tool("run_shader", "Run a MagicaVoxel voxel shader (GLSL `float map(vec3 v)` returning a color index) over the model, or the selection.", json!({
             "name": { "type": "string", "description": "A shader from list_shaders" },
@@ -199,7 +205,7 @@ fn base_tools() -> Value {
         }), &[]),
         tool("get_palette", "Palette colors as hex with their materials. Default: only colors in use.", json!({ "all": { "type": "boolean" } }), &[]),
         tool("set_palette_colors", "Set exact palette colors.", json!({
-            "colors": { "type": "array", "items": { "type": "object", "properties": { "index": { "type": "integer" }, "color": { "type": "string" } } }, "description": "[{\"index\": 1, \"color\": \"#ff8800\"}, ...]" },
+            "colors": { "type": "array", "items": { "type": "object", "properties": { "index": { "type": "integer", "minimum": 1, "maximum": 255 }, "color": { "type": "string" } }, "required": ["index", "color"] }, "description": "[{\"index\": 1, \"color\": \"#ff8800\"}, ...]" },
         }), &["colors"]),
         tool("load_palette", "Load a whole palette into colors 1.. : a palette file by path (MagicaVoxel 256x1 PNG, Lospec PNG, .act, .gpl or .hex), a MagicaVoxel palette page 0-3, or a preset name. With match: true the model's colors are recolored to the closest new colors (each keeps its own slot, so loading the old palette again restores them exactly); otherwise voxels keep their indices and take the new colors.", json!({
             "path": { "type": "string" }, "page": { "type": "integer" },
@@ -208,9 +214,9 @@ fn base_tools() -> Value {
         }), &[]),
         tool("edit_palette", "Rearrange or tidy the palette. swap / move (from, to): colors change places and voxels follow, so the model looks the same; copy (from, to): copy a color and its material onto another slot; gradient (from, to): blend the slots between two colors evenly; sort (by: hue | saturation | value): used colors first; pack: used colors into 1.. with duplicates merged; save (name): save the palette to the workspace's palettes folder; name_ramp (row, name): name a row of 8 colors (row k holds 8k+1..8k+8; saved in the .vox); undo: undo the last palette edit.", json!({
             "action": { "type": "string", "enum": ["swap", "move", "copy", "gradient", "sort", "pack", "save", "name_ramp", "undo"] },
-            "from": { "type": "integer" }, "to": { "type": "integer" },
+            "from": { "type": "integer", "minimum": 1, "maximum": 255 }, "to": { "type": "integer", "minimum": 1, "maximum": 255 },
             "by": { "type": "string", "enum": ["hue", "saturation", "value"] },
-            "name": { "type": "string" }, "row": { "type": "integer" },
+            "name": { "type": "string" }, "row": { "type": "integer", "minimum": 0, "maximum": 31 },
         }), &["action"]),
         tool("set_material", "Set the render material of a palette color.", json!({
             "color": color_schema(),
@@ -229,8 +235,8 @@ fn base_tools() -> Value {
             "combine": { "type": "string", "enum": ["replace", "add", "remove"] },
         }), &["mode"]),
         tool("move_selection", "Move the selected voxels (or the whole model if none) by an offset.", json!({ "offset": xyz("[dx, dy, dz]") }), &["offset"]),
-        tool("undo", "Undo edits.", json!({ "steps": { "type": "integer" } }), &[]),
-        tool("redo", "Redo edits.", json!({ "steps": { "type": "integer" } }), &[]),
+        tool("undo", "Undo edits.", json!({ "steps": { "type": "integer", "minimum": 1 } }), &[]),
+        tool("redo", "Redo edits.", json!({ "steps": { "type": "integer", "minimum": 1 } }), &[]),
         tool("set_camera", "Aim the camera (used by screenshot, render and the window). Angles in degrees.", json!({
             "frame": { "type": "boolean", "description": "Reset to a three-quarter view of the whole canvas first" },
             "yaw": { "type": "number", "description": "Orbit angle around z in degrees; 35-45 gives a three-quarter view" },
@@ -291,7 +297,7 @@ fn base_tools() -> Value {
         }), &["part"]),
         tool("create_part", "Add a new empty part (a separate model) and start editing it.", json!({
             "name": { "type": "string" },
-            "size": xyz("Size in voxels, up to 256 per axis for MagicaVoxel compatibility"),
+            "size": size3("Size in voxels, up to 256 per axis for MagicaVoxel compatibility"),
             "position": xyz("World position of its minimum corner (default: beside the existing parts)"),
             "parent": { "type": ["string", "integer"], "description": "Group to put it in (default: the top level)" },
             "fill": color_schema(),
@@ -326,7 +332,10 @@ fn base_tools() -> Value {
             "rotate_axis": axis,
             "quarter_turns": { "type": "integer" },
             "flip_axis": axis,
-            "free_rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees" },
+            "free_rotation": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] degrees" },
+            "attach_to": { "type": "string", "description": "As in transform_part: \"part:socket\" or \"part\"" },
+            "attach_socket": { "type": "string", "description": "With attach_to: this part's own socket to line up" },
+            "link": { "type": "boolean", "description": "With attach_to: false only lines it up (default true)" },
         }), &["part", "frame"]),
         tool("delete_keyframe", "Remove a part's keyframe on a frame.", json!({
             "part": { "type": ["string", "integer"] }, "frame": { "type": "integer" },
@@ -406,10 +415,16 @@ const UNLISTED: &[&str] = &["vary_colors", "shade_edges", "paint_from_reference"
 
 /// The tool list for MCP `tools/list`, with the shared `part` argument.
 pub fn tools() -> Value {
+    let mut list = all_tools();
+    list.as_array_mut().unwrap().retain(|t| !UNLISTED.contains(&t["name"].as_str().unwrap_or_default()));
+    list
+}
+
+/// `tools`, unlisted tools included.
+fn all_tools() -> Value {
     let mut list = base_tools();
     let extra = [build::tools(), guide::tools(), import::tools(), inspect::tools(), reference::tools(), surface::tools(), view::tools()];
     list.as_array_mut().unwrap().extend(extra.into_iter().flatten());
-    list.as_array_mut().unwrap().retain(|t| !UNLISTED.contains(&t["name"].as_str().unwrap_or_default()));
     for t in list.as_array_mut().into_iter().flatten() {
         if is_part_tool(t["name"].as_str().unwrap_or_default()) {
             t["inputSchema"]["properties"]["part"] = json!({ "type": ["string", "integer"], "description": "Part to work on (name or id); default: the part being edited" });
@@ -418,9 +433,14 @@ pub fn tools() -> Value {
     list
 }
 
-/// Run one tool and build the MCP `tools/call` result.
+/// Run one tool and build the MCP `tools/call` result. Arguments that don't
+/// fit the tool's schema are rejected before anything runs.
 pub fn call(ctx: &mut Ctx, name: &str, args: &Value) -> Value {
-    match dispatch(ctx, name, args) {
+    let args = match validate::check_call(name, args) {
+        Ok(a) => a,
+        Err(e) => return json!({ "content": [text(format!("{e:#}"))], "isError": true }),
+    };
+    match dispatch(ctx, name, &args) {
         Ok(content) => json!({ "content": content, "isError": false }),
         Err(e) => json!({ "content": [text(format!("{e:#}"))], "isError": true }),
     }

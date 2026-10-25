@@ -61,7 +61,7 @@ pub fn tools() -> Vec<Value> {
              Per subject: box in pixels, aspect ratio, the voxel block size if the picture is voxel art (so the model can match it: one picture block = one voxel), a width profile (filled extent at 20 heights, as fractions of the box width, so proportions read off directly) and dominant colors (k-means in OKLab) with where they sit. Returns an annotated image with numbered boxes; then attach views with set_reference.",
             json!({
                 "path": { "type": "string", "description": "PNG or JPEG" },
-                "threshold": { "type": "number", "description": "Color difference from the background (0-255, largest channel) that counts as subject; default automatic (about 15). Lower it if parts of the subject are missed, raise it if shadows join in" },
+                "threshold": { "type": "number", "minimum": 0, "maximum": 255, "description": "Color difference from the background (0-255, largest channel) that counts as subject; default automatic (about 15). Lower it if parts of the subject are missed, raise it if shadows join in" },
                 "crop": { "type": "array", "items": { "type": "integer" }, "minItems": 4, "maxItems": 4, "description": "[x0, y0, x1, y1] pixel box around one subject (e.g. the character in a busy scene): also reports its voxel block size and how many blocks tall the box is" },
             }),
             &["path"],
@@ -79,7 +79,8 @@ pub fn tools() -> Vec<Value> {
                 "flip": { "type": "boolean", "description": "Mirror left-right, e.g. to use a side view drawn facing the other way" },
                 "height": { "type": "number", "description": "Pin the scale: how many voxels tall (top view: deep along y) the subject is; compare_reference then measures at this scale and position instead of fitting to the model" },
                 "origin": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2, "description": "With height: world [h, v] where the reference's bottom-center sits (h along the view's horizontal axis, v up the vertical one: [x, z] for front/back, [y, z] for left/right, [x, y] for top). Default: the middle of the model's canvas at v 0" },
-                "threshold": { "type": "number", "description": "As in analyze_image" },
+                "threshold": { "type": "number", "minimum": 0, "maximum": 255, "description": "As in analyze_image" },
+                "part": { "type": ["string", "integer"], "description": "With height and no origin: center the default origin on this part (default: every visible part)" },
                 "clear": { "type": "boolean", "description": "Remove this view's reference" },
             }),
             &["view"],
