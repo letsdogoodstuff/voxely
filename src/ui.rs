@@ -106,6 +106,19 @@ pub enum Command {
     DeleteProject(PathBuf),
     /// Asked and confirmed: move it to the Trash.
     DeleteProjectConfirmed(PathBuf),
+    /// Pick a palette file to load (`true`: keeping the model's look).
+    PalettePick(bool),
+    /// Close the window.
+    Quit,
+    /// The answer to "Save changes?" before a command that drops them.
+    Unsaved(UnsavedChoice),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum UnsavedChoice {
+    Save,
+    Discard,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -586,9 +599,10 @@ pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, history: (bool, boo
     });
 }
 
-/// The Preferences window. Returns true when a preference changed.
-pub fn preferences_window(ctx: &egui::Context, open: &mut bool, prefs: &mut crate::prefs::Prefs, in_use: f32) -> bool {
-    let before = prefs.clone();
+/// The Preferences window. `autosave` is (on, edits between saves).
+/// Returns true when a preference changed.
+pub fn preferences_window(ctx: &egui::Context, open: &mut bool, prefs: &mut crate::prefs::Prefs, in_use: f32, autosave: &mut (bool, usize)) -> bool {
+    let before = (prefs.clone(), *autosave);
     // Under the Preferences button, at the right of the top bar.
     let window = egui::Window::new("Preferences").open(open).collapsible(false).resizable(false);
     window.anchor(egui::Align2::RIGHT_TOP, [-8.0, 40.0]).show(ctx, |ui| {
@@ -602,8 +616,16 @@ pub fn preferences_window(ctx: &egui::Context, open: &mut bool, prefs: &mut crat
         if in_use < prefs.ui_scale - 1e-3 {
             ui.label(format!("Showing {}% so the panels fit this window; widen it for more.", (in_use * 100.0).round()));
         }
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Autosave").strong());
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut autosave.0, "Save the project every");
+            ui.add_enabled(autosave.0, egui::DragValue::new(&mut autosave.1).range(1..=100_000));
+            ui.label("edits");
+        });
+        ui.label(egui::RichText::new("Counts your edits and agents' alike; saves to the project's file").weak().small());
     });
-    *prefs != before
+    (prefs.clone(), *autosave) != before
 }
 
 /// What the bottom bar shows and changes.
@@ -619,7 +641,12 @@ pub struct Status<'a> {
     /// The animation timeline is showing.
     pub timeline: &'a mut bool,
     pub hint: &'a str,
+    /// The last action's message, shown instead of the hint.
+    pub notice: &'a mut Option<crate::app::Notice>,
 }
+
+/// How long a message (not an error) stays in the status bar.
+const NOTICE_SECS: u64 = 8;
 
 /// Bottom bar: view toggles, hovered voxel, camera modes and a hint.
 /// Returns true when the isometric view was asked for.
@@ -668,7 +695,26 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
         ui.toggle_value(s.timeline, "Anim").on_hover_text("Animation timeline");
         crate::agents::badge(ui, s.agent);
         ui.separator();
-        ui.weak(s.hint);
+        if s.notice.as_ref().is_some_and(|n| !n.error && n.at.elapsed().as_secs() >= NOTICE_SECS) {
+            *s.notice = None;
+        }
+        match s.notice {
+            Some(n) => {
+                if n.error && ui.small_button("x").on_hover_text("Dismiss").clicked() {
+                    *s.notice = None;
+                } else {
+                    let text = egui::RichText::new(&n.text);
+                    let text = if n.error { text.color(egui::Color32::from_rgb(255, 120, 120)) } else { text };
+                    ui.add(egui::Label::new(text).truncate()).on_hover_text(&n.text);
+                    if !n.error {
+                        ui.ctx().request_repaint_after(std::time::Duration::from_secs(NOTICE_SECS));
+                    }
+                }
+            }
+            None => {
+                ui.add(egui::Label::new(egui::RichText::new(s.hint).weak()).truncate()).on_hover_text(s.hint);
+            }
+        }
     });
     iso
 }
@@ -835,8 +881,11 @@ pub fn palette_panel(ui: &mut Ui, e: &mut Editor, scene: &mut Scene, pal: &mut P
     ui.horizontal(|ui| {
         ui.color_edit_button_srgb(&mut rgb);
         ui.label(format!("#{i}"));
-        ui.selectable_value(&mut pal.rgb, false, "HSV");
-        ui.selectable_value(&mut pal.rgb, true, "RGB");
+        // One button that switches, so both fit the narrow column.
+        let (mode, other) = if pal.rgb { ("RGB", "HSV") } else { ("HSV", "RGB") };
+        if ui.button(mode).on_hover_text(format!("Sliders in {mode}; click for {other}")).clicked() {
+            pal.rgb ^= true;
+        }
     });
     if pal.rgb {
         for (k, n) in ["R", "G", "B"].iter().enumerate() {
@@ -1312,8 +1361,12 @@ pub fn project_panel(
         match *tab {
             ProjectTab::Project | ProjectTab::Pattern => {
                 let pattern_tab = *tab == ProjectTab::Pattern;
-                for (title, list) in [("My projects", projects), ("Samples", samples)] {
-                    if list.is_empty() && title == "Samples" {
+                // MagicaVoxel's `vox` folder is the samples; another folder
+                // (the opened file's) goes by its name.
+                let folder = samples.first().and_then(|p| p.parent()).and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
+                let others = folder.filter(|n| n != "vox").unwrap_or_else(|| "Samples".into());
+                for (title, list) in [("My projects", projects), (others.as_str(), samples)] {
+                    if list.is_empty() && title != "My projects" {
                         continue;
                     }
                     // Fold-out sections like the Edit column's.

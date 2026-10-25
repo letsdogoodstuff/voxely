@@ -1038,6 +1038,11 @@ impl Scene {
         self.apply(f)
     }
 
+    /// Tree undo and redo steps held.
+    pub fn tree_depth(&self) -> (usize, usize) {
+        (self.history.len(), self.future.len())
+    }
+
     pub fn can_undo_tree(&self) -> bool {
         !self.history.is_empty()
     }

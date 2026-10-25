@@ -23,7 +23,7 @@ use crate::ui::{Op, TransformKind};
 mod build;
 pub mod guide;
 mod import;
-mod inspect;
+pub(crate) mod inspect;
 mod reference;
 pub(crate) mod surface;
 mod view;

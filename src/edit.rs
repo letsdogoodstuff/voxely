@@ -1000,6 +1000,11 @@ impl Editor {
         self.undo.len()
     }
 
+    /// Entries in the undo and redo histories.
+    pub fn history_lens(&self) -> (usize, usize) {
+        (self.undo.len(), self.redo.len())
+    }
+
     /// Recolor the undo and redo history, the brush color, the copied
     /// voxels and the pattern through `remap` after the palette's colors
     /// moved to new indices.

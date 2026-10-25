@@ -87,6 +87,97 @@ pub struct EditState {
     pub backdrop: crate::backdrop::Backdrop,
     /// A project waiting for its delete to be confirmed.
     pub confirm_delete: Option<PathBuf>,
+    /// What the last action did, or why it failed (the status bar).
+    pub notice: Option<Notice>,
+    /// Unsaved changes since the last save or open.
+    pub dirty: Dirty,
+    /// A command that would drop unsaved changes, waiting for Save /
+    /// Don't save / Cancel.
+    pub unsaved_ask: Option<Command>,
+    /// Don't save was chosen: run the next guarded command anyway.
+    discard: bool,
+    /// The window should close.
+    pub quit: bool,
+    /// Last folder each kind of file dialog was used in.
+    dialog_dirs: std::collections::HashMap<&'static str, PathBuf>,
+}
+
+/// A status-bar message. Errors stay until dismissed or the next action;
+/// other messages fade after a few seconds.
+pub struct Notice {
+    pub text: String,
+    pub error: bool,
+    pub at: std::time::Instant,
+}
+
+/// What unsaved-change tracking compares: the undo histories, the colors
+/// and materials, and the render settings that are saved with the file.
+#[derive(Clone, PartialEq)]
+pub struct Sig {
+    history: [u64; 6],
+    look: u64,
+    settings: crate::scene::RenderSettings,
+}
+
+impl Sig {
+    pub fn of(settings: &crate::scene::RenderSettings, scene: &Scene, ed: &EditState) -> Sig {
+        use std::hash::{Hash, Hasher};
+        let (tree_back, tree_fwd) = scene.tree_depth();
+        let (undo, redo) = ed.editor.history_lens();
+        let history = [scene.tree_steps(), tree_back as u64, tree_fwd as u64, undo as u64, redo as u64, ed.palette.history.len() as u64];
+        let mut h = std::hash::DefaultHasher::new();
+        scene.palette.hash(&mut h);
+        bytemuck::cast_slice::<_, u8>(&scene.materials).hash(&mut h);
+        scene.notes.hash(&mut h);
+        // View-only settings don't make the project unsaved.
+        let mut settings = settings.clone();
+        settings.projection = Projection::Perspective;
+        (settings.denoise, settings.denoise_view) = (false, Default::default());
+        Sig { history, look: h.finish(), settings }
+    }
+}
+
+/// Unsaved-change tracking: the scene as last seen, and how many changes
+/// were seen in all and as of the last save. Undoing back to the saved
+/// state still counts as a change.
+#[derive(Default)]
+pub struct Dirty {
+    last: Option<Sig>,
+    changes: u64,
+    saved: u64,
+}
+
+impl Dirty {
+    pub fn is_dirty(&self) -> bool {
+        self.changes != self.saved
+    }
+
+    /// Look at the scene now. Returns true if its undo history moved (an
+    /// edit, an undo or a redo) since the last look.
+    pub fn see(&mut self, sig: Sig) -> bool {
+        let Some(last) = &self.last else {
+            self.last = Some(sig);
+            return false;
+        };
+        if *last == sig {
+            return false;
+        }
+        let edit = last.history != sig.history;
+        self.changes += 1;
+        self.last = Some(sig);
+        edit
+    }
+
+    /// The scene was just saved, opened or made.
+    pub fn clean(&mut self, sig: Sig) {
+        self.last = Some(sig);
+        self.saved = self.changes;
+    }
+
+    /// Changes not on disk (e.g. a new project from an import).
+    pub fn touch(&mut self) {
+        self.changes += 1;
+    }
 }
 
 /// Parts dragged across the plane of the face first clicked.
@@ -143,6 +234,41 @@ impl EditState {
             import: None,
             backdrop: Default::default(),
             confirm_delete: None,
+            notice: None,
+            dirty: Dirty::default(),
+            unsaved_ask: None,
+            discard: false,
+            quit: false,
+            dialog_dirs: Default::default(),
+        }
+    }
+
+    /// Show what an action did in the status bar (and the terminal).
+    pub fn say(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        eprintln!("{text}");
+        self.notice = Some(Notice { text, error: false, at: std::time::Instant::now() });
+    }
+
+    /// Show why an action failed; it stays until dismissed or the next
+    /// action.
+    pub fn fail(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        eprintln!("{text}");
+        self.notice = Some(Notice { text, error: true, at: std::time::Instant::now() });
+    }
+
+    /// Where a `kind` file dialog starts: where it was last used, else
+    /// `fallback`.
+    fn dialog_dir(&self, kind: &'static str, fallback: PathBuf) -> PathBuf {
+        self.dialog_dirs.get(kind).filter(|d| d.is_dir()).cloned().unwrap_or(fallback)
+    }
+
+    /// Remember the folder of a file picked in a `kind` dialog.
+    fn picked(&mut self, kind: &'static str, path: &Path) {
+        let dir = if path.is_dir() { Some(path) } else { path.parent() };
+        if let Some(d) = dir {
+            self.dialog_dirs.insert(kind, d.to_path_buf());
         }
     }
 
@@ -353,6 +479,7 @@ pub fn save_project(r: &Renderer, scene: &mut Scene, ed: &mut EditState, path: P
     ed.source = Some(path.clone());
     ed.rescan();
     ed.tools.inspect.mark_saved(&path);
+    ed.dirty.clean(Sig::of(&r.settings, scene, ed));
     Ok(path)
 }
 
@@ -512,16 +639,23 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
         }
         TreeOp::Motion(name, frames) => {
             let rig = scene.picked.first().copied();
+            let on = crate::timeline::rig_label(&scene.world, rig, name.starts_with("quad"));
             let res = scene.change_quiet(|w| crate::rig::apply_motion(w, rig, &name, frames, 1.0));
             match res {
-                Ok(a) if a.bones.is_empty() => eprintln!("motion {name}: no rig parts found (name parts hips, torso, head, upper_arm_l ...)"),
+                Ok(a) if a.bones.is_empty() => {
+                    ed.fail(format!("{name}: no rig parts found on {on} (name parts hips, torso, head, upper_arm_l ...)"));
+                }
                 Ok(a) => {
                     ed.timeline.open = true;
+                    let parts: Vec<&str> = a.bones.iter().map(|(_, l)| l.as_str()).collect();
+                    let mut msg = format!("{name} on {on}: keyed {} parts ({})", parts.len(), parts.join(", "));
                     if !a.missing.is_empty() {
-                        eprintln!("motion {name}: no part for {:?}", a.missing.iter().map(|b| crate::rig::bone_name(*b)).collect::<Vec<_>>());
+                        let missing: Vec<&str> = a.missing.iter().map(|b| crate::rig::bone_name(*b)).collect();
+                        msg.push_str(&format!("; no part for {}", missing.join(", ")));
                     }
+                    ed.say(msg);
                 }
-                Err(e) => eprintln!("{e}"),
+                Err(e) => ed.fail(e),
             }
         }
         TreeOp::Extras(id, x, begin) => {
@@ -646,6 +780,8 @@ pub(crate) fn import_file(path: &Path, how: &crate::import::How, new_project: bo
         ed.source = None;
         ed.save_path = (1..).map(|k| if k == 1 { project_path(&stem) } else { project_path(&format!("{stem}-{k}")) }).find(|p| !p.exists()).unwrap();
         loaded(r, scene, ed);
+        // Not on disk yet.
+        ed.dirty.touch();
         Ok(format!("Imported {} as {} ({what}); Ctrl+S saves it", path.display(), ed.name()))
     } else {
         let (top, written) = crate::import::add_to_scene(scene, &models, &stem, add_colors)?;
@@ -709,6 +845,36 @@ fn confirm_delete(ctx: &egui::Context, ed: &mut EditState, cmds: &mut Vec<Comman
     }
 }
 
+/// Ask whether to save before a command that drops unsaved changes.
+fn confirm_unsaved(ctx: &egui::Context, ed: &EditState, cmds: &mut Vec<Command>) {
+    let Some(next) = &ed.unsaved_ask else { return };
+    let what = match next {
+        Command::Quit => "closing",
+        Command::New => "starting a new project",
+        Command::Import(_) => "importing",
+        _ => "opening another project",
+    };
+    egui::Modal::new(egui::Id::unique("confirm_unsaved")).show(ctx, |ui| {
+        ui.set_width(320.0);
+        ui.heading(format!("Save changes to \u{201c}{}\u{201d}?", ed.name()));
+        ui.add_space(4.0);
+        ui.label(format!("Your changes will be lost if you don't save them before {what}."));
+        ui.weak(format!("Save writes {}", ed.save_path.display()));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                cmds.push(Command::Unsaved(ui::UnsavedChoice::Save));
+            }
+            if ui.button("Don't save").clicked() {
+                cmds.push(Command::Unsaved(ui::UnsavedChoice::Discard));
+            }
+            if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cmds.push(Command::Unsaved(ui::UnsavedChoice::Cancel));
+            }
+        });
+    });
+}
+
 /// Move a project (and its saved references) to the Trash. The scene
 /// stays open if it's the current one; saving writes it again.
 fn delete_project(path: &Path, ed: &mut EditState) -> Result<String> {
@@ -739,11 +905,26 @@ pub(crate) fn loaded(r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     ed.editor.sel_dirty = false;
     ed.timeline.play(false);
     ed.timeline.open |= scene.world.animated();
+    ed.dirty.clean(Sig::of(&r.settings, scene, ed));
     eprintln!("Ctrl+S saves to {}", ed.save_path.display());
 }
 
+/// The project's folder (the workspace for a new one).
 fn dialog_dir(ed: &EditState) -> PathBuf {
-    ed.source.as_deref().and_then(Path::parent).map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+    ed.source.as_deref().and_then(Path::parent).filter(|d| d.is_dir()).map_or_else(workspace_dir, Path::to_path_buf)
+}
+
+/// The window file dialogs belong to.
+static DIALOG_PARENT: std::sync::OnceLock<Arc<Window>> = std::sync::OnceLock::new();
+
+/// A file dialog attached to the window (a sheet on macOS), so it can't
+/// open behind it.
+pub fn file_dialog() -> rfd::FileDialog {
+    let d = rfd::FileDialog::new();
+    match DIALOG_PARENT.get() {
+        Some(w) => d.set_parent(w.as_ref()),
+        None => d,
+    }
 }
 
 pub(crate) fn apply_op(op: Op, scene: &Scene, editor: &Editor) -> Option<crate::scene::Volume> {
@@ -805,6 +986,21 @@ pub(crate) fn transform(kind: ui::TransformKind, text: &str, v: &crate::scene::V
     }
 }
 
+/// Save to `path`, saying so (or why not) in the status bar. Returns
+/// whether it saved.
+fn save_and_say(r: &Renderer, scene: &mut Scene, ed: &mut EditState, path: PathBuf) -> bool {
+    match save_project(r, scene, ed, path) {
+        Ok(p) => {
+            ed.say(format!("Saved {}", p.display()));
+            true
+        }
+        Err(e) => {
+            ed.fail(format!("Couldn't save: {e:#}"));
+            false
+        }
+    }
+}
+
 /// Run a button or hotkey command.
 pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) {
     let dims = scene.volume.dims;
@@ -824,11 +1020,25 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             Command::Tree(TreeOp::Duplicate)
         }
         (_, Command::Op(_) | Command::Resize(_) | Command::Cut | Command::RunShader | Command::Transform(..) | Command::PaletteRandom | Command::PatternFromSelection) => {
-            eprintln!("voxel edits need edit mode: pick a model and press Tab");
+            ed.fail("Voxel edits need edit mode: pick a model and press Tab");
             return;
         }
         (_, cmd) => cmd,
     };
+    // An error stays up until the next action.
+    if !matches!(cmd, Command::Frame(_) | Command::Unsaved(_)) && ed.notice.as_ref().is_some_and(|n| n.error) {
+        ed.notice = None;
+    }
+    // Ask before dropping unsaved changes.
+    let replaces = match &cmd {
+        Command::New | Command::Open | Command::OpenPath(_) | Command::Quit => true,
+        Command::Import(crate::import::window::ImportCmd::Run) => ed.import.as_ref().is_some_and(|i| i.new_project),
+        _ => false,
+    };
+    if replaces && ed.dirty.is_dirty() && !ed.discard {
+        ed.unsaved_ask = Some(cmd);
+        return;
+    }
     let reshape = matches!(cmd, Command::Op(_) | Command::Resize(_) | Command::Transform(..));
     let changed = match cmd {
         Command::New => {
@@ -844,35 +1054,52 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::Open => {
-            if let Some(p) = rfd::FileDialog::new().add_filter("MagicaVoxel", &["vox"]).set_directory(dialog_dir(ed)).pick_file() {
-                if let Err(e) = open_project(p, r, scene, ed) {
-                    eprintln!("open failed: {e:#}");
-                }
+            let dir = ed.dialog_dir("open", workspace_dir());
+            if let Some(p) = file_dialog().add_filter("MagicaVoxel", &["vox"]).set_directory(dir).pick_file() {
+                ed.picked("open", &p);
+                run_command(Command::OpenPath(p), r, scene, ed);
             }
             false
         }
         Command::OpenPath(p) => {
-            if let Err(e) = open_project(p, r, scene, ed) {
-                eprintln!("open failed: {e:#}");
+            match open_project(p.clone(), r, scene, ed) {
+                Ok(()) => ed.say(format!("Opened {}", p.display())),
+                Err(e) => ed.fail(format!("Couldn't open: {e:#}")),
             }
             false
         }
         Command::Save => {
             let path = ed.save_path.clone();
-            match save_project(r, scene, ed, path) {
-                Ok(p) => eprintln!("saved {}", p.display()),
-                Err(e) => eprintln!("save failed: {e:#}"),
-            }
+            save_and_say(r, scene, ed, path);
             false
         }
         Command::SaveAs => {
             let dir = ed.save_path.parent().filter(|d| d.is_dir()).map_or_else(workspace_dir, Path::to_path_buf);
-            let dialog = rfd::FileDialog::new().add_filter("MagicaVoxel", &["vox"]).set_directory(dir).set_file_name(format!("{}.vox", ed.name()));
+            let dialog = file_dialog().add_filter("MagicaVoxel", &["vox"]).set_directory(dir).set_file_name(format!("{}.vox", ed.name()));
             if let Some(p) = dialog.save_file() {
-                match save_project(r, scene, ed, p.with_extension("vox")) {
-                    Ok(p) => eprintln!("saved {}", p.display()),
-                    Err(e) => eprintln!("save failed: {e:#}"),
+                save_and_say(r, scene, ed, p.with_extension("vox"));
+            }
+            false
+        }
+        Command::Quit => {
+            ed.quit = true;
+            false
+        }
+        Command::Unsaved(choice) => {
+            let Some(next) = ed.unsaved_ask.take() else { return };
+            match choice {
+                ui::UnsavedChoice::Save => {
+                    let path = ed.save_path.clone();
+                    if save_and_say(r, scene, ed, path) {
+                        run_command(next, r, scene, ed);
+                    }
                 }
+                ui::UnsavedChoice::Discard => {
+                    ed.discard = true;
+                    run_command(next, r, scene, ed);
+                    ed.discard = false;
+                }
+                ui::UnsavedChoice::Cancel => {}
             }
             false
         }
@@ -891,39 +1118,55 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         },
         Command::EditPart(id) => set_mode(scene, ed, Some(id)),
         Command::ImportAnimation(None) => {
-            if let Some(p) = rfd::FileDialog::new().add_filter("glTF", &["glb", "gltf"]).pick_file() {
+            let dir = ed.dialog_dir("animation", dialog_dir(ed));
+            if let Some(p) = file_dialog().add_filter("glTF", &["glb", "gltf"]).set_directory(dir).pick_file() {
+                ed.picked("animation", &p);
                 match crate::gltf_import::Gltf::load(&p) {
                     Ok(g) => {
                         let names: Vec<String> = g.clips().into_iter().map(|c| c.name).collect();
+                        let file = p.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
                         if names.is_empty() {
-                            eprintln!("{}: no animations", p.display());
+                            ed.fail(format!("{file} has no animations"));
+                        } else {
+                            ed.say(format!("{file}: {} clips; pick one and press Use clip", names.len()));
                         }
                         ed.timeline.clips = Some((p, names));
                         ed.timeline.clip = 0;
                     }
-                    Err(e) => eprintln!("import: {e:#}"),
+                    Err(e) => ed.fail(format!("Couldn't read animations: {e:#}")),
                 }
             }
             false
         }
         Command::ImportAnimation(Some((path, k))) => {
             let rig = scene.picked.first().copied();
+            let on = crate::timeline::rig_label(&scene.world, rig, false);
             let res = crate::gltf_import::Gltf::load(&path).and_then(|g| scene.change_quiet(|w| crate::gltf_import::import(w, &g, Some(&k.to_string()), rig, true)));
             match res {
-                Ok(done) => eprintln!("imported {} ({} frames, {} parts)", done.clip, done.frames, done.bones.len()),
-                Err(e) => eprintln!("import: {e:#}"),
+                Ok(done) => {
+                    let parts: Vec<&str> = done.bones.iter().map(|b| b.2.as_str()).collect();
+                    let mut msg = format!("{} on {on}: {} frames onto {} parts ({})", done.clip, done.frames, parts.len(), parts.join(", "));
+                    if !done.missing.is_empty() {
+                        let missing: Vec<&str> = done.missing.iter().map(|b| crate::rig::bone_name(*b)).collect();
+                        msg.push_str(&format!("; no part for {}", missing.join(", ")));
+                    }
+                    ed.say(msg);
+                }
+                Err(e) => ed.fail(format!("Couldn't use the clip: {e:#}")),
             }
             ed.editor.reset();
             true
         }
         Command::ImportPick => {
-            let dialog = rfd::FileDialog::new()
+            let dir = ed.dialog_dir("import", dialog_dir(ed));
+            let dialog = file_dialog()
                 .add_filter("Everything voxely imports", &crate::import::extensions())
                 .add_filter("Voxel formats", crate::import::formats::EXTENSIONS)
                 .add_filter("Meshes", crate::import::mesh::EXTENSIONS)
                 .add_filter("Pictures (image, heightmap, slices)", crate::import::IMAGES)
-                .set_directory(dialog_dir(ed));
+                .set_directory(dir);
             if let Some(p) = dialog.pick_file() {
+                ed.picked("import", &p);
                 ed.import = crate::import::window::Pending::new(p);
             }
             false
@@ -933,9 +1176,10 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::Import(crate::import::window::ImportCmd::Pick(folder)) => {
-            let dialog = rfd::FileDialog::new().set_directory(dialog_dir(ed));
+            let dialog = file_dialog().set_directory(ed.dialog_dir("import", dialog_dir(ed)));
             let picked = if folder { dialog.pick_folder() } else { dialog.add_filter("Everything voxely imports", &crate::import::extensions()).pick_file() };
             if let Some(p) = picked {
+                ed.picked("import", &p);
                 let keep = ed.import.as_ref().map(|i| (i.new_project, i.add_colors, i.how));
                 ed.import = crate::import::window::Pending::new(p);
                 if let (Some(i), Some((new, add, how))) = (ed.import.as_mut(), keep) {
@@ -952,7 +1196,7 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             let Some(p) = ed.import.take() else { return };
             match import_file(&p.path, &p.how, p.new_project, p.add_colors, r, scene, ed) {
                 Ok(msg) => {
-                    eprintln!("{msg}");
+                    ed.say(msg.clone());
                     ed.export_status = Some(msg);
                 }
                 Err(e) => ed.import = Some(crate::import::window::Pending { error: Some(format!("{e:#}")), ..p }),
@@ -966,7 +1210,13 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         Command::Reference(cmd) => {
             use crate::backdrop::RefCmd;
             let path = match cmd {
-                RefCmd::Pick => rfd::FileDialog::new().add_filter("Pictures", crate::import::IMAGES).set_directory(dialog_dir(ed)).pick_file(),
+                RefCmd::Pick => {
+                    let p = file_dialog().add_filter("Pictures", crate::import::IMAGES).set_directory(ed.dialog_dir("picture", dialog_dir(ed))).pick_file();
+                    if let Some(p) = &p {
+                        ed.picked("picture", p);
+                    }
+                    p
+                }
                 RefCmd::Load(ref p) => Some(p.clone()),
                 RefCmd::Agent(v) => ed.backdrop.agent(v),
                 RefCmd::Clear => None,
@@ -990,11 +1240,10 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         }
         Command::DeleteProjectConfirmed(p) => {
             ed.confirm_delete = None;
-            ed.export_status = Some(match delete_project(&p, ed) {
-                Ok(msg) => msg,
-                Err(e) => format!("Couldn't delete {}: {e:#}", p.display()),
-            });
-            eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
+            match delete_project(&p, ed) {
+                Ok(msg) => ed.say(msg),
+                Err(e) => ed.fail(format!("Couldn't delete {}: {e:#}", p.display())),
+            }
             false
         }
         Command::Frame(f) => {
@@ -1009,7 +1258,12 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         Command::Tree(op) => tree_op(op, scene, ed),
         Command::Op(op) => match apply_op(op, scene, &ed.editor) {
             Some(new) => ed.editor.commit(&mut scene.volume, new),
-            None => false,
+            None => {
+                if op == Op::Double {
+                    ed.fail(format!("2X: the canvas would exceed {} voxels per side", ops::MAX_DIM));
+                }
+                false
+            }
         },
         Command::Resize(d) => {
             let new = ops::resize(&scene.volume, d);
@@ -1049,8 +1303,9 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             false
         }
         Command::Snapshot => {
-            ed.export_status = Some(snapshot(r, &ed.name()));
-            eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
+            let msg = snapshot(r, &ed.name());
+            ed.say(msg.clone());
+            ed.export_status = Some(msg);
             false
         }
         Command::LoadPattern(p) => {
@@ -1061,9 +1316,9 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
                         ed.editor.pattern = Some(edit::Pattern { name, volume });
                         ed.editor.brush = edit::Brush::Pattern;
                     }
-                    None => eprintln!("pattern {}: empty model", p.display()),
+                    None => ed.fail(format!("Pattern {}: the model is empty", p.display())),
                 },
-                Err(e) => eprintln!("pattern {}: {e:#}", p.display()),
+                Err(e) => ed.fail(format!("Pattern {}: {e:#}", p.display())),
             }
             false
         }
@@ -1106,7 +1361,10 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         }
         Command::Transform(kind, text) => match transform(kind, &text, &scene.volume) {
             Some(new) => ed.editor.commit(&mut scene.volume, new),
-            None => false,
+            None => {
+                ed.fail(format!("Expected [axes] [values], e.g. \"xyz 2\", got {text:?}"));
+                false
+            }
         },
         Command::PaletteRandom => {
             let colors = selected_colors(ed);
@@ -1116,23 +1374,33 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
         Command::Export(format) => {
             let dir = workspace_dir().join("export");
             let _ = std::fs::create_dir_all(&dir);
-            let dialog = rfd::FileDialog::new()
+            let dialog = file_dialog()
                 .add_filter(format.name(), &[format.extension()])
-                .set_directory(&dir)
+                .set_directory(ed.dialog_dir("export", dir))
                 .set_file_name(export_file_name(&ed.name(), format));
             if let Some(path) = dialog.save_file() {
+                ed.picked("export", &path);
                 scene.settings = r.settings.clone();
-                ed.export_status = Some(match crate::export::export(format, scene, &path) {
-                    Ok(files) => export_summary(&files),
-                    Err(e) => format!("{} export failed: {e:#}", format.name()),
-                });
-                eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
+                let msg = match crate::export::export(format, scene, &path) {
+                    Ok(files) => {
+                        let msg = export_summary(&files);
+                        ed.say(msg.clone());
+                        msg
+                    }
+                    Err(e) => {
+                        let msg = format!("{} export failed: {e:#}", format.name());
+                        ed.fail(msg.clone());
+                        msg
+                    }
+                };
+                ed.export_status = Some(msg);
             }
             false
         }
         Command::RenderImage => {
-            ed.export_status = Some(render_final(r, scene, ed.image, &ed.name()));
-            eprintln!("{}", ed.export_status.as_deref().unwrap_or_default());
+            let msg = render_final(r, scene, ed.image, &ed.name());
+            ed.say(msg.clone());
+            ed.export_status = Some(msg);
             false
         }
         Command::PatternFromSelection => {
@@ -1147,11 +1415,19 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
                 changed
             }
             Err(e) => {
-                eprintln!("palette: {e:#}");
+                ed.fail(format!("Palette: {e:#}"));
                 ed.palette.say(format!("{e:#}"));
                 false
             }
         },
+        Command::PalettePick(matched) => {
+            let dir = ed.dialog_dir("palette", dialog_dir(ed));
+            if let Some(path) = file_dialog().add_filter("Palette", &crate::palette_ops::PALETTE_EXTENSIONS).set_directory(dir).pick_file() {
+                ed.picked("palette", &path);
+                run_command(Command::Palette(crate::palette_lib::Cmd::Load(crate::palette_lib::Source::File(path), matched)), r, scene, ed);
+            }
+            false
+        }
     };
     if changed {
         sync_volume(r, scene, &mut ed.editor);
@@ -1327,7 +1603,8 @@ pub fn build_ui(
             let mut modeling = r.modeling;
             let editing = scene.editing().is_some();
             let history = (editing && ed.editor.can_undo() || scene.can_undo_tree(), editing && ed.editor.can_redo() || scene.can_redo_tree());
-            ui::top_bar(ui, &mut modeling, &ed.name(), history, cmds);
+            let name = if ed.dirty.is_dirty() { format!("{} \u{2022}", ed.name()) } else { ed.name() };
+            ui::top_bar(ui, &mut modeling, &name, history, cmds);
             if r.modeler.is_some() && modeling != was {
                 r.modeling = modeling;
                 ed.enabled = modeling;
@@ -1350,7 +1627,8 @@ pub fn build_ui(
             };
             let iso = is_iso(r);
             let options = r.modeler.as_mut().filter(|_| r.modeling).map(|m| &mut m.options);
-            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, agent: &mut ed.agent, timeline: &mut ed.timeline.open, hint };
+            let notice = &mut ed.notice;
+            let status = ui::Status { options, hover, projection: &mut r.settings.projection, iso, free: &mut ed.free_look, agent: &mut ed.agent, timeline: &mut ed.timeline.open, hint, notice };
             if ui::status_bar(ui, status, cmds) {
                 iso_camera(r);
             }
@@ -1374,7 +1652,7 @@ pub fn build_ui(
                 ui.add_enabled_ui(editing, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
             });
             if !editing {
-                egui::Panel::right("world").exact_size(160.0).resizable(false).show(ui, |ui| crate::outline::panel(ui, scene, &mut ed.outline, cmds));
+                egui::Panel::right("world").default_size(180.0).size_range(160.0..=320.0).resizable(true).show(ui, |ui| crate::outline::panel(ui, scene, &mut ed.outline, cmds));
             } else if let Some(m) = r.modeler.as_mut() {
                 egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut m.options, &mut ed.transform_text, cmds));
             }
@@ -1402,7 +1680,11 @@ pub fn build_ui(
             egui::Panel::bottom("agents").resizable(true).default_size(190.0).show(ui, |ui| crate::agents::panel(ui, &mut ed.agent));
         }
     }
-    if ui::preferences_window(ui.ctx(), &mut ed.prefs_open, &mut ed.prefs, ed.ui_scale) {
+    // Autosave shows what's in use (an agent may have changed it).
+    let mut autosave = ed.tools.inspect.autosave_config();
+    if ui::preferences_window(ui.ctx(), &mut ed.prefs_open, &mut ed.prefs, ed.ui_scale, &mut autosave) {
+        ed.tools.inspect.set_autosave_config(autosave.0, autosave.1);
+        (ed.prefs.autosave, ed.prefs.autosave_every) = autosave;
         ed.prefs.save();
     }
     crate::palette_lib::window(ui.ctx(), ed, cmds);
@@ -1420,6 +1702,7 @@ pub fn build_ui(
         m.reference_plane = ed.backdrop.plane(scene.volume.dims, scene.origin);
     }
     confirm_delete(ui.ctx(), ed, cmds);
+    confirm_unsaved(ui.ctx(), ed, cmds);
     actions.viewport = Some(ui.available_rect_before_wrap());
     draw_overlay(&ui.ctx().layer_painter(egui::LayerId::background()), r, scene, ed, ppp);
 
@@ -1575,6 +1858,7 @@ impl App {
         let mut edit = EditState::new(color, source, save_path);
         edit.timeline.open = scene.world.animated();
         edit.prefs = crate::prefs::Prefs::load();
+        edit.tools.inspect.set_autosave_config(edit.prefs.autosave, edit.prefs.autosave_every);
         App {
             scene,
             gfx: None,
@@ -1598,6 +1882,7 @@ impl App {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
             el.owned_display_handle(),
         )));
+        let _ = DIALOG_PARENT.set(window.clone());
         let surface = instance.create_surface(window.clone())?;
         let (adapter, device, queue) = pollster::block_on(gpu::request_device(&instance, Some(&surface)))?;
         let size = window.inner_size();
@@ -1635,8 +1920,29 @@ impl App {
 
     fn command(&mut self, cmd: Command) {
         if let Some(g) = self.gfx.as_mut() {
+            // A dropdown left open over a file dialog or the next action
+            // would be stale.
+            if !matches!(cmd, Command::Frame(_)) {
+                egui::Popup::close_all(&g.egui_ctx);
+            }
             run_command(cmd, &mut g.renderer, &mut self.scene, &mut self.edit);
             g.window.request_redraw();
+        }
+    }
+
+    /// Note changes since the last look: the window title's unsaved mark,
+    /// and GUI edits count toward autosave (`gui`; agents' edits are
+    /// counted by the control tools).
+    fn track_changes(&mut self, gui: bool) {
+        let Some(g) = self.gfx.as_mut() else { return };
+        let sig = Sig::of(&g.renderer.settings, &self.scene, &self.edit);
+        if self.edit.dirty.see(sig) && gui {
+            let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true };
+            match crate::control::inspect::count_gui_edit(&mut ctx) {
+                Some(Ok(msg)) => self.edit.say(msg),
+                Some(Err(msg)) => self.edit.fail(msg),
+                None => {}
+            }
         }
     }
 
@@ -2104,6 +2410,7 @@ impl App {
         if let Some(f) = self.edit.timeline.tick(&self.scene) {
             self.command(Command::Frame(f));
         }
+        self.track_changes(true);
         let Some(g) = self.gfx.as_mut() else { return };
         if self.edit.editor.sel_dirty {
             sync_selection(&mut g.renderer, &self.scene, &mut self.edit.editor);
@@ -2149,10 +2456,11 @@ impl App {
         for cmd in actions.commands {
             self.command(cmd);
         }
+        self.track_changes(true);
 
         let Some(g) = self.gfx.as_ref() else { return };
         let ed = &self.edit.editor;
-        let name = self.edit.name();
+        let name = if self.edit.dirty.is_dirty() { format!("{} \u{2022}", self.edit.name()) } else { self.edit.name() };
         let title = if g.renderer.modeling {
             let sel = match ed.selected_count() {
                 0 => String::new(),
@@ -2183,11 +2491,14 @@ impl ApplicationHandler<UserEvent> for App {
                 g.window.request_redraw();
                 result
             }
-            Some(g) => {
+            Some(_) => {
+                self.track_changes(true);
+                let g = self.gfx.as_mut().unwrap();
                 let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true };
                 let result = crate::control::call(&mut ctx, &tool, &args);
                 self.edit.agent.record(&tool, &result);
                 g.window.request_redraw();
+                self.track_changes(false);
                 result
             }
             None => serde_json::json!({ "content": [{ "type": "text", "text": "the voxely window is still starting" }], "isError": true }),
@@ -2212,12 +2523,22 @@ impl ApplicationHandler<UserEvent> for App {
             }
             let pointer_on_ui = g.egui_ctx.egui_wants_pointer_input();
             let press = matches!(event, WindowEvent::MouseInput { state: ElementState::Pressed, .. } | WindowEvent::MouseWheel { .. });
+            // Escape closes any open dropdown, wherever the focus is.
+            if let WindowEvent::KeyboardInput { event: KeyEvent { logical_key: Key::Named(NamedKey::Escape), state: ElementState::Pressed, .. }, .. } = &event {
+                if egui::Popup::is_any_open(&g.egui_ctx) {
+                    egui::Popup::close_all(&g.egui_ctx);
+                    g.window.request_redraw();
+                    return;
+                }
+            }
             let typing = g.egui_ctx.egui_wants_keyboard_input() && matches!(event, WindowEvent::KeyboardInput { .. });
             if (resp.consumed && !matches!(event, WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. })) || (pointer_on_ui && press) || typing {
                 return;
             }
         }
         match event {
+            // With unsaved changes, ask first (Quit sets `quit`).
+            WindowEvent::CloseRequested if self.gfx.is_some() => self.command(Command::Quit),
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => {
                 if let Some(g) = self.gfx.as_mut() {
@@ -2252,5 +2573,61 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
+        if self.edit.quit {
+            el.exit();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sig(scene: &Scene, ed: &EditState) -> Sig {
+        Sig::of(&scene.settings, scene, ed)
+    }
+
+    #[test]
+    fn unsaved_changes_are_tracked() {
+        let mut scene = Scene::empty(IVec3::splat(4));
+        let mut ed = EditState::new(1, None, PathBuf::from("x.vox"));
+        ed.dirty.clean(sig(&scene, &ed));
+        assert!(!ed.dirty.is_dirty());
+        assert!(!ed.dirty.see(sig(&scene, &ed)), "nothing changed");
+        // A tree change is an edit (it counts toward autosave).
+        scene.change(|w| w.anim.fps = 5.0);
+        assert!(ed.dirty.see(sig(&scene, &ed)));
+        assert!(ed.dirty.is_dirty());
+        assert!(!ed.dirty.see(sig(&scene, &ed)), "seen once");
+        ed.dirty.clean(sig(&scene, &ed));
+        assert!(!ed.dirty.is_dirty());
+        // Undo is a change too, and it stays unsaved.
+        scene.undo_tree(false);
+        assert!(ed.dirty.see(sig(&scene, &ed)));
+        assert!(ed.dirty.is_dirty());
+        ed.dirty.clean(sig(&scene, &ed));
+        // A color change is unsaved but not an undo step.
+        scene.palette[3] = [1, 2, 3, 255];
+        assert!(!ed.dirty.see(sig(&scene, &ed)));
+        assert!(ed.dirty.is_dirty());
+        ed.dirty.clean(sig(&scene, &ed));
+        // Switching the view's projection isn't a change to the project.
+        scene.settings.projection = Projection::Orthographic;
+        ed.dirty.see(sig(&scene, &ed));
+        assert!(!ed.dirty.is_dirty());
+        // Voxel edits in edit mode are.
+        let full = ops::full(&scene.volume, 2);
+        ed.editor.commit(&mut scene.volume, full);
+        assert!(ed.dirty.see(sig(&scene, &ed)));
+        assert!(ed.dirty.is_dirty());
+    }
+
+    #[test]
+    fn errors_stay_and_messages_replace_them() {
+        let mut ed = EditState::new(1, None, PathBuf::from("x.vox"));
+        ed.fail("Couldn't save: disk full");
+        assert!(ed.notice.as_ref().is_some_and(|n| n.error));
+        ed.say("Saved x.vox");
+        assert!(ed.notice.as_ref().is_some_and(|n| !n.error && n.text == "Saved x.vox"));
     }
 }

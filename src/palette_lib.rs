@@ -453,9 +453,7 @@ pub fn window(ctx: &egui::Context, ed: &mut EditState, cmds: &mut Vec<crate::ui:
         );
         ui.horizontal(|ui| {
             if ui.button("Load file…").on_hover_text("PNG (MagicaVoxel or Lospec), .act, .gpl or .hex; or drop one on the window").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("Palette", &ops::PALETTE_EXTENSIONS).pick_file() {
-                    cmds.push(crate::ui::Command::Palette(Cmd::Load(Source::File(path), p.match_colors)));
-                }
+                cmds.push(crate::ui::Command::PalettePick(p.match_colors));
             }
             if ui.add_enabled(!p.history.is_empty(), egui::Button::new("Undo")).on_hover_text("Undo the last palette change").clicked() {
                 cmds.push(crate::ui::Command::Palette(Cmd::Undo));
