@@ -455,6 +455,14 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
         TreeOp::Move(d) => scene.change(|w| picked.iter().for_each(|&p| w.translate(p, d))),
         TreeOp::Turn(axis, q) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::turn(axis, q)))),
         TreeOp::Flip(axis) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::flip(axis)))),
+        TreeOp::Attach(id, to, socket) => {
+            if !scene.change(|w| w.attach_to(id, to, socket.as_deref(), None)) {
+                return false;
+            }
+        }
+        TreeOp::Detach(id) => {
+            scene.change(|w| w.detach(id));
+        }
         TreeOp::Extras(id, x, begin) => {
             let set = |w: &mut crate::world::World| {
                 if let Some(n) = w.node_mut(id) {

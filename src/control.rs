@@ -37,7 +37,7 @@ screenshot (fast) -> set_material and set_render_settings -> render (path traced
 Every edit is undoable. If the voxely window is open, edits appear in it live.
 
 Scenes are a tree of parts (models) and groups, like MagicaVoxel's World editor. Voxel tools work on one part at a time, in that part's own coordinates (0..size-1): the part being edited (see get_scene_info), or the one named by a tool's `part` argument. Build separate pieces (body, head, arms, wheels, props) as separate parts with create_part, place them with transform_part (move, 90° rotate, flip) and group_parts, and inspect the tree with list_parts. Give parts pivots (set_pivot: a shoulder, a hinge) \
-and named sockets (set_socket: hand, muzzle, seat), then snap parts together with transform_part attach_to; \
+and named sockets (set_socket: hand, muzzle, seat), then attach parts with transform_part attach_to (\"arm:hand\") so they follow, like a skeleton; \
 both carry into glTF exports for game engines. Part positions are world voxel coordinates of the part's minimum corner; a new project's first part spans [0, size).";
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
@@ -192,7 +192,7 @@ fn base_tools() -> Value {
             "parent": { "type": ["string", "integer"], "description": "Group to put it in (default: the top level)" },
             "fill": color_schema(),
         }), &["name", "size"]),
-        tool("transform_part", "Move, rotate or flip a part or group as a whole. 90° turns and flips are exact and turn about its pivot (default: its center), around world axes. free_rotation adds any angle (shown resampled; edit the part upright). attach_to moves it so its pivot (or its own socket) lands on another part's socket.", json!({
+        tool("transform_part", "Move, rotate or flip a part or group as a whole. 90° turns and flips are exact and turn about its pivot (default: its center), around world axes. free_rotation adds any angle (shown resampled; edit the part upright). attach_to attaches it to another part (snapping its pivot or own socket onto that part's socket) so it follows that part from then on, like a sword in a hand.", json!({
             "part": { "type": ["string", "integer"] },
             "move": xyz("[dx, dy, dz] offset"),
             "position": xyz("New world position of its minimum corner"),
@@ -200,7 +200,8 @@ fn base_tools() -> Value {
             "quarter_turns": { "type": "integer", "description": "Counter-clockwise quarter turns about rotate_axis (negative for clockwise)" },
             "flip_axis": axis,
             "free_rotation": { "type": "array", "items": { "type": "number" }, "description": "[x, y, z] degrees about the pivot, applied x then y then z; replaces any previous free rotation. [0, 0, 0] straightens." },
-            "attach_to": { "type": "string", "description": "\"part:socket\", e.g. \"body:shoulder_r\"" },
+            "attach_to": { "type": "string", "description": "\"part:socket\" (e.g. \"body:shoulder_r\") to snap onto a socket and attach, or \"part\" to attach where it is. Attached parts follow their parent's moves and turns (and nest in glTF exports)." },
+            "link": { "type": "boolean", "description": "With attach_to: false only lines it up without attaching (default true)" },
             "attach_socket": { "type": "string", "description": "With attach_to: this part's own socket to line up (default: its pivot). It becomes the pivot if none was set, so later turns keep it attached." },
         }), &["part"]),
         tool("set_pivot", "Set the point a part or group turns about (and its origin in glTF exports), in the part's own coordinates (the ones the voxel tools use while editing it; world coordinates for groups). E.g. a shoulder for an arm, the hinge for a door.", json!({
@@ -214,7 +215,7 @@ fn base_tools() -> Value {
         }), &["part", "name"]),
         tool("modify_part", "Rename, duplicate, delete, hide, show or ungroup a part or group.", json!({
             "part": { "type": ["string", "integer"] },
-            "action": { "type": "string", "enum": ["rename", "duplicate", "delete", "hide", "show", "ungroup"] },
+            "action": { "type": "string", "enum": ["rename", "duplicate", "delete", "hide", "show", "ungroup", "detach"], "description": "detach: stop following what it's attached to (it stays where it is)" },
             "name": { "type": "string", "description": "New name (rename) or the copy's name (duplicate)" },
             "offset": xyz("duplicate: where the copy goes relative to the original (default: just beside it on x)"),
         }), &["part", "action"]),
@@ -505,8 +506,9 @@ fn part_json(scene: &Scene, id: usize) -> Value {
             .map(|s| json!({ "name": s.name, "position": w.to_part(id, s.pos).to_array(), "world": w.affine(id).transform_point3(s.pos).to_array() }))
             .collect();
     }
-    if n.is_group() {
-        v["children"] = n.children().iter().map(|&c| part_json(scene, c)).collect();
+    if !n.children().is_empty() {
+        let key = if n.is_group() { "children" } else { "attached" };
+        v[key] = n.children().iter().map(|&c| part_json(scene, c)).collect();
     }
     v
 }
@@ -604,24 +606,29 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             };
             let attach = match string(a, "attach_to") {
                 Some(spec) => {
-                    let (p, sock) = spec.split_once(':').context("attach_to is \"part:socket\"")?;
+                    let (p, sock) = match spec.split_once(':') {
+                        Some((p, s)) => (p, Some(s.to_string())),
+                        None => (spec, None),
+                    };
                     let target = find_part(ctx.scene, Some(&json!(p)))?;
-                    let synced = ctx.scene.synced_world();
-                    let at = synced.socket_world(target, sock).with_context(|| format!("`{p}` has no socket `{sock}`"))?;
+                    if let Some(sock) = &sock {
+                        ctx.scene.world.socket_world(target, sock).with_context(|| format!("`{p}` has no socket `{sock}`"))?;
+                    }
                     let own = string(a, "attach_socket").map(str::to_string);
-                    Some((at, own))
+                    Some((target, sock, own))
                 }
                 None => None,
             };
+            let link = boolean(a, "link").unwrap_or(true);
             if mv.is_none() && pos.is_none() && turn.is_none() && flip.is_none() && tilt.is_none() && attach.is_none() {
                 bail!("give move, position, rotate_axis, flip_axis, free_rotation or attach_to");
             }
-            if let Some((_, Some(own))) = &attach {
+            if let Some((_, _, Some(own))) = &attach {
                 if ctx.scene.world.socket_world(id, own).is_none() {
                     bail!("`{}` has no socket `{own}`", ctx.scene.world.label(id));
                 }
             }
-            ctx.scene.change(|w| {
+            let linked = ctx.scene.change(|w| {
                 if let Some((axis, q)) = turn {
                     w.reorient(id, crate::world::Rot::turn(axis, q));
                 }
@@ -640,23 +647,29 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                     w.set_tilt(id, t);
                 }
                 match &attach {
-                    Some((at, None)) => w.attach(id, *at),
-                    Some((at, Some(own))) => {
-                        // The joint becomes the pivot, so later turns keep it attached.
-                        let sock = w.node(id).and_then(|n| n.sockets.iter().find(|s| s.name.eq_ignore_ascii_case(own))).map(|s| s.pos);
-                        if let (Some(n), Some(pos)) = (w.node_mut(id), sock) {
+                    Some((target, sock, own)) if link => Some(w.attach_to(id, *target, sock.as_deref(), own.as_deref())),
+                    Some((target, Some(sock), own)) => {
+                        // Snap only: line up, don't link.
+                        let at = w.socket_world(*target, sock).unwrap_or_default();
+                        let own_pos = own.as_deref().and_then(|o| w.node(id)?.sockets.iter().find(|s| s.name.eq_ignore_ascii_case(o)).map(|s| s.pos));
+                        if let (Some(n), Some(pos)) = (w.node_mut(id), own_pos) {
                             n.pivot = n.pivot.or(Some(pos));
                         }
-                        if let Some(from) = w.socket_world(id, own) {
-                            w.translate(id, (*at - from).round().as_ivec3());
-                        }
+                        let from = own_pos.map_or_else(|| w.pivot_world(id), |p| w.affine(id).transform_point3(p));
+                        w.translate(id, (at - from).round().as_ivec3());
+                        None
                     }
-                    None => {}
+                    _ => None,
                 }
             });
             tree_changed(ctx);
+            if linked == Some(false) {
+                bail!("can't attach `{}` to something attached to it", ctx.scene.world.label(id));
+            }
             let (lo, size) = ctx.scene.world.bounds(id).unwrap_or_default();
-            Ok(vec![text(format!("`{}` now at {:?}, size {:?}", ctx.scene.world.label(id), arr(lo), arr(size)))])
+            let w = &ctx.scene.world;
+            let to = w.node(id).and_then(|n| n.parent).filter(|&p| p != crate::world::ROOT).map(|p| format!(", attached to `{}`", w.label(p))).unwrap_or_default();
+            Ok(vec![text(format!("`{}` now at {:?}, size {:?}{to}", w.label(id), arr(lo), arr(size)))])
         }
         "set_pivot" => {
             let id = find_part(ctx.scene, get(a, "part"))?;
@@ -739,6 +752,12 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 act @ ("hide" | "show") => {
                     ctx.scene.change(|w| w.node_mut(id).map(|n| n.hidden = act == "hide"));
                     format!("{} `{label}`", if act == "hide" { "Hid" } else { "Showed" })
+                }
+                "detach" => {
+                    if !ctx.scene.change(|w| w.detach(id)) {
+                        bail!("`{label}` isn't attached to anything");
+                    }
+                    format!("Detached `{label}`")
                 }
                 "ungroup" => {
                     if !ctx.scene.world.node(id).is_some_and(|n| n.is_group()) {

@@ -31,6 +31,11 @@ pub enum TreeOp {
     PickNone,
     PickInvert,
     Rename(usize, String),
+    /// Attach a node to another so it follows it, snapping onto one of
+    /// that part's sockets if given.
+    Attach(usize, usize, Option<String>),
+    /// Stop following; stays where it is.
+    Detach(usize),
     /// New pivot, free rotation and sockets for a node. `true` starts an
     /// undo step (false continues a drag).
     Extras(usize, Extras, bool),
@@ -85,7 +90,7 @@ fn row(ui: &mut Ui, w: &World, id: usize, picked: &[usize], editing: Option<usiz
             cmds.push(Command::Tree(TreeOp::Pick(id, ui.input(|i| i.modifiers.shift))));
         }
     });
-    if n.is_group() {
+    if !n.children().is_empty() {
         ui.indent(("children", id), |ui| {
             for &c in n.children() {
                 row(ui, w, c, picked, editing, cmds);
@@ -176,6 +181,7 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                     ui.weak(format!("size {} {} {}", size.x, size.y, size.z));
                 }
             });
+            attach_ui(ui, w, id, cmds);
             extras_ui(ui, w, id, cmds);
         }
         if scene.mode == Mode::World {
@@ -271,4 +277,38 @@ fn extras_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
     if changed && x != Extras::of(n) {
         cmds.push(Command::Tree(TreeOp::Extras(id, x, begin)));
     }
+}
+
+/// What a node is attached to, and snapping onto that part's sockets.
+fn attach_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
+    let Some(parent) = w.node(id).and_then(|n| n.parent) else { return };
+    CollapsingHeader::new("Attached to").default_open(true).show(ui, |ui| {
+        let current = if parent == ROOT { "nothing".to_string() } else { w.label(parent) };
+        egui::ComboBox::from_id_salt(("attach", id)).selected_text(current).width(ui.available_width()).show_ui(ui, |ui| {
+            if ui.selectable_label(parent == ROOT, "nothing").clicked() && parent != ROOT {
+                cmds.push(Command::Tree(TreeOp::Detach(id)));
+            }
+            // Anything not inside this node.
+            let mut inside = Vec::new();
+            w.visit(id, &mut |i, _| inside.push(i));
+            w.visit(ROOT, &mut |i, _| {
+                if i != ROOT && !inside.contains(&i) && ui.selectable_label(i == parent, w.label(i)).clicked() && i != parent {
+                    cmds.push(Command::Tree(TreeOp::Attach(id, i, None)));
+                }
+            });
+        })
+        .response
+        .on_hover_text("Attached parts follow their parent's moves and turns");
+        let sockets = w.node(parent).map(|n| n.sockets.clone()).unwrap_or_default();
+        if parent != ROOT && !sockets.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("snap to");
+                for s in sockets {
+                    if ui.small_button(&s.name).on_hover_text("Move this part's pivot onto the socket").clicked() {
+                        cmds.push(Command::Tree(TreeOp::Attach(id, parent, Some(s.name.clone()))));
+                    }
+                }
+            });
+        }
+    });
 }

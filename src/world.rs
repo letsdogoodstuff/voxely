@@ -145,7 +145,7 @@ impl Place {
 
 #[derive(Clone)]
 pub enum Kind {
-    Group(Vec<usize>),
+    Group,
     Model(Volume),
 }
 
@@ -165,6 +165,9 @@ pub struct Node {
     pub rot: Rot,
     pub t: IVec3,
     pub parent: Option<usize>,
+    /// Groups hold parts; a part's children are parts attached to it (they
+    /// follow it, placed in its voxel space).
+    pub children: Vec<usize>,
     pub kind: Kind,
     /// Where turns happen, in the node's own coordinates (a model's voxel
     /// space, `0..size`). Default: a model's center; a group's box center.
@@ -177,7 +180,7 @@ pub struct Node {
 
 impl Node {
     fn new(name: &str, parent: Option<usize>, layer: i32, kind: Kind) -> Node {
-        Node { name: name.to_string(), hidden: false, layer, rot: Rot::IDENTITY, t: IVec3::ZERO, parent, kind, pivot: None, tilt: Vec3::ZERO, sockets: Vec::new() }
+        Node { name: name.to_string(), hidden: false, layer, rot: Rot::IDENTITY, t: IVec3::ZERO, parent, children: Vec::new(), kind, pivot: None, tilt: Vec3::ZERO, sockets: Vec::new() }
     }
 
     pub fn tilted(&self) -> bool {
@@ -210,20 +213,17 @@ impl Node {
     }
 
     pub fn is_group(&self) -> bool {
-        matches!(self.kind, Kind::Group(_))
+        matches!(self.kind, Kind::Group)
     }
 
     pub fn children(&self) -> &[usize] {
-        match &self.kind {
-            Kind::Group(c) => c,
-            Kind::Model(_) => &[],
-        }
+        &self.children
     }
 
     pub fn volume(&self) -> Option<&Volume> {
         match &self.kind {
             Kind::Model(v) => Some(v),
-            Kind::Group(_) => None,
+            Kind::Group => None,
         }
     }
 }
@@ -257,7 +257,7 @@ pub struct Composite {
 
 impl World {
     fn root_group() -> Node {
-        Node::new("", None, -1, Kind::Group(Vec::new()))
+        Node::new("", None, -1, Kind::Group)
     }
 
     /// One model filling the box `[0, size)`.
@@ -319,8 +319,18 @@ impl World {
 
     pub fn place(&self, id: usize) -> Place {
         let Some(n) = self.node(id) else { return Place::IDENTITY };
-        let parent = n.parent.map_or(Place::IDENTITY, |p| self.place(p));
+        let parent = n.parent.map_or(Place::IDENTITY, |p| self.frame(p));
         parent.then(n.rot, n.t)
+    }
+
+    /// The frame `id`'s children are placed in: a group's own frame, or a
+    /// part's voxel space (cell 0 at the origin).
+    pub fn frame(&self, id: usize) -> Place {
+        let place = self.place(id);
+        match self.node(id).and_then(Node::volume) {
+            Some(v) => place.then(Rot::IDENTITY, -(v.dims / 2)),
+            None => place,
+        }
     }
 
     fn layer_hidden(&self, layer: i32) -> bool {
@@ -355,9 +365,9 @@ impl World {
                 Some((lo, hi.ceil().as_ivec3() - lo))
             }
             Kind::Model(v) => Some(self.place(id).bounds(v.dims)),
-            Kind::Group(children) => {
+            Kind::Group => {
                 let mut b: Option<(IVec3, IVec3)> = None;
-                for &c in children {
+                for &c in &n.children {
                     if let Some((lo, size)) = self.bounds(c) {
                         let hi = lo + size;
                         b = Some(b.map_or((lo, hi), |(a, z)| (a.min(lo), z.max(hi))));
@@ -436,7 +446,8 @@ impl World {
     /// the box stays where it was drawn (even if the size changed).
     pub fn checkin(&mut self, id: usize, volume: &Volume, origin: IVec3) {
         let Some(n) = self.node(id) else { return };
-        let parent = n.parent.map_or(Place::IDENTITY, |p| self.place(p));
+        let before = self.frame(id);
+        let parent = n.parent.map_or(Place::IDENTITY, |p| self.frame(p));
         let rot = parent.rot.mul(&n.rot);
         let size = rot.inverse().extent(volume.dims);
         // Where the box lands with no translation, then shift it into place.
@@ -455,13 +466,30 @@ impl World {
             n.t = node_t;
             n.kind = Kind::Model(local);
         }
+        // Resizing can move the voxel space's origin; keep attached parts,
+        // sockets and the pivot where they were.
+        let after = self.frame(id);
+        let shift = after.rot.inverse().apply(before.t - after.t);
+        if shift != IVec3::ZERO {
+            let children = self.node(id).map(|n| n.children.clone()).unwrap_or_default();
+            for c in children {
+                if let Some(cn) = self.node_mut(c) {
+                    cn.t += shift;
+                }
+            }
+            if let Some(n) = self.node_mut(id) {
+                let d = shift.as_vec3();
+                n.pivot = n.pivot.map(|p| p + d);
+                n.sockets.iter_mut().for_each(|s| s.pos += d);
+            }
+        }
     }
 
     fn push(&mut self, parent: usize, node: Node) -> usize {
         let id = self.nodes.len();
         self.nodes.push(Some(node));
-        if let Some(Node { kind: Kind::Group(c), .. }) = self.node_mut(parent) {
-            c.push(id);
+        if let Some(p) = self.node_mut(parent) {
+            p.children.push(id);
         }
         id
     }
@@ -478,7 +506,7 @@ impl World {
     /// Add an unrotated model under `parent` whose box starts at world `origin`.
     pub fn add_model(&mut self, parent: usize, name: &str, volume: Volume, origin: IVec3) -> usize {
         let parent = self.group_of(parent);
-        let pp = self.place(parent);
+        let pp = self.frame(parent);
         let layer = self.layers.first().map_or(-1, |l| l.id);
         let node = Node { rot: pp.rot.inverse(), ..Node::new(name, Some(parent), layer, Kind::Model(Volume::new(IVec3::ONE))) };
         let id = self.push(parent, node);
@@ -500,11 +528,8 @@ impl World {
 
     fn copy_into(&mut self, id: usize, parent: usize) -> usize {
         let Some(mut n) = self.node(id).cloned() else { return ROOT };
-        let children = n.children().to_vec();
+        let children = std::mem::take(&mut n.children);
         n.parent = Some(parent);
-        if n.is_group() {
-            n.kind = Kind::Group(Vec::new());
-        }
         let copy = self.push(parent, n);
         for c in children {
             self.copy_into(c, copy);
@@ -520,8 +545,8 @@ impl World {
         let mut doomed = Vec::new();
         self.visit(id, &mut |i, _| doomed.push(i));
         if let Some(p) = self.node(id).and_then(|n| n.parent) {
-            if let Some(Node { kind: Kind::Group(c), .. }) = self.node_mut(p) {
-                c.retain(|&x| x != id);
+            if let Some(pn) = self.node_mut(p) {
+                pn.children.retain(|&x| x != id);
             }
         }
         for i in doomed {
@@ -535,7 +560,7 @@ impl World {
     pub fn group(&mut self, ids: &[usize]) -> Option<usize> {
         let ids: Vec<usize> = ids.iter().copied().filter(|&i| i != ROOT && self.node(i).is_some()).collect();
         let parent = self.node(*ids.first()?)?.parent?;
-        let g = Node::new("", Some(parent), self.layers.first().map_or(-1, |l| l.id), Kind::Group(Vec::new()));
+        let g = Node::new("", Some(parent), self.layers.first().map_or(-1, |l| l.id), Kind::Group);
         let gid = self.push(parent, g);
         for id in ids {
             if self.is_ancestor(id, gid) {
@@ -556,20 +581,21 @@ impl World {
         false
     }
 
-    /// Move `id` under group `to`, keeping its world placement.
+    /// Move `id` under `to` (a group, or a part to attach it to), keeping
+    /// its world placement.
     pub fn reparent(&mut self, id: usize, to: usize) -> bool {
-        if id == ROOT || id == to || self.is_ancestor(id, to) || !self.node(to).is_some_and(Node::is_group) {
+        if id == ROOT || id == to || self.is_ancestor(id, to) || self.node(to).is_none() {
             return false;
         }
         let world = self.place(id);
         let Some(old) = self.node(id).and_then(|n| n.parent) else { return false };
-        if let Some(Node { kind: Kind::Group(c), .. }) = self.node_mut(old) {
-            c.retain(|&x| x != id);
+        if let Some(o) = self.node_mut(old) {
+            o.children.retain(|&x| x != id);
         }
-        if let Some(Node { kind: Kind::Group(c), .. }) = self.node_mut(to) {
-            c.push(id);
+        if let Some(t) = self.node_mut(to) {
+            t.children.push(id);
         }
-        let pp = self.place(to);
+        let pp = self.frame(to);
         let inv = pp.rot.inverse();
         if let Some(n) = self.node_mut(id) {
             n.parent = Some(to);
@@ -591,7 +617,7 @@ impl World {
 
     /// Move a node by `delta` world cells.
     pub fn translate(&mut self, id: usize, delta: IVec3) {
-        let inv = self.node(id).and_then(|n| n.parent).map_or(Rot::IDENTITY, |p| self.place(p).rot.inverse());
+        let inv = self.node(id).and_then(|n| n.parent).map_or(Rot::IDENTITY, |p| self.frame(p).rot.inverse());
         if let Some(n) = self.node_mut(id) {
             n.t += inv.apply(delta);
         }
@@ -604,7 +630,7 @@ impl World {
             // About the chosen pivot.
             let before = self.pivot_world(id);
             let Some(parent) = self.node(id).and_then(|n| n.parent) else { return };
-            let pr = self.place(parent).rot;
+            let pr = self.frame(parent).rot;
             if let Some(n) = self.node_mut(id) {
                 n.rot = pr.inverse().mul(&q).mul(&pr).mul(&n.rot);
             }
@@ -615,7 +641,7 @@ impl World {
         let Some((lo, size)) = self.bounds(id) else { return };
         let center2 = lo * 2 + size;
         let Some(parent) = self.node(id).and_then(|n| n.parent) else { return };
-        let pr = self.place(parent).rot;
+        let pr = self.frame(parent).rot;
         if let Some(n) = self.node_mut(id) {
             // World rotation becomes q * parent * rot.
             n.rot = pr.inverse().mul(&q).mul(&pr).mul(&n.rot);
@@ -712,6 +738,32 @@ impl World {
         self.translate(id, d.round().as_ivec3());
     }
 
+    /// Attach `id` to `parent` at its socket: snap `id`'s own socket `own`
+    /// (or its pivot) onto it, and link it so it follows `parent` from now
+    /// on. The joint becomes `id`'s pivot unless it has one.
+    pub fn attach_to(&mut self, id: usize, parent: usize, socket: Option<&str>, own: Option<&str>) -> bool {
+        if id == parent || self.is_ancestor(id, parent) {
+            return false;
+        }
+        if let Some(at) = socket.and_then(|s| self.socket_world(parent, s)) {
+            let own_pos = own.and_then(|o| self.node(id)?.sockets.iter().find(|s| s.name.eq_ignore_ascii_case(o)).map(|s| s.pos));
+            if let (Some(pos), Some(n)) = (own_pos, self.node_mut(id)) {
+                n.pivot = n.pivot.or(Some(pos));
+            }
+            let from = match own_pos {
+                Some(p) => self.affine(id).transform_point3(p),
+                None => self.pivot_world(id),
+            };
+            self.translate(id, (at - from).round().as_ivec3());
+        }
+        self.reparent(id, parent)
+    }
+
+    /// Unlink `id` from what it's attached to (it stays where it is).
+    pub fn detach(&mut self, id: usize) -> bool {
+        self.node(id).and_then(|n| n.parent).is_some_and(|p| p != ROOT) && self.reparent(id, ROOT)
+    }
+
     /// A socket's world position, by `part:socket` or a node and name.
     pub fn socket_world(&self, id: usize, name: &str) -> Option<Vec3> {
         let s = self.node(id)?.sockets.iter().find(|s| s.name.eq_ignore_ascii_case(name))?;
@@ -796,15 +848,42 @@ impl World {
         let Some(VoxNode::Transform { attrs, child, layer, rotation, translation }) = f.nodes.get(&trn) else { return };
         let name = attrs.get("_name").cloned().unwrap_or_default();
         let hidden = attrs.get("_hidden").is_some_and(|v| v == "1");
-        let mut base = Node { hidden, rot: Rot::from_mat3(*rotation), t: *translation, ..Node::new(&name, Some(parent), *layer, Kind::Group(Vec::new())) };
+        let mut base = Node { hidden, rot: Rot::from_mat3(*rotation), t: *translation, ..Node::new(&name, Some(parent), *layer, Kind::Group) };
         read_extras(&mut base, attrs);
         match f.nodes.get(child) {
             Some(VoxNode::Group { attrs: gattrs, children }) => {
                 let mut n = base;
                 n.hidden |= gattrs.get("_hidden").is_some_and(|v| v == "1");
-                let id = self.push(parent, n);
-                for &c in children {
-                    self.read_node(f, c, id, depth + 1);
+                // voxely's part with attached parts: the first child is the
+                // part's own shape, the rest are attached in its voxel space.
+                let shape = children.first().and_then(|c| match f.nodes.get(c) {
+                    Some(VoxNode::Transform { child, .. }) => match f.nodes.get(child) {
+                        Some(VoxNode::Shape { models, .. }) => models.first().and_then(|&m| f.models.get(m as usize)),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                match shape.filter(|_| attrs.get("_vx_part").is_some_and(|v| v == "1")) {
+                    Some(m) => {
+                        let v = model_volume(m);
+                        let half = v.dims / 2;
+                        n.kind = Kind::Model(v);
+                        let id = self.push(parent, n);
+                        for &c in &children[1..] {
+                            self.read_node(f, c, id, depth + 1);
+                        }
+                        for c in self.node(id).map(|n| n.children.clone()).unwrap_or_default() {
+                            if let Some(cn) = self.node_mut(c) {
+                                cn.t += half;
+                            }
+                        }
+                    }
+                    None => {
+                        let id = self.push(parent, n);
+                        for &c in children {
+                            self.read_node(f, c, id, depth + 1);
+                        }
+                    }
                 }
             }
             Some(VoxNode::Shape { attrs: sattrs, models }) => {
@@ -1012,5 +1091,56 @@ mod tests {
         assert_eq!(n.pivot, Some(Vec3::new(0.5, 1.5, 0.0)));
         assert_eq!(n.tilt, Vec3::new(0.0, 15.0, -30.0));
         assert_eq!(n.sockets, w.node(m).unwrap().sockets);
+    }
+
+    #[test]
+    fn attached_parts_follow_and_round_trip() {
+        let mut w = World::single(vol(IVec3::new(4, 3, 8), &[(IVec3::ZERO, 1)]));
+        let body = w.models()[0];
+        w.node_mut(body).unwrap().sockets.push(Socket { name: "shoulder".into(), pos: Vec3::new(4.0, 1.5, 7.0) });
+        let mut arm_v = Volume::new(IVec3::new(2, 2, 6));
+        arm_v.set(IVec3::ZERO, 2);
+        let arm = w.add_model(ROOT, "arm", arm_v, IVec3::new(10, 0, 0));
+        w.node_mut(arm).unwrap().sockets = vec![Socket { name: "top".into(), pos: Vec3::new(1.0, 1.0, 6.0) }, Socket { name: "hand".into(), pos: Vec3::new(1.0, 1.0, 0.0) }];
+        let sword = w.add_model(ROOT, "sword", vol(IVec3::new(1, 1, 9), &[(IVec3::new(0, 0, 8), 3)]), IVec3::new(20, 0, 0));
+        w.node_mut(sword).unwrap().sockets.push(Socket { name: "grip".into(), pos: Vec3::new(0.5, 0.5, 2.0) });
+        assert!(w.attach_to(arm, body, Some("shoulder"), Some("top")));
+        assert!(w.attach_to(sword, arm, Some("hand"), Some("grip")));
+        assert!(!w.attach_to(body, sword, None, None), "no cycles");
+        // Snapped to within half a voxel (positions are whole voxels)...
+        let grip_in_arm = |w: &World| w.affine(arm).inverse().transform_point3(w.socket_world(sword, "grip").unwrap());
+        let start = grip_in_arm(&w);
+        assert!((start - Vec3::new(1.0, 1.0, 0.0)).abs().max_element() <= 0.5, "{start}");
+        // ...and it stays put in the hand as the arm is raised, tilted and
+        // the body moves.
+        w.reorient(arm, Rot::turn(0, 1));
+        assert!((grip_in_arm(&w) - start).length() < 1e-4);
+        w.set_tilt(arm, Vec3::new(0.0, 30.0, 0.0));
+        assert!((grip_in_arm(&w) - start).length() < 1e-3);
+        // The shoulder joint is the arm's pivot, so it didn't move either.
+        assert!((w.socket_world(arm, "top").unwrap() - w.socket_world(body, "shoulder").unwrap()).abs().max_element() <= 0.5);
+        w.translate(body, IVec3::new(3, 0, 0));
+        assert!((grip_in_arm(&w) - start).length() < 1e-3);
+
+        // Growing the arm while editing keeps the sword attached where it was.
+        w.set_tilt(arm, Vec3::ZERO);
+        let before = w.socket_world(sword, "grip").unwrap();
+        let (mut v, origin) = w.checkout(arm).unwrap();
+        v = { let mut g = Volume::new(v.dims + IVec3::new(0, 0, 3)); for (i, &c) in v.cells.iter().enumerate() { g.set(v.position(i), c); } g };
+        w.checkin(arm, &v, origin);
+        assert!((w.socket_world(sword, "grip").unwrap() - before).length() < 1e-4);
+
+        // Saved and reloaded, the links and placement survive.
+        let path = std::env::temp_dir().join(format!("voxely-attach-{}.vox", std::process::id()));
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[]).unwrap();
+        let back = World::from_vox(&VoxFile::load(&path).unwrap());
+        std::fs::remove_file(&path).ok();
+        let (b_arm, b_sword) = (back.find("arm").unwrap(), back.find("sword").unwrap());
+        assert!(!back.node(b_arm).unwrap().is_group());
+        assert_eq!(back.node(b_sword).unwrap().parent, Some(b_arm));
+        assert_eq!(back.label(back.node(b_arm).unwrap().parent.unwrap()), "model 1");
+        assert_eq!(solid(&back), solid(&w));
+        assert!(w.detach(sword) && w.node(sword).unwrap().parent == Some(ROOT));
+        assert!((w.socket_world(sword, "grip").unwrap() - before).length() < 1e-4);
     }
 }

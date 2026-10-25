@@ -196,6 +196,24 @@ fn node_transform(node: &mut Value, translation: Vec3, linear: Mat3) {
     }
 }
 
+/// A primitive in voxel space (relative to its pivot) turned into glTF
+/// space through `flip` (identity or a mirror), with triangles rewound
+/// when mirrored so they still face out.
+fn mirror(p: &Prim, flip: Mat3) -> Prim {
+    let mirrored = flip.determinant() < 0.0;
+    let mut indices = p.indices.clone();
+    if mirrored {
+        indices.chunks_exact_mut(3).for_each(|t| t.swap(1, 2));
+    }
+    let dir = |v: Vec3| [v.x, v.z, -v.y];
+    Prim {
+        positions: p.positions.iter().map(|&v| to_gltf(flip * Vec3::from(v))).collect(),
+        normals: p.normals.iter().map(|&n| dir(flip * Vec3::from(n))).collect(),
+        uvs: p.uvs.clone(),
+        indices,
+    }
+}
+
 /// One primitive's buffers, using material `k`.
 fn prim_json(bin: &mut Bin, k: usize, p: &Prim) -> Value {
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -228,7 +246,11 @@ struct Out<'a> {
 
 /// Add node `id` (and its subtree), placed relative to its parent's
 /// pivot `offset`. Returns its index.
-fn add_node(id: usize, offset: Vec3, o: &mut Out) -> Option<usize> {
+///
+/// glTF engines don't all handle mirrored nodes well, so mirrors are baked
+/// into meshes instead: `pre` is the mirror the parent baked into its own
+/// mesh, which this node's transform is corrected by.
+fn add_node(id: usize, offset: Vec3, pre: Mat3, o: &mut Out) -> Option<usize> {
     let (world, kinds) = (o.world, o.kinds);
     let n = world.node(id)?;
     if !world.visible(id) {
@@ -241,7 +263,10 @@ fn add_node(id: usize, offset: Vec3, o: &mut Out) -> Option<usize> {
     let translation = n.t.as_vec3() + crate::world::rot_mat(n.rot) * (pivot - half) - offset;
     let label = if o.only && n.name.is_empty() && !n.is_group() { o.project.to_string() } else { world.label(id) };
     let mut node = json!({ "name": label });
-    node_transform(&mut node, translation, linear);
+    let linear = pre * linear;
+    // Mirrored: flip x in the mesh and children so the node is a rotation.
+    let flip = if linear.determinant() < 0.0 { Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat3::IDENTITY };
+    node_transform(&mut node, pre * translation, linear * flip);
     let index = o.nodes.len();
     o.nodes.push(node);
     let mut children = Vec::new();
@@ -249,7 +274,7 @@ fn add_node(id: usize, offset: Vec3, o: &mut Out) -> Option<usize> {
         let mut surface = Vec::new();
         let clouds = pm.prims.iter().filter(|(k, _)| matches!(kinds[*k], Kind::Cloud(_))).count();
         for (k, p) in &pm.prims {
-            let prim = prim_json(o.bin, *k, p);
+            let prim = prim_json(o.bin, *k, &mirror(p, flip));
             match kinds[*k] {
                 Kind::Surface(_) => surface.push(prim),
                 Kind::Cloud(c) => {
@@ -267,13 +292,13 @@ fn add_node(id: usize, offset: Vec3, o: &mut Out) -> Option<usize> {
     }
     for s in &n.sockets {
         let mut sock = json!({ "name": s.name, "extras": { "voxely_socket": true } });
-        node_transform(&mut sock, s.pos - pivot, Mat3::IDENTITY);
+        node_transform(&mut sock, flip * (s.pos - pivot), Mat3::IDENTITY);
         o.nodes.push(sock);
         children.push(o.nodes.len() - 1);
     }
     for &c in n.children() {
         // Children sit relative to the group's pivot.
-        if let Some(ci) = add_node(c, pivot, o) {
+        if let Some(ci) = add_node(c, pivot, flip, o) {
             children.push(ci);
         }
     }
@@ -322,11 +347,12 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
             });
             let p = &mut prims[slot].1;
             let base = p.positions.len() as u32;
-            let n = to_gltf(dir(q.normal).as_vec3() / SCALE);
+            let n = dir(q.normal).as_vec3().to_array();
             let uv = [((q.color as f32 - 1.0) + 0.5) / 256.0, 0.5];
             for c in q.corners {
-                // Vertices relative to the pivot, the node's origin.
-                p.positions.push(to_gltf(c.as_vec3() - pivot));
+                // Voxel units relative to the pivot, the node's origin;
+                // converted to glTF space per node (see `add_node`).
+                p.positions.push((c.as_vec3() - pivot).to_array());
                 p.normals.push(n);
                 p.uvs.push(uv);
             }
@@ -349,7 +375,7 @@ pub fn write(scene: &Scene, path: &Path) -> Result<()> {
     let mut out = Out { nodes, meshes: Vec::new(), bin: &mut bin, scene, world, parts: &parts, kinds: &kinds, project: &name, only: models.len() == 1 };
     let mut top = Vec::new();
     for &c in world.node(crate::world::ROOT).map(|n| n.children()).unwrap_or_default() {
-        if let Some(i) = add_node(c, Vec3::ZERO, &mut out) {
+        if let Some(i) = add_node(c, Vec3::ZERO, Mat3::IDENTITY, &mut out) {
             top.push(i);
         }
     }
@@ -643,7 +669,7 @@ mod tests {
         s.volume = crate::ops::full(&s.volume, 3);
         let body = s.editing().unwrap();
         s.world_mode();
-        let arm = s.change(|w| {
+        let (arm, gem) = s.change(|w| {
             w.node_mut(body).unwrap().name = "body".into();
             w.node_mut(body).unwrap().sockets.push(Socket { name: "hand".into(), pos: Vec3::new(4.0, 1.0, 5.0) });
             let mut v = crate::scene::Volume::new(IVec3::new(2, 2, 5));
@@ -654,7 +680,11 @@ mod tests {
             w.reorient(arm, Rot::flip(1));
             let g = w.group(&[body, arm]).unwrap();
             w.node_mut(g).unwrap().name = "bot".into();
-            arm
+            // Attached under the mirrored arm, and turned itself.
+            let gem = w.add_model(ROOT, "gem", crate::ops::full(&crate::scene::Volume::new(IVec3::new(3, 1, 2)), 5), IVec3::new(9, 0, 0));
+            w.reorient(gem, Rot::turn(2, 1));
+            w.attach_to(gem, arm, None, None);
+            (arm, gem)
         });
         let path = std::env::temp_dir().join(format!("voxely-gltf-tree-{}.glb", std::process::id()));
         write(&s, &path).unwrap();
@@ -662,7 +692,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let nodes = doc["nodes"].as_array().unwrap();
         let find = |name: &str| nodes.iter().position(|n| n["name"] == json!(name)).unwrap();
-        let (bot, body_i, arm_i, hand) = (find("bot"), find("body"), find("arm"), find("hand"));
+        let (bot, body_i, arm_i, hand, gem_i) = (find("bot"), find("body"), find("arm"), find("hand"), find("gem"));
+        assert!(nodes[arm_i]["children"].as_array().unwrap().contains(&json!(gem_i)));
         assert_eq!(nodes[0]["children"], json!([bot]));
         assert_eq!(nodes[bot]["children"], json!([body_i, arm_i]));
         assert!(nodes[body_i]["children"].as_array().unwrap().contains(&json!(hand)));
@@ -681,7 +712,7 @@ mod tests {
         let w = &s.world;
         let (lo, size) = w.bounds(ROOT).unwrap();
         let center = lo.as_vec3() + size.as_vec3() * 0.5;
-        for (id, ni) in [(body, body_i), (arm, arm_i)] {
+        for (id, ni) in [(body, body_i), (arm, arm_i), (gem, gem_i)] {
             let mesh = &doc["meshes"][nodes[ni]["mesh"].as_u64().unwrap() as usize];
             let acc = &doc["accessors"][mesh["primitives"][0]["attributes"]["POSITION"].as_u64().unwrap() as usize];
             let view = &doc["bufferViews"][acc["bufferView"].as_u64().unwrap() as usize];
@@ -702,7 +733,25 @@ mod tests {
         let sw = w.socket_world(body, "hand").unwrap();
         let got = global[hand].transform_point3(Vec3::ZERO);
         assert!((got - Vec3::from(to_gltf(sw - center))).length() < 1e-4);
-        // The flipped arm needs a matrix.
-        assert!(nodes[arm_i].get("matrix").is_some());
+        // Mirrors are baked into meshes: every node is a plain rotation,
+        // and triangles still wind counter-clockwise seen from outside.
+        assert!(nodes.iter().all(|n| n.get("matrix").is_none()));
+        let read = |acc: u64| -> &[u8] {
+            let a = &doc["accessors"][acc as usize];
+            let v = &doc["bufferViews"][a["bufferView"].as_u64().unwrap() as usize];
+            let off = v["byteOffset"].as_u64().unwrap() as usize;
+            &bin[off..off + v["byteLength"].as_u64().unwrap() as usize]
+        };
+        for ni in [body_i, arm_i, gem_i] {
+            let prim = &doc["meshes"][nodes[ni]["mesh"].as_u64().unwrap() as usize]["primitives"][0];
+            let pos: &[[f32; 3]] = bytemuck::cast_slice(read(prim["attributes"]["POSITION"].as_u64().unwrap()));
+            let nrm: &[[f32; 3]] = bytemuck::cast_slice(read(prim["attributes"]["NORMAL"].as_u64().unwrap()));
+            let idx: &[u32] = bytemuck::cast_slice(read(prim["indices"].as_u64().unwrap()));
+            assert!(global[ni].determinant() > 0.0);
+            for t in idx.chunks_exact(3) {
+                let [a, b, c] = [0, 1, 2].map(|k| Vec3::from(pos[t[k] as usize]));
+                assert!((b - a).cross(c - a).dot(Vec3::from(nrm[t[0] as usize])) > 0.0, "inward triangle in node {ni}");
+            }
+        }
     }
 }

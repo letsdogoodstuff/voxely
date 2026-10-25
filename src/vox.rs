@@ -323,48 +323,68 @@ impl Graph {
         self.models.push((size, xyzi));
     }
 
-    /// Write world node `n` as transform `trn` (already allocated).
-    fn node(&mut self, w: &World, n: usize, trn: i32) {
+    /// Write world node `n` as transform `trn` (already allocated), its
+    /// translation shifted by `offset` (children of parts are stored in the
+    /// part's voxel space, `.vox` groups are centered).
+    fn node(&mut self, w: &World, n: usize, trn: i32, offset: IVec3) {
         let Some(node) = w.node(n) else { return };
         let child = self.id();
-        let (name, rot, layer) = (node.name.as_str(), node.rot.to_byte(), node.layer);
+        let (name, rot, layer, t) = (node.name.as_str(), node.rot.to_byte(), node.layer, node.t + offset);
         let mut extras = Dict::new();
         crate::world::write_extras(node, &mut extras);
         match &node.kind {
-            Kind::Group(children) => {
-                self.transform_with(trn, child, name, node.hidden, layer, rot, node.t, extras);
-                let ids: Vec<i32> = children.iter().map(|_| self.id()).collect();
-                self.group(child, &ids);
-                for (&c, &id) in children.iter().zip(&ids) {
-                    self.node(w, c, id);
-                }
+            Kind::Group => {
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
+                self.children(w, child, &[], &node.children, IVec3::ZERO);
             }
-            Kind::Model(v) if v.dims.cmple(IVec3::splat(MAX_MODEL)).all() => {
-                self.transform_with(trn, child, name, node.hidden, layer, rot, node.t, extras);
-                self.shape(child, v, IVec3::ZERO, v.dims);
+            Kind::Model(v) if node.children.is_empty() => {
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
+                self.model(child, v, layer);
             }
             Kind::Model(v) => {
-                // Too big for one model: a group of tiles that lands on
-                // the same cells.
-                self.transform(trn, child, name, node.hidden, layer, rot, node.t);
-                let tiles = (v.dims + IVec3::splat(MAX_MODEL - 1)) / MAX_MODEL;
-                let mut placed = Vec::new();
-                for tz in 0..tiles.z {
-                    for ty in 0..tiles.y {
-                        for tx in 0..tiles.x {
-                            let o = IVec3::new(tx, ty, tz) * MAX_MODEL;
-                            placed.push((o, (v.dims - o).min(IVec3::splat(MAX_MODEL))));
-                        }
-                    }
-                }
-                let ids: Vec<i32> = placed.iter().map(|_| self.id()).collect();
-                self.group(child, &ids);
-                for (&(o, size), &id) in placed.iter().zip(&ids) {
-                    let shape = self.id();
-                    self.transform(id, shape, "", false, layer, Rot::IDENTITY.to_byte(), o + size / 2 - v.dims / 2);
-                    self.shape(shape, v, o, size);
+                // A part with attached parts: a group holding the part and
+                // them, marked so voxely reads it back as one part.
+                extras.insert("_vx_part".into(), "1".into());
+                self.transform_with(trn, child, name, node.hidden, layer, rot, t, extras);
+                let (shape_trn, shape) = (self.id(), self.id());
+                self.children(w, child, &[shape_trn], &node.children, -(v.dims / 2));
+                self.transform(shape_trn, shape, "", false, layer, Rot::IDENTITY.to_byte(), IVec3::ZERO);
+                self.model(shape, v, layer);
+            }
+        }
+    }
+
+    /// Group `id` holding the transforms `first` plus world nodes `children`.
+    fn children(&mut self, w: &World, id: i32, first: &[i32], children: &[usize], offset: IVec3) {
+        let ids: Vec<i32> = children.iter().map(|_| self.id()).collect();
+        self.group(id, &[first, &ids].concat());
+        for (&c, &cid) in children.iter().zip(&ids) {
+            self.node(w, c, cid, offset);
+        }
+    }
+
+    /// A model's voxels as shape `id`, or a group of tiles when it is over
+    /// 256 on a side (landing on the same cells).
+    fn model(&mut self, id: i32, v: &Volume, layer: i32) {
+        if v.dims.cmple(IVec3::splat(MAX_MODEL)).all() {
+            return self.shape(id, v, IVec3::ZERO, v.dims);
+        }
+        let tiles = (v.dims + IVec3::splat(MAX_MODEL - 1)) / MAX_MODEL;
+        let mut placed = Vec::new();
+        for tz in 0..tiles.z {
+            for ty in 0..tiles.y {
+                for tx in 0..tiles.x {
+                    let o = IVec3::new(tx, ty, tz) * MAX_MODEL;
+                    placed.push((o, (v.dims - o).min(IVec3::splat(MAX_MODEL))));
                 }
             }
+        }
+        let ids: Vec<i32> = placed.iter().map(|_| self.id()).collect();
+        self.group(id, &ids);
+        for (&(o, size), &tid) in placed.iter().zip(&ids) {
+            let shape = self.id();
+            self.transform(tid, shape, "", false, layer, Rot::IDENTITY.to_byte(), o + size / 2 - v.dims / 2);
+            self.shape(shape, v, o, size);
         }
     }
 }
@@ -392,7 +412,7 @@ pub fn write(
     let ids: Vec<i32> = children.iter().map(|_| g.id()).collect();
     g.group(top, &ids);
     for (&c, &id) in children.iter().zip(&ids) {
-        g.node(world, c, id);
+        g.node(world, c, id, IVec3::ZERO);
     }
     g.nodes.sort_by_key(|(id, _)| *id);
 

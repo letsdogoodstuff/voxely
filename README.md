@@ -73,7 +73,7 @@ Exports (the Export box at the bottom of the Project column) go to `<workspace>/
 | Area | Tools |
 |---|---|
 | Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
-| Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach to a socket), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup), `group_parts` |
+| Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup, detach), `group_parts` |
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `resize_canvas` |
 | Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid), `draw_line` |
 | Reading | `get_voxels`, `get_slice` (a text map of one layer) |
@@ -121,9 +121,14 @@ still opens there, just without them):
 - **Free rotation**: any angle about the pivot, on top of the exact 90° turns. Shown resampled to the
   voxel grid; the part is edited upright and on its own. MagicaVoxel shows such parts unrotated.
 - **Sockets**: named attachment points (hand, muzzle, seat). Shown as green dots on picked parts.
-  `transform_part` with `attach_to: "body:shoulder_r"` snaps a part's pivot (or its own socket,
-  `attach_socket`) onto another part's socket; an attached socket becomes the pivot so later turns
-  keep the joint together.
+- **Attaching**: a part can be attached to another part, like bones in a skeleton: it then follows
+  that part's moves and turns (raise the arm and the sword in its hand comes along). Set it with
+  "Attached to" in the World panel (with buttons to snap onto the parent's sockets), or
+  `transform_part` with `attach_to: "body:shoulder_r"`, which snaps the part's pivot (or its own
+  socket, `attach_socket`) onto that socket and attaches it. The joint becomes the part's pivot.
+  In `.vox` files an attached chain is saved as a MagicaVoxel group, so MagicaVoxel shows and moves
+  it as one object. Positions are whole voxels, so a socket on a voxel corner and one on a voxel
+  center line up to within half a voxel.
 
 ## glTF export
 
@@ -146,8 +151,10 @@ Name the file `.gltf` instead to get readable JSON with the data embedded.
     1 voxel = 0.1 m), `phase` and `opacity`. Find that node on import and swap in Godot's
     FogVolume, Unity/Unreal volumetric fog, or a custom shader.
 - Structure: the scene tree. A root node named after the project, then a node per group and part
-  with its transform. Each node's origin is the part's pivot, so rotating it in an engine turns it
-  the same way it turns in voxely. Sockets are empty child nodes (`extras.voxely_socket: true`) to
+  with its transform; attached parts are child nodes of their parent part, ready to animate as a
+  rig. Each node's origin is the part's pivot, so rotating it in an engine turns it the same way it
+  turns in voxely. Mirrored parts are baked into their meshes, so every node is a plain rotation
+  (some engines mishandle mirrored nodes). Sockets are empty child nodes (`extras.voxely_socket: true`) to
   parent weapons, riders or effects to; clouds are child nodes of their part.
 
 Exports pass the Khronos glTF Validator with no errors or warnings (it can't yet check
