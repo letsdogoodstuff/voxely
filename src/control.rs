@@ -239,6 +239,19 @@ fn base_tools() -> Value {
             "height": { "type": "integer", "description": "Each frame's height (default 240)" },
             "columns": { "type": "integer", "description": "Frames per row (default 6)" },
         }), &[]),
+        tool("create_rig", "Add a ready-to-animate character made of blocks: parts with joints (pivots) attached in a chain, named so apply_motion and animation imports find them. humanoid: hips (root), torso, head, upper_arm_l/r, lower_arm_l/r (hand_l/r sockets), upper_leg_l/r, lower_leg_l/r. quadruped: body (root), head, tail, leg_front_l/r, leg_back_l/r. Facing -y, left is +x. Then redraw each part (voxel tools with `part`) to make it your character; keep each part's joint end where it is.", json!({
+            "template": { "type": "string", "enum": ["humanoid", "quadruped"] },
+            "prefix": { "type": "string", "description": "Prepended to part names, e.g. \"knight_\" (to have several rigs)" },
+            "scale": { "type": "integer", "description": "Voxels per template unit, default 1 (a humanoid is 26 tall at 1)" },
+            "position": xyz("World position of its feet (default: beside the existing parts)"),
+        }), &["template"]),
+        tool("apply_motion", "Key a ready-made motion onto a rig (parts found by name: create_rig's names, or Mixamo / Unreal / Blender style like LeftArm, upperarm_l, thigh.L). Replaces those parts' keys; their pose on frame 0 is the rest pose. Motions: idle, walk, run, jump, attack, wave, death, quad_walk, quad_idle. Check with frame_strip, then adjust with set_keyframe.", json!({
+            "motion": { "type": "string", "enum": ["idle", "walk", "run", "jump", "attack", "wave", "death", "quad_walk", "quad_idle"] },
+            "frames": { "type": "integer", "description": "Length of the motion in frames (default: the timeline's length, or 24)" },
+            "amount": { "type": "number", "description": "Scale the motion, e.g. 0.5 for subtle, 1.5 for exaggerated (default 1)" },
+            "rig": { "type": ["string", "integer"], "description": "Any part of the rig to animate when there are several (default: the first rig with the right limbs)" },
+            "fps": { "type": "number" },
+        }), &["motion"]),
         tool("set_pivot", "Set the point a part or group turns about (and its origin in glTF exports), in the part's own coordinates (the ones the voxel tools use while editing it; world coordinates for groups). E.g. a shoulder for an arm, the hinge for a door.", json!({
             "part": { "type": ["string", "integer"] },
             "pivot": { "type": ["array", "string"], "items": { "type": "number" }, "description": "[x, y, z], or \"center\" (default), or \"bottom\" (middle of the bottom face)" },
@@ -850,6 +863,57 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             }
             go_to(ctx, back);
             Ok(vec![text(format!("Frames {frames:?}, left to right then top to bottom")), image(sw as u32, sh as u32, &sheet)?])
+        }
+        "create_rig" => {
+            let quad = match string(a, "template") {
+                Some("humanoid") => false,
+                Some("quadruped") => true,
+                _ => bail!("template is humanoid or quadruped"),
+            };
+            let prefix = string(a, "prefix").unwrap_or_default().trim().to_string();
+            let scale = int(a, "scale").unwrap_or(1).clamp(1, 16) as i32;
+            let at = match opt_ivec3(a, "position")? {
+                Some(p) => p,
+                None => ctx.scene.world.bounds(crate::world::ROOT).map_or(IVec3::ZERO, |(lo, s)| IVec3::new(lo.x + s.x + 3, lo.y, 0)),
+            };
+            let colors = app::rig_colors(&ctx.scene.palette);
+            let root = ctx.scene.change_quiet(|w| if quad { crate::rig::quadruped(w, at, scale, &prefix, colors) } else { crate::rig::humanoid(w, at, scale, &prefix, colors) });
+            app::set_mode(ctx.scene, ctx.ed, None);
+            ctx.scene.picked = vec![root];
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            let mut names = Vec::new();
+            ctx.scene.world.visit(root, &mut |id, _| names.push(ctx.scene.world.label(id)));
+            Ok(vec![text(format!("Added a {} rig at {:?}: {}. Redraw parts with the voxel tools (pass `part`), then apply_motion.", if quad { "four-legged" } else { "humanoid" }, arr(at), names.join(", ")))])
+        }
+        "apply_motion" => {
+            let name = string(a, "motion").context("missing `motion`")?.to_string();
+            if let Some(fps) = get(a, "fps").and_then(Value::as_f64) {
+                ctx.scene.world.anim.fps = (fps as f32).clamp(0.5, 120.0);
+            }
+            let frames = int(a, "frames").map_or(if ctx.scene.world.anim.frames > 1 { ctx.scene.world.anim.frames } else { 24 }, |f| f.clamp(2, 10_000) as u32);
+            let amount = get(a, "amount").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+            let rig = match get(a, "rig") {
+                Some(v) => Some(find_part(ctx.scene, Some(v))?),
+                None => None,
+            };
+            let res = ctx.scene.change_quiet(|w| crate::rig::apply_motion(w, rig, &name, frames, amount));
+            ctx.ed.editor.reset();
+            app::sync_volume(ctx.r, ctx.scene, &mut ctx.ed.editor);
+            let applied = res.map_err(|e| anyhow!(e))?;
+            if applied.bones.is_empty() {
+                bail!("no rig parts found; name parts like create_rig does (hips, torso, head, upper_arm_l ...) or use create_rig");
+            }
+            ctx.ed.timeline.open = true;
+            let mut msg = format!(
+                "Keyed `{name}` over {frames} frames on {} ({}). Timeline: {}.",
+                applied.bones.iter().map(|b| b.1.as_str()).collect::<Vec<_>>().join(", "),
+                applied.keys,
+                crate::timeline::describe(&ctx.scene.world.anim)
+            );
+            if !applied.missing.is_empty() {
+                msg += &format!(" No part found for: {}.", applied.missing.iter().map(|b| crate::rig::bone_name(*b)).collect::<Vec<_>>().join(", "));
+            }
+            Ok(vec![text(msg)])
         }
         "set_pivot" => {
             let id = find_part(ctx.scene, get(a, "part"))?;

@@ -14,6 +14,8 @@ use crate::ui::Command;
 pub struct TimelineState {
     pub open: bool,
     pub playing: bool,
+    /// The motion preset picked in the timeline.
+    pub motion: usize,
     /// When the shown frame last advanced.
     last: Option<Instant>,
 }
@@ -107,6 +109,17 @@ pub fn panel(ui: &mut Ui, scene: &Scene, st: &mut TimelineState, cmds: &mut Vec<
             None => {
                 ui.weak("Pick one part to key it");
             }
+        }
+        ui.separator();
+        let motions = crate::rig::MOTIONS;
+        egui::ComboBox::from_id_salt("motion").selected_text(motions[st.motion.min(motions.len() - 1)].0).show_ui(ui, |ui| {
+            for (k, (name, about)) in motions.iter().enumerate() {
+                ui.selectable_value(&mut st.motion, k, *name).on_hover_text(*about);
+            }
+        });
+        if ui.button("Apply motion").on_hover_text("Key this motion onto the rig's parts (found by name: hips, torso, head, upper_arm_l ...), replacing their keys").clicked() {
+            let frames = if a.frames > 1 { a.frames } else { 24 };
+            cmds.push(Command::Tree(TreeOp::Motion(motions[st.motion].0.to_string(), frames)));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("Close").clicked() {

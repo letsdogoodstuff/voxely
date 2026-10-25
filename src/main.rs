@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 mod agents;
 mod anim;
 mod app;
@@ -12,6 +13,7 @@ mod modeler;
 mod outline;
 mod ops;
 mod palette_ops;
+mod rig;
 mod scene;
 mod timeline;
 mod ui;

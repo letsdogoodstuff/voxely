@@ -44,6 +44,10 @@ pub enum TreeOp {
     /// Flipbook: own voxels from the current frame on, or drop them.
     SplitFrame(usize),
     MergeFrame(usize),
+    /// Add a rig template (true: four-legged).
+    AddRig(bool),
+    /// Key a motion preset onto the rig over this many frames.
+    Motion(String, u32),
     /// New pivot, free rotation and sockets for a node. `true` starts an
     /// undo step (false continues a drag).
     Extras(usize, Extras, bool),
@@ -140,6 +144,13 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                     cmds.push(Command::EditPart(picked[0]));
                 }
                 ui.end_row();
+            });
+        });
+        CollapsingHeader::new("Rig").default_open(false).show(ui, |ui| {
+            ui.weak("A character of blocks with joints, ready for the motions in the timeline. Redraw each part to taste.");
+            ui.horizontal_wrapped(|ui| {
+                op(ui, cmds, "+ Humanoid", "Hips, torso, head, two-piece arms and legs", true, TreeOp::AddRig(false));
+                op(ui, cmds, "+ Four-legged", "Body, head, tail and four legs", true, TreeOp::AddRig(true));
             });
         });
         CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {

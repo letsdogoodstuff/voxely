@@ -483,6 +483,26 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
         TreeOp::MergeFrame(id) => {
             scene.change_quiet(|w| w.merge_frame(id));
         }
+        TreeOp::AddRig(quad) => {
+            let at = w.bounds(ROOT).map_or(IVec3::ZERO, |(lo, size)| IVec3::new(lo.x + size.x + 3, lo.y, 0));
+            let colors = rig_colors(&scene.palette);
+            let root = scene.change_quiet(|w| if quad { crate::rig::quadruped(w, at, 1, "", colors) } else { crate::rig::humanoid(w, at, 1, "", colors) });
+            scene.picked = vec![root];
+        }
+        TreeOp::Motion(name, frames) => {
+            let rig = scene.picked.first().copied();
+            let res = scene.change_quiet(|w| crate::rig::apply_motion(w, rig, &name, frames, 1.0));
+            match res {
+                Ok(a) if a.bones.is_empty() => eprintln!("motion {name}: no rig parts found (name parts hips, torso, head, upper_arm_l ...)"),
+                Ok(a) => {
+                    ed.timeline.open = true;
+                    if !a.missing.is_empty() {
+                        eprintln!("motion {name}: no part for {:?}", a.missing.iter().map(|b| crate::rig::bone_name(*b)).collect::<Vec<_>>());
+                    }
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+        }
         TreeOp::Extras(id, x, begin) => {
             let set = |w: &mut crate::world::World| {
                 if let Some(n) = w.node_mut(id) {
@@ -520,6 +540,12 @@ pub(crate) fn history_step(scene: &mut Scene, ed: &mut EditState, forward: bool)
         ed.editor.reset();
     }
     done
+}
+
+/// Palette colors closest to a rig's clothes, skin and dark parts.
+pub(crate) fn rig_colors(palette: &[[u8; 4]]) -> crate::rig::Colors {
+    let near = |c: [i32; 3]| (1..256).min_by_key(|&i| (0..3).map(|k| (palette[i][k] as i32 - c[k]).pow(2)).sum::<i32>()).unwrap_or(1) as u8;
+    (near([90, 120, 196]), near([232, 195, 158]), near([60, 60, 80]))
 }
 
 /// Switch between editing a model and the World view.
