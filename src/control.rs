@@ -519,6 +519,38 @@ pub(crate) fn apply(ctx: &mut Ctx, new: Volume) -> bool {
     changed
 }
 
+/// Replace the edited part's canvas with `new` (cell 0 at old cell `at`)
+/// without moving anything in the world; one undo step.
+fn recanvas(ctx: &mut Ctx, new: Volume, at: IVec3) {
+    let edit = LastEdit { part: ctx.scene.editing(), resized: true, ..Default::default() };
+    ctx.scene.recanvas(&new, at);
+    tree_changed(ctx);
+    ctx.ed.tools.last_edit = Some(edit);
+    inspect::after_commit(ctx);
+}
+
+/// edit_model fit: crop the canvas to the voxels, keeping them in place.
+fn fit_part(ctx: &mut Ctx) -> Result<Vec<Value>> {
+    let (new, lo) = ops::crop(&ctx.scene.volume).ok_or_else(|| anyhow!("fit isn't possible here: the part is empty"))?;
+    if new.dims == ctx.scene.volume.dims {
+        return Ok(edited(ctx, false, "Applied fit"));
+    }
+    let new = build::before_commit(ctx, new);
+    let before = ctx.scene.origin;
+    recanvas(ctx, new, lo);
+    let d = ctx.scene.volume.dims;
+    let note = format!(
+        "Applied fit: canvas is now {}x{}x{}; its position moved {:?} -> {:?} so the voxels stay where they were (part coordinates shifted by {:?}; pivot and sockets follow)",
+        d.x,
+        d.y,
+        d.z,
+        before.to_array(),
+        ctx.scene.origin.to_array(),
+        (-lo).to_array()
+    );
+    Ok(edited(ctx, true, &note))
+}
+
 fn refresh_selection(ctx: &mut Ctx) {
     if ctx.ed.editor.sel_dirty {
         ctx.r.upload_selection(&ctx.scene.volume, ctx.ed.editor.selection());
@@ -1419,6 +1451,9 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "perlin" => Op::Perlin,
                 other => bail!("unknown op {other:?}"),
             };
+            if let Op::Fit = op {
+                return fit_part(ctx);
+            }
             let new = app::apply_op(op, ctx.scene, &ctx.ed.editor).ok_or_else(|| anyhow!("{op_name} isn't possible here (empty model, or the canvas would exceed {})", ops::MAX_DIM))?;
             let changed = apply(ctx, new);
             Ok(edited(ctx, changed, &format!("Applied {op_name}")))
@@ -1438,9 +1473,15 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         "resize_canvas" => {
             let size = ivec3(a, "size")?;
+            let old = ctx.scene.volume.dims;
             let new = ops::resize(&ctx.scene.volume, size);
-            let changed = apply(ctx, new);
-            Ok(edited(ctx, changed, "Resized canvas"))
+            if new.dims == old {
+                let changed = apply(ctx, new);
+                return Ok(edited(ctx, changed, "Resized canvas"));
+            }
+            let new = build::before_commit(ctx, new);
+            recanvas(ctx, new, -ops::resize_shift(old, size));
+            Ok(edited(ctx, true, &format!("Resized canvas to {:?}; the part's world position moved by {:?} so its voxels stay put", ctx.scene.volume.dims.to_array(), (-ops::resize_shift(old, size)).to_array())))
         }
         "list_shaders" => {
             let mut out = Vec::new();

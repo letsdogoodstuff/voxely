@@ -198,6 +198,9 @@ struct Targets {
     width: u32,
     height: u32,
     out: wgpu::Buffer,
+    /// The radiance sum (kept for tests that poison it).
+    #[cfg_attr(not(test), allow(dead_code))]
+    accum: wgpu::Buffer,
     trace_bg: wgpu::BindGroup,
     bloom_down_bg: wgpu::BindGroup,
     bloom_h_bg: wgpu::BindGroup,
@@ -412,7 +415,7 @@ impl Renderer {
         let pixels = (width * height) as u64;
         let bloom_pixels = (width.div_ceil(4) * height.div_ceil(4)) as u64;
         let none = wgpu::BufferUsages::empty();
-        let accum = scratch_buffer(device, "accum", pixels * 16, none);
+        let accum = scratch_buffer(device, "accum", pixels * 16, wgpu::BufferUsages::COPY_DST);
         let out = scratch_buffer(device, "out_rgba", pixels * 4, wgpu::BufferUsages::COPY_SRC);
         let bloom_a = scratch_buffer(device, "bloom_a", bloom_pixels * 16, none);
         let bloom_b = scratch_buffer(device, "bloom_b", bloom_pixels * 16, none);
@@ -496,6 +499,7 @@ impl Renderer {
             resolve_bg: post(p.resolve.get_bind_group_layout(0), "resolve", &[0, 1, 2, 3, 5, 6]),
             display_bg: p.display.as_ref().map(|d| post(d.get_bind_group_layout(0), "display", &[0, 1, 3, 5, 6])),
             out,
+            accum,
             trace_bg,
             features,
             denoise_init_bg,
@@ -1006,4 +1010,51 @@ pub fn read_texture(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Text
         }
     }
     Ok(rgba)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::MaterialKind;
+    use glam::IVec3;
+
+    /// Pixels at most `level` in every channel.
+    fn dark(px: &[u8], level: u8) -> usize {
+        px.chunks_exact(4).filter(|p| p[0] <= level && p[1] <= level && p[2] <= level).count()
+    }
+
+    #[test]
+    fn denoiser_contains_bad_samples() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let (_a, device, queue) = pollster::block_on(request_device(&instance, None)).expect("gpu");
+        let mut scene = Scene::empty(IVec3::splat(16));
+        for x in 4..12 {
+            for y in 4..12 {
+                for z in 0..6 {
+                    scene.volume.set(IVec3::new(x, y, z), 10);
+                }
+            }
+        }
+        scene.volume.set(IVec3::new(7, 2, 1), 20);
+        scene.materials[20].kind = MaterialKind::Emit as u32;
+        scene.materials[20].emit = 20.0;
+        scene.rebuild_lights();
+        // An odd size, so workgroups overhang both edges.
+        let (w, h) = (101, 77);
+        let mut r = Renderer::new(device, queue, &scene, None, w, h);
+        r.settings.denoise = true;
+        r.settings.aces = true;
+        r.settings.bg_mode = BgMode::Color;
+        r.settings.bg_color = Vec3::splat(0.86);
+        r.set_lights(&scene.lights, scene.light_power);
+        r.set_camera(Camera::framing(scene.volume.dims.as_vec3(), r.settings.fov, w as f32 / h as f32));
+        let clean = r.render_image(16).unwrap();
+        assert_eq!(dark(&clean, 2), 0, "a light scene renders without black pixels");
+
+        // One NaN sample in the middle used to black out a 125 px block.
+        let i = (h / 2 * w + w / 2) as u64 * 16;
+        r.queue.write_buffer(&r.targets.accum, i, bytemuck::bytes_of(&[f32::NAN, f32::INFINITY, 0.5f32]));
+        let poisoned = r.read_pixels().unwrap();
+        assert_eq!(dark(&poisoned, 2), 0, "a bad sample spread through the denoiser");
+    }
 }

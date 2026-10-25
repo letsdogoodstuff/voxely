@@ -179,8 +179,8 @@ pub fn erode(v: &Volume) -> Volume {
 /// Change the canvas size, keeping the model centered in x and y and on
 /// the floor.
 pub fn resize(v: &Volume, dims: IVec3) -> Volume {
+    let shift = resize_shift(v.dims, dims);
     let dims = dims.clamp(IVec3::ONE, IVec3::splat(MAX_DIM));
-    let shift = IVec3::new((dims.x - v.dims.x) / 2, (dims.y - v.dims.y) / 2, 0);
     let mut out = Volume::new(dims);
     for (i, &c) in v.cells.iter().enumerate() {
         if c != 0 {
@@ -190,8 +190,19 @@ pub fn resize(v: &Volume, dims: IVec3) -> Volume {
     out
 }
 
+/// Where `resize` puts the old cell 0 in the new canvas.
+pub fn resize_shift(old: IVec3, dims: IVec3) -> IVec3 {
+    let dims = dims.clamp(IVec3::ONE, IVec3::splat(MAX_DIM));
+    IVec3::new((dims.x - old.x) / 2, (dims.y - old.y) / 2, 0)
+}
+
 /// Shrink the canvas to the model's bounds (MagicaVoxel's crop/fit).
 pub fn fit(v: &Volume) -> Option<Volume> {
+    crop(v).map(|(out, _)| out)
+}
+
+/// `fit`, plus the old cell the new cell 0 was (the crop's min corner).
+pub fn crop(v: &Volume) -> Option<(Volume, IVec3)> {
     let mut b: Option<(IVec3, IVec3)> = None;
     for (i, &c) in v.cells.iter().enumerate() {
         if c != 0 {
@@ -206,7 +217,7 @@ pub fn fit(v: &Volume) -> Option<Volume> {
             out.set(v.position(i) - lo, c);
         }
     }
-    Some(out)
+    Some((out, lo))
 }
 
 /// Shift by one voxel along `axis`, wrapping around the canvas.
