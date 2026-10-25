@@ -94,8 +94,12 @@ pub struct WorldDrag {
 
 impl EditState {
     pub fn new(color: u8, source: Option<PathBuf>, save_path: PathBuf) -> Self {
-        let samples = list_samples(source.as_deref());
-        let palettes = list_palettes(source.as_deref());
+        // A model outside MagicaVoxel's folders (a workspace project, say)
+        // has none of its assets around it; list the install's instead.
+        let install = magicavoxel_dir().map(|d| d.join("vox").join("_.vox"));
+        let or_install = |found: Vec<PathBuf>, list: fn(Option<&Path>) -> Vec<PathBuf>| if found.is_empty() { list(install.as_deref()) } else { found };
+        let samples = or_install(list_samples(source.as_deref()), list_samples);
+        let palettes = or_install(list_palettes(source.as_deref()), list_palettes);
         EditState {
             samples,
             scanned: std::time::Instant::now(),
@@ -113,7 +117,7 @@ impl EditState {
             ui_scale: 1.0,
             transform_text: ui::TransformText::default(),
             palette: ui::PaletteState::default(),
-            shaders: ui::ShaderState { files: list_shaders(source.as_deref()), current: None, values: Vec::new(), error: None },
+            shaders: ui::ShaderState { files: or_install(list_shaders(source.as_deref()), list_shaders), current: None, values: Vec::new(), error: None },
             editor: Editor::new(color),
             hover: None,
             enabled: true,
