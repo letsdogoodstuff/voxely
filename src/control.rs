@@ -1476,6 +1476,14 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             };
             let text_args = string(a, "args").context("missing `args`, e.g. \"xyz 2\"")?;
             let new = app::transform(kind, text_args, &ctx.scene.volume).ok_or_else(|| anyhow!("couldn't apply {text_args:?}: expected axes then values, within size limits"))?;
+            let old = ctx.scene.volume.dims;
+            if matches!(kind, TransformKind::Rotate) && new.dims != old {
+                // The turn is about the canvas center; keep that center in place.
+                let new = build::before_commit(ctx, new);
+                let at = -(new.dims - old).div_euclid(IVec3::splat(2));
+                recanvas(ctx, new, at);
+                return Ok(edited(ctx, true, &format!("Applied {text_args}; the canvas grew to {:?} around the same center", ctx.scene.volume.dims.to_array())));
+            }
             let changed = apply(ctx, new);
             Ok(edited(ctx, changed, &format!("Applied {text_args}")))
         }
