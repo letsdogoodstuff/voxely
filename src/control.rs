@@ -23,6 +23,7 @@ use crate::ui::{Op, TransformKind};
 mod build;
 pub mod guide;
 mod inspect;
+mod reference;
 mod surface;
 mod view;
 
@@ -32,6 +33,7 @@ pub struct ToolState {
     pub last_edit: Option<LastEdit>,
     pub build: build::State,
     pub inspect: inspect::State,
+    pub reference: reference::State,
     pub surface: surface::State,
 }
 
@@ -383,13 +385,13 @@ const PART_TOOLS: &[&str] = &[
 ];
 
 fn is_part_tool(name: &str) -> bool {
-    [PART_TOOLS, build::PART_TOOLS, guide::PART_TOOLS, inspect::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
+    [PART_TOOLS, build::PART_TOOLS, guide::PART_TOOLS, inspect::PART_TOOLS, reference::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
 }
 
 /// The tool list for MCP `tools/list`, with the shared `part` argument.
 pub fn tools() -> Value {
     let mut list = base_tools();
-    let extra = [build::tools(), guide::tools(), inspect::tools(), surface::tools(), view::tools()];
+    let extra = [build::tools(), guide::tools(), inspect::tools(), reference::tools(), surface::tools(), view::tools()];
     list.as_array_mut().unwrap().extend(extra.into_iter().flatten());
     for t in list.as_array_mut().into_iter().flatten() {
         if is_part_tool(t["name"].as_str().unwrap_or_default()) {
@@ -720,7 +722,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
     if is_part_tool(name) {
         focus_part(ctx, get(a, "part"))?;
     }
-    for family in [build::dispatch, guide::dispatch, inspect::dispatch, surface::dispatch, view::dispatch] {
+    for family in [build::dispatch, guide::dispatch, inspect::dispatch, reference::dispatch, surface::dispatch, view::dispatch] {
         if let Some(result) = family(ctx, name, a) {
             return result;
         }
