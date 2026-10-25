@@ -81,12 +81,73 @@ pub struct Snap {
     look: Vec<Option<[u8; 4]>>,
     /// New index -> old index of the edit, if it moved colors.
     order: Option<Vec<usize>>,
+    /// Pack: per volume (and its size then), the voxels whose duplicate
+    /// color it merged into another, as (cell, own color, merged-into
+    /// color) in old indices.
+    unmerge: Vec<(Held, glam::IVec3, Vec<(usize, u8, u8)>)>,
+}
+
+/// A volume of voxels in the scene: the edited one (or World mode's
+/// flattened view), the others shown around it, a part, or a part's
+/// flipbook drawing.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Held {
+    Volume,
+    Context,
+    Model(usize),
+    Drawing(usize, usize),
+}
+
+/// The voxels a pack's `order` / `remap` merges into another color (see
+/// `Snap::unmerge`).
+fn merges(scene: &mut Scene, order: &[usize], remap: &[u8; 256]) -> Vec<(Held, glam::IVec3, Vec<(usize, u8, u8)>)> {
+    let mut out = Vec::new();
+    each_volume(scene, |at, v| {
+        let cells: Vec<(usize, u8, u8)> = v.cells.filled().map(|(i, c)| (i, c, order[remap[c as usize] as usize] as u8)).filter(|&(_, c, into)| c != into).collect();
+        if !cells.is_empty() {
+            out.push((at, v.dims, cells));
+        }
+    });
+    out
+}
+
+/// Undoing a pack (colors back at their old indices): split merged
+/// duplicates again where nothing repainted them since.
+fn split(scene: &mut Scene, unmerge: &[(Held, glam::IVec3, Vec<(usize, u8, u8)>)]) {
+    let held: std::collections::HashMap<Held, (glam::IVec3, &Vec<(usize, u8, u8)>)> = unmerge.iter().map(|(at, d, cells)| (*at, (*d, cells))).collect();
+    each_volume(scene, |at, v| {
+        let Some(&(_, cells)) = held.get(&at).filter(|h| h.0 == v.dims) else { return };
+        for &(i, own, into) in cells {
+            if v.cells[i] == into {
+                v.set_index(i, own);
+            }
+        }
+    });
+}
+
+/// Every volume holding voxels, for `f`.
+fn each_volume(scene: &mut Scene, mut f: impl FnMut(Held, &mut Volume)) {
+    f(Held::Volume, &mut scene.volume);
+    if let Some((ctx, _)) = &mut scene.context {
+        f(Held::Context, ctx);
+    }
+    for (id, n) in scene.world.nodes.iter_mut().enumerate() {
+        let Some(n) = n else { continue };
+        if let crate::world::Kind::Model(v) = &mut n.kind {
+            f(Held::Model(id), v);
+        }
+        for (k, slot) in n.flip.iter_mut().enumerate() {
+            if let Some(v) = &mut slot.volume {
+                f(Held::Drawing(id, k), v);
+            }
+        }
+    }
 }
 
 const HISTORY: usize = 64;
 
 pub fn snapshot(scene: &Scene, look: &[Option<[u8; 4]>]) -> Snap {
-    Snap { palette: scene.palette.clone(), materials: scene.materials.clone(), notes: scene.notes.clone(), look: look.to_vec(), order: None }
+    Snap { palette: scene.palette.clone(), materials: scene.materials.clone(), notes: scene.notes.clone(), look: look.to_vec(), order: None, unmerge: Vec::new() }
 }
 
 /// Stop remembering the original colors of `slots` (their colors were
@@ -187,8 +248,13 @@ pub fn apply(cmd: Cmd, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) 
             let (order, remap) = ops::compact(&keys, &used);
             let n = used.iter().filter(|&&u| u).count();
             let kept = order.iter().skip(1).take_while(|&&i| used[i]).count();
-            reorder(r, scene, ed, order, Some(remap));
             let merged = n - kept;
+            // Remember the merged voxels' own colors, for undo.
+            let unmerge = if merged > 0 { merges(scene, &order, &remap) } else { Vec::new() };
+            reorder(r, scene, ed, order, Some(remap));
+            if let Some(s) = ed.palette.history.last_mut() {
+                s.unmerge = unmerge;
+            }
             (format!("Packed {kept} used colors into 1-{kept}{}", if merged > 0 { format!(", merged {merged} duplicates") } else { String::new() }), true)
         }
         Cmd::Load(src, matched) => {
@@ -264,6 +330,7 @@ pub fn apply(cmd: Cmd, r: &mut Renderer, scene: &mut Scene, ed: &mut EditState) 
                 let back: [u8; 256] = std::array::from_fn(|k| order.get(k).copied().unwrap_or(k) as u8);
                 remap_voxels(scene, ed, &back);
             }
+            split(scene, &s.unmerge);
             scene.palette = s.palette;
             scene.materials = s.materials;
             scene.notes = s.notes;
@@ -555,6 +622,31 @@ pub fn handle_drops(ctx: &egui::Context, ed: &EditState, cmds: &mut Vec<crate::u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undoing_a_pack_splits_merged_duplicates() {
+        let mut scene = Scene::empty(glam::IVec3::splat(4));
+        // Colors 5 and 9 are the same; pack merges 9 into 5.
+        scene.palette[9] = scene.palette[5];
+        scene.sync_color(9);
+        scene.volume.set(glam::IVec3::ZERO, 5);
+        scene.volume.set(glam::IVec3::X, 9);
+        scene.volume.set(glam::IVec3::Y, 9);
+        let keys: Vec<([u8; 4], &[u8])> = scene.palette.iter().zip(&scene.materials).map(|(c, m)| (*c, bytemuck::bytes_of(m))).collect();
+        let (order, remap) = ops::compact(&keys, &scene.used_colors());
+        let unmerge = merges(&mut scene, &order, &remap);
+        scene.remap(&remap);
+        let packed: Vec<u8> = scene.volume.filled().map(|(_, c)| c).collect();
+        assert_eq!(packed, vec![1, 1, 1]);
+        // Undo: colors back at their old indices, then the split. A voxel
+        // repainted since stays as it is.
+        let back: [u8; 256] = std::array::from_fn(|k| order.get(k).copied().unwrap_or(k) as u8);
+        scene.remap(&back);
+        scene.volume.set(glam::IVec3::Y, 7);
+        split(&mut scene, &unmerge);
+        let get = |p: glam::IVec3| scene.volume.get(p);
+        assert_eq!((get(glam::IVec3::ZERO), get(glam::IVec3::X), get(glam::IVec3::Y)), (5, 9, 7));
+    }
 
     /// Load `colors` the way `Cmd::Load(_, true)` does, without moving
     /// colors (they are all past `colors.len()` here).
