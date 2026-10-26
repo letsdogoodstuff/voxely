@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::env::EnvMode;
 use crate::vox::{Dict, VoxFile};
-use crate::world::World;
+use crate::world::{World, ROOT};
 
 use crate::grid::Grid;
 
@@ -324,6 +324,9 @@ pub struct Scene {
     /// `volume` and are written back when leaving edit mode or saving.
     pub world: World,
     pub mode: Mode,
+    /// The object World mode works inside: its contents show and can be
+    /// picked; everything else is dimmed. `ROOT` for the whole world.
+    pub inside: usize,
     /// World position of `volume`'s cell 0.
     pub origin: IVec3,
     /// World mode: the model node each cell of `volume` came from.
@@ -963,6 +966,7 @@ impl Scene {
             volume: Volume::new(IVec3::ONE),
             world,
             mode: Mode::World,
+            inside: ROOT,
             origin: IVec3::ZERO,
             owners: Grid::new(IVec3::ZERO),
             context: None,
@@ -1020,14 +1024,18 @@ impl Scene {
                 self.picked = vec![id];
             }
             Mode::World => {
-                self.context = None;
-                match self.world.composite(None) {
+                if self.world.node(self.inside).is_none() {
+                    self.inside = ROOT;
+                }
+                let (w, inside) = (&self.world, self.inside);
+                match w.composite_where(|m| w.within(inside, m)) {
                     Some(c) => (self.volume, self.origin, self.owners) = (c.volume, c.origin, c.owners),
                     None => {
                         self.volume = Volume::new(IVec3::ONE);
                         self.owners = Grid::new(IVec3::ONE);
                     }
                 }
+                self.context = if inside == ROOT { None } else { w.composite_where(|m| !w.within(inside, m)).map(|c| (c.volume, c.origin - self.origin)) };
                 let w = &self.world;
                 self.picked.retain(|&p| w.node(p).is_some());
             }
@@ -1163,6 +1171,14 @@ impl Scene {
         self.history.truncate(self.history.len().saturating_sub(n));
         self.remember();
         *self.history.last_mut().unwrap() = before;
+    }
+
+    /// Work inside object `id` in World mode (`ROOT`: the whole world).
+    pub fn enter(&mut self, id: usize) {
+        self.inside = if self.world.node(id).is_some() { id } else { ROOT };
+        if self.mode == Mode::World {
+            self.view(Mode::World);
+        }
     }
 
     /// Edit model `id` (or the model of a group's first model).

@@ -438,7 +438,12 @@ impl World {
     /// Flatten visible models (except `skip`) into one volume covering
     /// their boxes. Later models win where they overlap.
     pub fn composite(&self, skip: Option<usize>) -> Option<Composite> {
-        let models: Vec<usize> = self.models().into_iter().filter(|&m| Some(m) != skip && self.visible(m)).collect();
+        self.composite_where(|m| Some(m) != skip)
+    }
+
+    /// `composite` of the visible models that `keep` accepts.
+    pub fn composite_where(&self, keep: impl Fn(usize) -> bool) -> Option<Composite> {
+        let models: Vec<usize> = self.models().into_iter().filter(|&m| keep(m) && self.visible(m)).collect();
         let mut b: Option<(IVec3, IVec3)> = None;
         for &m in &models {
             let (lo, size) = self.bounds(m)?;
@@ -687,6 +692,11 @@ impl World {
             id = p;
         }
         id
+    }
+
+    /// Whether `b` is `a` or anywhere inside it.
+    pub fn within(&self, a: usize, b: usize) -> bool {
+        a == b || self.is_ancestor(a, b)
     }
 
     fn is_ancestor(&self, a: usize, mut b: usize) -> bool {

@@ -570,7 +570,7 @@ pub fn sync_selection(r: &mut Renderer, scene: &Scene, editor: &mut Editor) {
 pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool {
     let picked = scene.picked.clone();
     let w = &scene.world;
-    let top: Vec<usize> = w.node(ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
+    let top: Vec<usize> = w.node(scene.inside).map(|n| n.children().to_vec()).unwrap_or_default();
     match op {
         TreeOp::Pick(id, add) => {
             if !add {
@@ -594,6 +594,14 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
             scene.picked = top.into_iter().filter(|t| !picked.contains(t)).collect();
             return true;
         }
+        TreeOp::Enter(id) => {
+            let from = scene.inside;
+            // Coming out, the object just left stays picked.
+            let keep = from != id && from != ROOT && w.within(id, from);
+            scene.enter(id);
+            scene.picked = if keep { vec![from] } else { Vec::new() };
+            return true;
+        }
         _ => {}
     }
     keep_history(scene, &mut ed.editor);
@@ -603,8 +611,15 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
             let near = picked.first().copied().unwrap_or(ROOT);
             // Beside the picked one (or everything), on the ground.
             let at = picked.first().and_then(|&p| w.bounds_all(p)).or_else(|| w.reach()).map_or(IVec3::ZERO, |(lo, size)| IVec3::new(lo.x + size.x + 2, lo.y, 0));
-            let parent = w.node(near).and_then(|n| n.parent).unwrap_or(ROOT);
-            let id = scene.change(|w| w.add_model(parent, "", crate::scene::Volume::new(IVec3::splat(NEW_PART)), at));
+            let parent = if picked.is_empty() { scene.inside } else { w.node(near).and_then(|n| n.parent).unwrap_or(ROOT) };
+            let id = scene.change(|w| {
+                let id = w.add_model(parent, "", crate::scene::Volume::new(IVec3::splat(NEW_PART)), at);
+                // Inside a model: attached to it.
+                if w.node(parent).is_some_and(|n| !n.is_group()) {
+                    w.reparent(id, parent);
+                }
+                id
+            });
             scene.picked = vec![id];
         }
         TreeOp::Delete => {
@@ -677,8 +692,22 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
                 return false;
             }
         }
-        TreeOp::Detach(id) => {
-            scene.change(|w| w.detach(id));
+        TreeOp::PutInside(ids, to) => {
+            let ids: Vec<usize> = ids.into_iter().filter(|&i| !w.within(i, to) && w.node(i).and_then(|n| n.parent) != Some(to)).collect();
+            if ids.is_empty() {
+                return false;
+            }
+            scene.change(|w| ids.iter().for_each(|&i| {
+                w.reparent(i, to);
+            }));
+            scene.picked = ids;
+        }
+        TreeOp::Place(id, d, begin) => {
+            if begin {
+                scene.change(|w| w.translate(id, d));
+            } else {
+                scene.apply(|w| w.translate(id, d));
+            }
         }
         TreeOp::SetAnim(a) => {
             let frame = scene.world.frame;
@@ -2332,6 +2361,12 @@ impl App {
             return;
         }
         if world && !cmd && self.gfx.as_ref().is_some_and(|g| g.renderer.modeling) {
+            // Escape steps out of the object being worked inside.
+            if matches!(event.logical_key.as_ref(), Key::Named(NamedKey::Escape)) && self.scene.inside != ROOT {
+                let up = self.scene.world.node(self.scene.inside).and_then(|n| n.parent).unwrap_or(ROOT);
+                self.command(Command::Tree(TreeOp::Enter(up)));
+                return;
+            }
             let mv = |x, y, z| Some(TreeOp::Move(IVec3::new(x, y, z)));
             let op = match event.logical_key.as_ref() {
                 Key::Named(NamedKey::ArrowLeft) => mv(-1, 0, 0),
@@ -2697,7 +2732,8 @@ impl App {
         let w = &self.scene.world;
         let mut node = model;
         if !self.modifiers.alt_key() {
-            while let Some(p) = w.node(node).and_then(|n| n.parent).filter(|&p| p != ROOT) {
+            let inside = self.scene.inside;
+            while let Some(p) = w.node(node).and_then(|n| n.parent).filter(|&p| p != inside && p != ROOT) {
                 node = p;
             }
         }
@@ -2985,6 +3021,40 @@ mod tests {
 
     fn sig(scene: &Scene, ed: &EditState) -> Sig {
         Sig::of(&scene.settings, scene, ed)
+    }
+
+    #[test]
+    fn put_inside_go_inside_and_place() {
+        let mut scene = Scene::empty(IVec3::splat(4));
+        let mut ed = EditState::new(1, None, PathBuf::from("x.vox"));
+        let mut full = crate::scene::Volume::new(IVec3::splat(2));
+        for i in 0..8 {
+            full.set(IVec3::new(i & 1, (i >> 1) & 1, i >> 2), 1);
+        }
+        let a = scene.change(|w| w.add_model(ROOT, "a", full.clone(), IVec3::new(10, 0, 0)));
+        let b = scene.change(|w| w.add_model(ROOT, "b", full.clone(), IVec3::new(20, 0, 0)));
+        // Dropping b's row on a: b follows a and stays put.
+        assert!(tree_op(TreeOp::PutInside(vec![b], a), &mut scene, &mut ed));
+        assert_eq!(scene.world.node(b).and_then(|n| n.parent), Some(a));
+        assert_eq!(scene.world.bounds(b).map(|b| b.0), Some(IVec3::new(20, 0, 0)));
+        // Not inside itself or what's inside it.
+        assert!(!tree_op(TreeOp::PutInside(vec![a], b), &mut scene, &mut ed));
+        // Inside a: only a and b show; the rest is dimmed context.
+        set_mode(&mut scene, &mut ed, None);
+        tree_op(TreeOp::Enter(a), &mut scene, &mut ed);
+        assert_eq!(scene.inside, a);
+        assert_eq!(scene.volume.count(), 16);
+        assert!(scene.context.is_some());
+        // The Position fields move by whole voxels, one undo step per drag.
+        tree_op(TreeOp::Place(b, IVec3::X, true), &mut scene, &mut ed);
+        tree_op(TreeOp::Place(b, IVec3::X, false), &mut scene, &mut ed);
+        assert_eq!(scene.world.bounds(b).map(|b| b.0), Some(IVec3::new(22, 0, 0)));
+        scene.undo_tree(false);
+        assert_eq!(scene.world.bounds(b).map(|b| b.0), Some(IVec3::new(20, 0, 0)));
+        // Coming back out keeps a picked.
+        tree_op(TreeOp::Enter(ROOT), &mut scene, &mut ed);
+        assert_eq!((scene.inside, scene.picked.clone()), (ROOT, vec![a]));
+        assert!(scene.context.is_none());
     }
 
     #[test]

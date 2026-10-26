@@ -34,8 +34,14 @@ pub enum TreeOp {
     /// Attach a node to another so it follows it, snapping onto one of
     /// that part's sockets if given.
     Attach(usize, usize, Option<String>),
-    /// Stop following; stays where it is.
-    Detach(usize),
+    /// Put nodes inside another (they follow it from then on), keeping
+    /// where they are in the world.
+    PutInside(Vec<usize>, usize),
+    /// Work inside a node in World mode (`ROOT`: the whole world).
+    Enter(usize),
+    /// Move a node by whole voxels from the Transform fields. `true`
+    /// starts an undo step (false continues a drag).
+    Place(usize, IVec3, bool),
     /// Timeline settings.
     SetAnim(crate::anim::Anim),
     /// Key a node's pose on the current frame, or remove that key.
@@ -81,8 +87,24 @@ fn op(ui: &mut Ui, cmds: &mut Vec<Command>, label: &str, hint: &str, enabled: bo
     }
 }
 
+/// Tree rows being dragged: the picked ones, or the row grabbed.
+struct Dragged(Vec<usize>);
+
+/// Highlight `r` while rows that could go inside `to` are held over it,
+/// and put them inside when they're dropped there.
+fn drop_target(ui: &Ui, r: &egui::Response, w: &World, to: usize, cmds: &mut Vec<Command>) {
+    let fits = |d: &Dragged| d.0.iter().any(|&i| !w.within(i, to) && w.node(i).and_then(|n| n.parent) != Some(to));
+    if r.dnd_hover_payload::<Dragged>().is_some_and(|d| fits(&d)) {
+        ui.painter().rect_stroke(r.rect, 3.0, ui.visuals().selection.stroke, egui::StrokeKind::Inside);
+    }
+    if let Some(d) = r.dnd_release_payload::<Dragged>().filter(|d| fits(d)) {
+        cmds.push(Command::Tree(TreeOp::PutInside(d.0.clone(), to)));
+    }
+}
+
 fn row(ui: &mut Ui, w: &World, id: usize, picked: &[usize], editing: Option<usize>, cmds: &mut Vec<Command>) {
     let Some(n) = w.node(id) else { return };
+    let inner = !n.children().is_empty();
     ui.horizontal(|ui| {
         let mut shown = !n.hidden;
         if ui.checkbox(&mut shown, "").on_hover_text("Show").changed() {
@@ -93,7 +115,11 @@ fn row(ui: &mut Ui, w: &World, id: usize, picked: &[usize], editing: Option<usiz
         let font = egui::TextStyle::Button.resolve(ui.style());
         let room = ui.available_width() - 2.0 * ui.spacing().button_padding.x;
         let shown = fit_middle(ui, &label, &font, room);
-        let hint = "Click to pick, Shift+click to add, double-click to edit";
+        let hint = if inner {
+            "Click to pick, Shift+click to add, double-click to go inside\nDrag onto another to put it inside"
+        } else {
+            "Click to pick, Shift+click to add, double-click to edit\nDrag onto another to put it inside"
+        };
         let hint = if shown != label { format!("{label}\n{hint}") } else { hint.to_string() };
         let mut text = RichText::new(shown);
         if n.hidden {
@@ -102,14 +128,16 @@ fn row(ui: &mut Ui, w: &World, id: usize, picked: &[usize], editing: Option<usiz
         if Some(id) == editing || n.is_group() {
             text = text.strong();
         }
-        let r = ui.add(egui::Button::selectable(picked.contains(&id), text)).on_hover_text(hint);
+        let r = ui.add(egui::Button::selectable(picked.contains(&id), text).sense(egui::Sense::click_and_drag())).on_hover_text(hint);
+        r.dnd_set_drag_payload(Dragged(if picked.contains(&id) { picked.to_vec() } else { vec![id] }));
+        drop_target(ui, &r, w, id, cmds);
         if r.double_clicked() {
-            cmds.push(Command::EditPart(id));
+            cmds.push(if inner { Command::Tree(TreeOp::Enter(id)) } else { Command::EditPart(id) });
         } else if r.clicked() {
             cmds.push(Command::Tree(TreeOp::Pick(id, ui.input(|i| i.modifiers.shift))));
         }
     });
-    if !n.children().is_empty() {
+    if inner {
         ui.indent(("children", id), |ui| {
             for &c in n.children() {
                 row(ui, w, c, picked, editing, cmds);
@@ -142,17 +170,38 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
     let w = &scene.world;
     let picked = &scene.picked;
     let any = !picked.is_empty();
+    let inside = scene.inside;
     ui.vertical_centered(|ui| ui.label(RichText::new("World").strong()));
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.set_max_width(ui.available_width());
+        if inside != ROOT {
+            // Working inside an object: a way back out.
+            let up = w.node(inside).and_then(|n| n.parent).unwrap_or(ROOT);
+            let to = if up == ROOT { "the whole world".to_string() } else { w.label(up) };
+            ui.horizontal(|ui| {
+                let r = ui.button(RichText::new("\u{2191} Up").monospace()).on_hover_text(format!("Back out to {to} [Esc]\nDrop rows here to take them out"));
+                drop_target(ui, &r, w, up, cmds);
+                if r.clicked() {
+                    cmds.push(Command::Tree(TreeOp::Enter(up)));
+                }
+                ui.label(RichText::new(w.label(inside)).strong());
+            });
+        }
         CollapsingHeader::new("Objects").default_open(true).show(ui, |ui| {
-            egui::ScrollArea::vertical().id_salt("tree").max_height(260.0).show(ui, |ui| {
+            let tall = (ui.ctx().content_rect().height() * 0.4).max(200.0);
+            egui::ScrollArea::vertical().id_salt("tree").max_height(tall).show(ui, |ui| {
                 // Rigs nest deep; keep names readable.
                 ui.spacing_mut().indent = 8.0;
-                for &c in w.node(ROOT).map(|n| n.children()).unwrap_or_default() {
+                for &c in w.node(inside).map(|n| n.children()).unwrap_or_default() {
                     row(ui, w, c, picked, scene.editing(), cmds);
                 }
+                // Dropping below the rows brings things to this level.
+                let (rect, r) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+                if egui::DragAndDrop::has_payload_of_type::<Dragged>(ui.ctx()) {
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "drop here: this level", egui::TextStyle::Small.resolve(ui.style()), ui.visuals().weak_text_color());
+                }
+                drop_target(ui, &r, w, inside, cmds);
             });
         });
         CollapsingHeader::new("Object").default_open(true).show(ui, |ui| {
@@ -160,9 +209,9 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                 op(ui, cmds, "New", "New empty model [Ctrl+N]", true, TreeOp::New);
                 op(ui, cmds, "Copy", "Duplicate [Ctrl+C, Ctrl+V]", any, TreeOp::Duplicate);
                 ui.end_row();
-                op(ui, cmds, "Group", "Group the picked objects [Ctrl+R]", any, TreeOp::Group);
+                op(ui, cmds, "Group", "Put the picked objects inside a new empty one [Ctrl+R]", any, TreeOp::Group);
                 let group = picked.iter().any(|&p| w.node(p).is_some_and(|n| n.is_group()));
-                op(ui, cmds, "Ungroup", "Dissolve the picked groups [Ctrl+Shift+R]", group, TreeOp::Ungroup);
+                op(ui, cmds, "Ungroup", "Take everything out of the picked groups and remove them [Ctrl+Shift+R]", group, TreeOp::Ungroup);
                 ui.end_row();
                 op(ui, cmds, "Hide", "Hide the picked objects [Ctrl+H]", any, TreeOp::Hide(true));
                 op(ui, cmds, "Show all", "Show every object [Ctrl+Shift+H]", true, TreeOp::Hide(false));
@@ -171,6 +220,10 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                 if ui.add_enabled(picked.len() == 1, egui::Button::new("Edit")).on_hover_text("Edit this model's voxels [Tab, double-click]").clicked() {
                     cmds.push(Command::EditPart(picked[0]));
                 }
+                ui.end_row();
+                let inner = picked.len() == 1 && w.node(picked[0]).is_some_and(|n| !n.children().is_empty());
+                let hint = "Work on what's inside it; the rest dims [double-click its row; Esc comes back out]";
+                op(ui, cmds, "Go inside", hint, inner, TreeOp::Enter(picked.first().copied().unwrap_or(ROOT)));
                 ui.end_row();
             });
         });
@@ -181,34 +234,6 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
             ui.horizontal_wrapped(|ui| {
                 op(ui, cmds, "+ Humanoid", "Hips, torso, head, two-piece arms and legs", true, TreeOp::AddRig(false));
                 op(ui, cmds, "+ Four-legged", "Body, head, tail and four legs", true, TreeOp::AddRig(true));
-            });
-        });
-        CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
-            ui.add_enabled_ui(any, |ui| {
-                ui.label("Rotate 90°");
-                ui.horizontal(|ui| {
-                    for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
-                        op(ui, cmds, name, &format!("Turn about {name} (hold Shift: the other way)"), true, TreeOp::Turn(axis, if ui.input(|i| i.modifiers.shift) { -1 } else { 1 }));
-                    }
-                });
-                ui.label("Flip");
-                ui.horizontal(|ui| {
-                    for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
-                        op(ui, cmds, name, &format!("Mirror along {name}"), true, TreeOp::Flip(axis));
-                    }
-                });
-                ui.label("Move");
-                ui.horizontal(|ui| {
-                    for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
-                        let mut d = IVec3::ZERO;
-                        d[axis] = 1;
-                        let keys = ["Left / Right", "Down / Up", "PageDown / PageUp"][axis];
-                        ui.vertical(|ui| {
-                            op(ui, cmds, &format!("+{name}"), &format!("Move one voxel [{keys}]"), true, TreeOp::Move(d));
-                            op(ui, cmds, &format!("-{name}"), &format!("Move one voxel [{keys}]"), true, TreeOp::Move(-d));
-                        });
-                    }
-                });
             });
         });
         if let [id] = picked.as_slice() {
@@ -225,17 +250,25 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                 if r.lost_focus() && w.node(id).is_some_and(|n| n.name != *text) {
                     cmds.push(Command::Tree(TreeOp::Rename(id, text.clone())));
                 }
-                if let Some((lo, size)) = w.bounds(id) {
-                    ui.weak(format!("at {} {} {}", lo.x, lo.y, lo.z));
+                if let Some((_, size)) = w.bounds(id) {
                     ui.weak(format!("size {} {} {}", size.x, size.y, size.z));
                 }
+                let parent = w.node(id).and_then(|n| n.parent).unwrap_or(ROOT);
+                if parent != ROOT {
+                    ui.weak(format!("inside {}", w.label(parent)));
+                }
+                socket_snap(ui, w, id, parent, cmds);
             });
-            attach_ui(ui, w, id, cmds);
-            extras_ui(ui, w, id, cmds);
+        }
+        if any {
+            transform_ui(ui, w, picked, cmds);
+        }
+        if let [id] = picked.as_slice() {
+            sockets_ui(ui, w, *id, cmds);
         }
         if scene.mode == Mode::World {
             ui.add_space(6.0);
-            ui.add(egui::Label::new(RichText::new("Drag a part to move it. Tab edits the picked model.").weak()).wrap());
+            ui.add(egui::Label::new(RichText::new("Drag a part to move it. Drag a row onto another to put it inside. Tab edits the picked model.").weak()).wrap());
         }
     });
 }
@@ -258,50 +291,101 @@ fn vec3_ui(ui: &mut Ui, v: &mut Vec3, speed: f64, suffix: &str) -> (bool, bool) 
     (changed, begin)
 }
 
-/// Pivot, free rotation and sockets of node `id`. Positions show in part
-/// coordinates (what the voxel tools use while editing it).
-fn extras_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
-    let (Some(n), Some(mut x)) = (w.node(id), Extras::of(w, id)) else { return };
+/// `vec3_ui` for whole voxels.
+fn ivec3_ui(ui: &mut Ui, v: &mut IVec3) -> (bool, bool) {
     let (mut changed, mut begin) = (false, false);
-    let mut track = |(c, b): (bool, bool)| {
-        changed |= c;
-        begin |= b;
-    };
-    CollapsingHeader::new("Pivot").default_open(true).show(ui, |ui| {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let w = ((ui.available_width() - 4.0) / 3.0).floor();
+        for k in 0..3 {
+            let r = ui.add_sized([w, ui.spacing().interact_size.y], egui::DragValue::new(&mut v[k]).speed(0.1));
+            if r.changed() {
+                changed = true;
+                begin |= !r.dragged() || r.drag_started();
+            }
+        }
+    });
+    (changed, begin)
+}
+
+/// One Transform block: position, rotation, quarter turns and flips, and
+/// the pivot everything turns about. Fields show for a single object;
+/// the buttons act on every picked one.
+fn transform_ui(ui: &mut Ui, w: &World, picked: &[usize], cmds: &mut Vec<Command>) {
+    CollapsingHeader::new("Transform").default_open(true).show(ui, |ui| {
+        let one = match picked {
+            [id] => w.node(*id).map(|n| (*id, n)),
+            _ => None,
+        };
+        if let Some((lo, _)) = one.and_then(|(id, _)| w.bounds(id)) {
+            ui.label("Position").on_hover_text("Where its box starts in the world, in voxels [arrows, PageUp/PageDown]");
+            let mut p = lo;
+            let (changed, begin) = ivec3_ui(ui, &mut p);
+            if let (true, Some((id, _))) = (changed && p != lo, one) {
+                cmds.push(Command::Tree(TreeOp::Place(id, p - lo, begin)));
+            }
+        }
+        let mut x = one.and_then(|(id, _)| Extras::of(w, id));
+        let (mut changed, mut begin) = (false, false);
+        if let Some(x) = &mut x {
+            ui.label("Rotation").on_hover_text("Free rotation about world axes, turning about the pivot");
+            let r = vec3_ui(ui, &mut x.tilt, 1.0, "°");
+            (changed, begin) = (r.0, r.1);
+        }
+        let shift = ui.input(|i| i.modifiers.shift);
+        ui.horizontal(|ui| {
+            ui.label("Turn 90°");
+            for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
+                op(ui, cmds, name, &format!("Turn about {name} (hold Shift: the other way)"), true, TreeOp::Turn(axis, if shift { -1 } else { 1 }));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Flip");
+            for (axis, name) in ["X", "Y", "Z"].into_iter().enumerate() {
+                op(ui, cmds, name, &format!("Mirror along {name}"), true, TreeOp::Flip(axis));
+            }
+        });
+        let (Some((id, n)), Some(x)) = (one, &mut x) else { return };
+        if n.tilted() && ui.button("Straighten").on_hover_text("Remove the free rotation").clicked() {
+            x.tilt = Vec3::ZERO;
+            (changed, begin) = (true, true);
+        }
+        ui.label("Pivot").on_hover_text("The point it turns about, and where it joins what it's inside. In the part's own voxels.");
         let mut p = w.to_part(id, w.pivot_local(id));
         let r = vec3_ui(ui, &mut p, 0.25, "");
         if r.0 {
             x.pivot = Some(w.from_part(id, p));
         }
-        track(r);
+        (changed, begin) = (changed | r.0, begin | r.1);
         ui.horizontal(|ui| {
             if ui.button("Center").on_hover_text("Turn about the middle").clicked() {
                 x.pivot = None;
-                track((true, true));
+                (changed, begin) = (true, true);
             }
             if let Some((_, size)) = w.bounds(id).filter(|_| !n.is_group() && !n.tilted()) {
                 if ui.button("Bottom").on_hover_text("Turn about the middle of the bottom face").clicked() {
                     x.pivot = Some(w.from_part(id, Vec3::new(size.x as f32 * 0.5, size.y as f32 * 0.5, 0.0)));
-                    track((true, true));
+                    (changed, begin) = (true, true);
                 }
             }
         });
-    });
-    CollapsingHeader::new("Rotation").default_open(true).show(ui, |ui| {
-        let r = vec3_ui(ui, &mut x.tilt, 1.0, "°");
-        track(r);
-        if n.tilted() && ui.button("Straighten").on_hover_text("Remove the free rotation").clicked() {
-            x.tilt = Vec3::ZERO;
-            track((true, true));
+        if changed && Some(&*x) != Extras::of(w, id).as_ref() {
+            cmds.push(Command::Tree(TreeOp::Extras(id, x.clone(), begin)));
         }
     });
-    CollapsingHeader::new("Sockets").default_open(true).show(ui, |ui| {
+}
+
+/// Named attachment points of node `id`.
+fn sockets_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
+    let Some(mut x) = Extras::of(w, id) else { return };
+    let (mut changed, mut begin) = (false, false);
+    CollapsingHeader::new("Sockets").default_open(false).show(ui, |ui| {
         let mut remove = None;
         for (k, sock) in x.sockets.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 let r = ui.add(egui::TextEdit::singleline(&mut sock.name).desired_width(ui.available_width() - 34.0));
                 if r.changed() {
-                    track((true, true));
+                    (changed, begin) = (true, true);
                 }
                 if ui.small_button("x").on_hover_text("Remove").clicked() {
                     remove = Some(k);
@@ -312,16 +396,16 @@ fn extras_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
             if r.0 {
                 sock.pos = w.from_part(id, p);
             }
-            track(r);
+            (changed, begin) = (changed | r.0, begin | r.1);
         }
         if let Some(k) = remove {
             x.sockets.remove(k);
-            track((true, true));
+            (changed, begin) = (true, true);
         }
-        if ui.button("+ Socket").on_hover_text("A named attachment point, for attaching parts here and for game engines").clicked() {
+        if ui.button("+ Socket").on_hover_text("A named attachment point, for snapping parts here and for game engines").clicked() {
             let name = (1..).map(|i| format!("socket{i}")).find(|s| !x.sockets.iter().any(|o| &o.name == s)).unwrap();
             x.sockets.push(Socket { name, pos: w.pivot_local(id) });
-            track((true, true));
+            (changed, begin) = (true, true);
         }
     });
     if changed && Some(&x) != Extras::of(w, id).as_ref() {
@@ -329,36 +413,18 @@ fn extras_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
     }
 }
 
-/// What a node is attached to, and snapping onto that part's sockets.
-fn attach_ui(ui: &mut Ui, w: &World, id: usize, cmds: &mut Vec<Command>) {
-    let Some(parent) = w.node(id).and_then(|n| n.parent) else { return };
-    CollapsingHeader::new("Attached to").default_open(true).show(ui, |ui| {
-        let current = if parent == ROOT { "nothing".to_string() } else { w.label(parent) };
-        egui::ComboBox::from_id_salt(("attach", id)).selected_text(current).width(ui.available_width()).show_ui(ui, |ui| {
-            if ui.selectable_label(parent == ROOT, "nothing").clicked() && parent != ROOT {
-                cmds.push(Command::Tree(TreeOp::Detach(id)));
+/// Buttons snapping node `id` onto the sockets of what it's inside.
+fn socket_snap(ui: &mut Ui, w: &World, id: usize, parent: usize, cmds: &mut Vec<Command>) {
+    let sockets = w.node(parent).map(|n| n.sockets.clone()).unwrap_or_default();
+    if parent == ROOT || sockets.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.weak("snap to");
+        for s in sockets {
+            if ui.small_button(&s.name).on_hover_text("Move this part's pivot onto the socket").clicked() {
+                cmds.push(Command::Tree(TreeOp::Attach(id, parent, Some(s.name.clone()))));
             }
-            // Anything not inside this node.
-            let mut inside = Vec::new();
-            w.visit(id, &mut |i, _| inside.push(i));
-            w.visit(ROOT, &mut |i, _| {
-                if i != ROOT && !inside.contains(&i) && ui.selectable_label(i == parent, w.label(i)).clicked() && i != parent {
-                    cmds.push(Command::Tree(TreeOp::Attach(id, i, None)));
-                }
-            });
-        })
-        .response
-        .on_hover_text("Attached parts follow their parent's moves and turns");
-        let sockets = w.node(parent).map(|n| n.sockets.clone()).unwrap_or_default();
-        if parent != ROOT && !sockets.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.weak("snap to");
-                for s in sockets {
-                    if ui.small_button(&s.name).on_hover_text("Move this part's pivot onto the socket").clicked() {
-                        cmds.push(Command::Tree(TreeOp::Attach(id, parent, Some(s.name.clone()))));
-                    }
-                }
-            });
         }
     });
 }
