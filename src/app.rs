@@ -1923,12 +1923,12 @@ pub fn build_ui(
         if r.modeling {
             let editing = scene.editing().is_some();
             egui::Panel::left("brush").exact_size(190.0).resizable(false).show(ui, |ui| {
-                ui.add_enabled_ui(editing, |ui| ui::brush_panel(ui, &mut ed.editor, cmds));
+                ui.add_enabled_ui(editing, |ui| ui::brush_panel(ui, &mut ed.editor, r.modeler.as_mut().map(|m| &mut m.options), cmds));
             });
             if !editing {
                 egui::Panel::right("world").default_size(180.0).size_range(160.0..=320.0).resizable(true).show(ui, |ui| crate::outline::panel(ui, scene, &mut ed.outline, cmds));
-            } else if let Some(m) = r.modeler.as_mut() {
-                egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut m.options, &mut ed.transform_text, cmds));
+            } else {
+                egui::Panel::right("edit").exact_size(160.0).resizable(false).show(ui, |ui| ui::edit_panel(ui, &ed.editor, &mut ed.transform_text, cmds));
             }
             let part = scene.editing().map(|id| {
                 let label = scene.world.label(id);

@@ -1094,79 +1094,6 @@ fn swatch_menu(ui: &mut Ui, i: usize, e: &mut Editor, scene: &mut Scene, pal: &m
     item(ui, &format!("Blend ramp {lo}-{hi}"), Cmd::Gradient(lo, hi));
 }
 
-/// Second left column in the modeler: brush, tool, selection tools and
-/// mirroring.
-pub fn brush_panel(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
-    heading(ui, "Brush");
-    egui::Grid::new("brushes").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
-        ui.selectable_value(&mut e.brush, Brush::Geo, "Geo").on_hover_text("Geometry mode [L]: line, square, circle");
-        ui.selectable_value(&mut e.brush, Brush::Code, "Code").on_hover_text("Voxel shader mode [C]");
-        ui.selectable_value(&mut e.brush, Brush::Pattern, "Pattern").on_hover_text("Pattern mode [P] : Rot [-/+/0/9] : Move [Dir/Page/Home]");
-        ui.end_row();
-        ui.selectable_value(&mut e.brush, Brush::Voxel, "Voxel").on_hover_text("Voxel mode [V] : Resize [-/+/Ctrl+Alt+Drag]");
-        ui.selectable_value(&mut e.brush, Brush::Face, "Face").on_hover_text("Face mode [F] : Extrude [Drag]");
-        ui.selectable_value(&mut e.brush, Brush::Box, "Box").on_hover_text("Box mode [B]");
-        ui.end_row();
-    });
-    ui.separator();
-    ui.vertical_centered_justified(|ui| {
-        ui.selectable_value(&mut e.tool, Tool::Attach, "Attach").on_hover_text("T");
-        ui.selectable_value(&mut e.tool, Tool::Erase, "Erase").on_hover_text("R");
-        ui.selectable_value(&mut e.tool, Tool::Paint, "Paint").on_hover_text("G");
-    });
-    ui.separator();
-    egui::Grid::new("select_tools").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
-        ui.selectable_value(&mut e.tool, Tool::Move, "Move").on_hover_text("Transform: move, scale, wrap or rotate the selection, or the model");
-        ui.selectable_value(&mut e.tool, Tool::Marquee, "Select").on_hover_text("Marquee select [M] : Add [Shift] : Remove [Shift+Alt]");
-        ui.selectable_value(&mut e.tool, Tool::Region, "Region").on_hover_text("Region select [N] : Add [Shift] : Remove [Shift+Alt]");
-        ui.end_row();
-        ui.selectable_value(&mut e.tool, Tool::Pick, "Pick").on_hover_text("Pick voxel color [Alt+LButton]");
-        ui.selectable_value(&mut e.tool, Tool::RegionRemove, "Remove").on_hover_text("Region remove");
-        ui.selectable_value(&mut e.tool, Tool::RegionReplace, "Replace").on_hover_text("Region replace with the current color");
-        ui.end_row();
-    });
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("Mirror").on_hover_text("Mirror mode");
-        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-            ui.toggle_value(&mut e.mirror[i], *n).on_hover_text(format!("F{}", 5 + i));
-        }
-        if ui.small_button("Off").on_hover_text("Reset mirror mode").clicked() {
-            e.mirror = [false; 3];
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.label("Axis").on_hover_text("Axis mode: extend the brush through the canvas");
-        for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-            ui.toggle_value(&mut e.opts.axis[i], *n);
-        }
-        if ui.small_button("Off").on_hover_text("Reset axis mode").clicked() {
-            e.opts.axis = [false; 3];
-        }
-    });
-    ui.separator();
-    brush_options(ui, e, cmds);
-    if matches!(e.tool, Tool::Region | Tool::RegionRemove | Tool::RegionReplace) {
-        ui.separator();
-        ui.label("Region");
-        let r = &mut e.region;
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut r.same_color, true, "Color").on_hover_text("Same palette color, anywhere");
-            ui.selectable_value(&mut r.same_color, false, "Connected").on_hover_text("Connected region");
-        });
-        if !r.same_color {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut r.by_color, true, "Color").on_hover_text("Connect through the same color");
-                ui.selectable_value(&mut r.by_color, false, "Geo").on_hover_text("Connect through any voxel");
-            });
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut r.diagonal, false, "4").on_hover_text("Connect through faces");
-                ui.selectable_value(&mut r.diagonal, true, "8").on_hover_text("Also connect through edges and corners");
-            });
-        }
-    }
-}
-
 fn axis_row(ui: &mut Ui, cmds: &mut Vec<Command>, hint: &str, held: bool, op: fn(usize) -> Op) {
     ui.horizontal(|ui| {
         for (axis, n) in ["X", "Y", "Z"].iter().enumerate() {
@@ -1223,7 +1150,7 @@ pub enum EditTab {
 
 /// Right column in the modeler: MagicaVoxel's Edit panel. With a
 /// selection, the edits act on the selected voxels (see `app::apply_edit`).
-pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, text: &mut TransformText, cmds: &mut Vec<Command>) {
+pub fn edit_panel(ui: &mut Ui, e: &Editor, text: &mut TransformText, cmds: &mut Vec<Command>) {
     use crate::ops::Shape;
     heading(ui, "Edit");
     ui.horizontal(|ui| {
@@ -1337,87 +1264,384 @@ pub fn edit_panel(ui: &mut Ui, e: &Editor, o: &mut ModelerOptions, text: &mut Tr
                 });
             });
         }
-        if tab == EditTab::All {
-            CollapsingHeader::new("View").show(ui, |ui| {
-                ui.checkbox(&mut o.constant, "Constant shading");
-                ui.checkbox(&mut o.fade, "Fade").on_hover_text("Fade Background Objects");
-                let mut bg = o.background.to_array();
-                ui.horizontal(|ui| {
-                    ui.color_edit_button_rgb(&mut bg);
-                    ui.label("Background");
-                });
-                o.background = bg.into();
-            });
+    });
+}
+
+/// Which sections the Brush panel shows (MagicaVoxel's All / Brush /
+/// Display tabs).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum BrushTab {
+    #[default]
+    All,
+    Brush,
+    Display,
+}
+
+/// Second left column in the modeler, laid out like MagicaVoxel's: mode
+/// and tool grids, mirror and axis rows, then fold-out sections for the
+/// current tool and mode and the modeler display options.
+pub fn brush_panel(ui: &mut Ui, e: &mut Editor, display: Option<&mut ModelerOptions>, cmds: &mut Vec<Command>) {
+    heading(ui, "Brush");
+    let tab_id = ui.make_persistent_id("brush_tab");
+    let mut tab: BrushTab = ui.data(|d| d.get_temp(tab_id)).unwrap_or_default();
+    let w = ui.available_width();
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let cw = ((w - 16.0) / 3.0).floor();
+        let s = egui::vec2(cw, 18.0);
+        ui.horizontal(|ui| {
+            cell(ui, s, &mut tab, BrushTab::All, "All", "Show All Options");
+            icon_cell(ui, s, &mut tab, BrushTab::Brush, Icon::Brush, "Show Brush Options");
+            icon_cell(ui, s, &mut tab, BrushTab::Display, Icon::Gear, "Show Display Options");
+        });
+    });
+    ui.data_mut(|d| d.insert_temp(tab_id, tab));
+    if tab != BrushTab::Display {
+        brush_grids(ui, e);
+    }
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        if tab != BrushTab::Display {
+            brush_options(ui, e, cmds);
+        }
+        if tab != BrushTab::Brush {
+            if let Some(o) = display {
+                display_options(ui, o);
+            }
         }
     });
 }
 
-fn pick2<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, a: (T, &str, &str), b: (T, &str, &str)) {
-    ui.horizontal(|ui| {
-        ui.selectable_value(v, a.0, a.1).on_hover_text(a.2);
-        ui.selectable_value(v, b.0, b.1).on_hover_text(b.2);
-    });
+/// Size of one cell in a grid of `n` columns across the panel.
+fn cell_size(ui: &Ui, n: f32, h: f32) -> egui::Vec2 {
+    egui::vec2(((ui.available_width() - 2.0 * (n - 1.0)) / n).floor(), h)
 }
 
-/// Options for the current brush or selection tool.
-fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
-    if e.tool == Tool::Move {
-        ui.label("Transform");
-        egui::Grid::new("xform").num_columns(2).spacing([4.0, 4.0]).show(ui, |ui| {
-            ui.selectable_value(&mut e.opts.xform, XformMode::Move, "Move").on_hover_text("Move/Loop [Ctrl+LButton] : Normal axis [Shift]");
-            ui.selectable_value(&mut e.opts.xform, XformMode::Scale, "Scale").on_hover_text("Scale : Commit [Enter] : Cancel [Esc] : Two-sided [Shift]");
-            ui.end_row();
-            ui.selectable_value(&mut e.opts.xform, XformMode::Wrap, "Wrap").on_hover_text("Wrap/Crop : Commit [Enter] : Cancel [Esc] : Two-sided [Shift]");
-            ui.selectable_value(&mut e.opts.xform, XformMode::Rotate, "Rotate").on_hover_text("Rotate : Commit [Enter] : Cancel [Esc] : Snap [Shift]");
-            ui.end_row();
+/// A selectable cell: `v` becomes `val` when clicked.
+fn cell<T: PartialEq + Copy>(ui: &mut Ui, size: egui::Vec2, v: &mut T, val: T, label: impl Into<egui::WidgetText>, hint: &str) {
+    if ui.add_sized(size, egui::Button::selectable(*v == val, label)).on_hover_text(hint).clicked() {
+        *v = val;
+    }
+}
+
+/// The Brush panel's icons, drawn with the painter since the bundled fonts
+/// lack most of these shapes.
+#[derive(Clone, Copy)]
+enum Icon {
+    Brush,
+    Gear,
+    Dot,
+    Star,
+    Square,
+    Extrude,
+    Cube,
+    Move,
+    Marquee,
+    Wand,
+    Dropper,
+    Trash,
+    Bucket,
+    Mirror,
+    Axis,
+    Line,
+}
+
+/// Draws `icon` centered at `c`, about `2 * r` across.
+fn paint_icon(p: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Color32, icon: Icon) {
+    use egui::{vec2, Shape, Stroke};
+    let s = Stroke::new(1.5, col);
+    let at = |x: f32, y: f32| c + vec2(x, y) * r;
+    let line = |a: (f32, f32), b: (f32, f32)| p.line_segment([at(a.0, a.1), at(b.0, b.1)], s);
+    // An arrow from `a` to `b` with a head at `b`.
+    let arrow = |a: (f32, f32), b: (f32, f32)| {
+        line(a, b);
+        let d = vec2(b.0 - a.0, b.1 - a.1).normalized() * 0.45;
+        let n = d.rot90();
+        line(b, (b.0 - d.x + n.x, b.1 - d.y + n.y));
+        line(b, (b.0 - d.x - n.x, b.1 - d.y - n.y));
+    };
+    match icon {
+        Icon::Brush => {
+            p.line_segment([at(0.9, -0.9), at(-0.1, 0.1)], Stroke::new(2.0, col));
+            p.circle_filled(at(-0.45, 0.45), r * 0.4, col);
+        }
+        Icon::Gear => {
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                let (y, x) = a.sin_cos();
+                p.line_segment([at(x * 0.5, y * 0.5), at(x * 0.95, y * 0.95)], Stroke::new(2.5, col));
+            }
+            p.circle_stroke(c, r * 0.6, Stroke::new(2.0, col));
+        }
+        Icon::Dot => {
+            p.circle_filled(c, r * 0.6, col);
+        }
+        Icon::Star => {
+            let pt = |k: usize| {
+                let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 5.0;
+                let d = if k % 2 == 0 { 1.0 } else { 0.42 };
+                at(a.cos() * d, a.sin() * d + 0.08)
+            };
+            for k in 0..10 {
+                p.add(Shape::convex_polygon(vec![c + vec2(0.0, 0.08 * r), pt(k), pt(k + 1)], col, Stroke::NONE));
+            }
+        }
+        Icon::Square => {
+            p.rect_filled(egui::Rect::from_center_size(c, vec2(1.0, 1.0) * r), 0.0, col);
+        }
+        Icon::Extrude => {
+            line((-0.9, 0.8), (0.9, 0.8));
+            arrow((0.0, 0.5), (0.0, -0.9));
+        }
+        Icon::Cube => {
+            let h = |x: f32, y: f32| at(x * 0.87, y);
+            let top = vec![h(0.0, -1.0), h(1.0, -0.5), h(0.0, 0.0), h(-1.0, -0.5)];
+            p.add(Shape::convex_polygon(top, col, Stroke::NONE));
+            p.add(Shape::closed_line(vec![h(0.0, -1.0), h(1.0, -0.5), h(1.0, 0.5), h(0.0, 1.0), h(-1.0, 0.5), h(-1.0, -0.5)], s));
+            p.line_segment([h(0.0, 0.0), h(0.0, 1.0)], s);
+        }
+        Icon::Move => {
+            for (x, y) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+                arrow((x * 0.15, y * 0.15), (x * 0.9, y * 0.9));
+            }
+        }
+        Icon::Marquee => {
+            for (x, y) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+                line((x * 0.85, y * 0.85), (x * 0.4, y * 0.85));
+                line((x * 0.85, y * 0.85), (x * 0.85, y * 0.4));
+            }
+        }
+        Icon::Wand => {
+            p.line_segment([at(-0.9, 0.9), at(0.3, -0.3)], Stroke::new(2.0, col));
+            for (x, y) in [(0.55, -0.85), (0.85, -0.55), (0.2, -0.85), (0.85, -0.2)] {
+                p.circle_filled(at(x, y), 1.2, col);
+            }
+        }
+        Icon::Dropper => {
+            p.line_segment([at(-0.85, 0.85), at(0.2, -0.2)], Stroke::new(2.5, col));
+            p.circle_filled(at(0.45, -0.45), r * 0.4, col);
+        }
+        Icon::Trash => {
+            p.add(Shape::convex_polygon(vec![at(-0.6, -0.45), at(0.6, -0.45), at(0.5, 0.95), at(-0.5, 0.95)], col, Stroke::NONE));
+            line((-0.85, -0.7), (0.85, -0.7));
+            line((-0.25, -0.95), (0.25, -0.95));
+        }
+        Icon::Bucket => {
+            p.add(Shape::closed_line(vec![at(-0.2, -0.95), at(0.6, -0.15), at(0.0, 0.45), at(-0.8, -0.35)], s));
+            p.add(Shape::convex_polygon(vec![at(-0.8, -0.35), at(0.6, -0.15), at(0.0, 0.45)], col, Stroke::NONE));
+            p.circle_filled(at(0.75, 0.6), r * 0.25, col);
+        }
+        Icon::Mirror => {
+            line((0.0, -0.9), (0.0, 0.9));
+            p.add(Shape::convex_polygon(vec![at(-0.9, -0.5), at(-0.25, 0.0), at(-0.9, 0.5)], col, Stroke::NONE));
+            p.add(Shape::convex_polygon(vec![at(0.9, -0.5), at(0.25, 0.0), at(0.9, 0.5)], col, Stroke::NONE));
+        }
+        Icon::Axis => {
+            arrow((-0.2, 0.2), (0.85, -0.85));
+            arrow((0.2, -0.2), (-0.85, 0.85));
+        }
+        Icon::Line => {
+            line((-0.85, 0.85), (0.85, -0.85));
+        }
+    }
+}
+
+/// An empty selectable button with `icon` drawn on it.
+fn icon_button(ui: &mut Ui, size: egui::Vec2, selected: bool, icon: Icon, hint: &str) -> egui::Response {
+    let b = ui.add_sized(size, egui::Button::selectable(selected, "")).on_hover_text(hint);
+    let col = ui.style().interact_selectable(&b, selected).fg_stroke.color;
+    let r = (size.y * 0.32).min(size.x * 0.32);
+    paint_icon(ui.painter(), b.rect.center(), r, col, icon);
+    b
+}
+
+/// A selectable icon cell: `v` becomes `val` when clicked.
+fn icon_cell<T: PartialEq + Copy>(ui: &mut Ui, size: egui::Vec2, v: &mut T, val: T, icon: Icon, hint: &str) {
+    if icon_button(ui, size, *v == val, icon, hint).clicked() {
+        *v = val;
+    }
+}
+
+/// The fixed top of the Brush panel: modes, tools, mirror and axis.
+fn brush_grids(ui: &mut Ui, e: &mut Editor) {
+    let grid = |ui: &mut Ui, id: &str, add: &mut dyn FnMut(&mut Ui)| {
+        egui::Frame::group(ui.style()).inner_margin(2.0).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+            ui.push_id(id, |ui| add(ui));
         });
-        if e.opts.xform == XformMode::Wrap {
-            ui.label("Wrap spacing");
+    };
+    grid(ui, "modes", &mut |ui| {
+        let s = cell_size(ui, 3.0, 22.0);
+        let b = &mut e.brush;
+        ui.horizontal(|ui| {
+            icon_cell(ui, s, b, Brush::Geo, Icon::Dot, "Geometry mode [L]: line, square, circle");
+            cell(ui, s, b, Brush::Code, "</>", "Voxel shader mode [C]");
+            icon_cell(ui, s, b, Brush::Pattern, Icon::Star, "Pattern mode [P] : Rot [-/+/0/9] : Move [Dir/Page/Home]");
+        });
+        ui.horizontal(|ui| {
+            icon_cell(ui, s, b, Brush::Voxel, Icon::Square, "Voxel mode [V] : Resize [-/+/Ctrl+Alt+Drag]");
+            icon_cell(ui, s, b, Brush::Face, Icon::Extrude, "Face mode [F] : Extrude [Drag]");
+            icon_cell(ui, s, b, Brush::Box, Icon::Cube, "Box mode [B]");
+        });
+    });
+    grid(ui, "tools", &mut |ui| {
+        let s = cell_size(ui, 1.0, 26.0);
+        let t = &mut e.tool;
+        cell(ui, s, t, Tool::Attach, "Attach", "Attach [T]");
+        cell(ui, s, t, Tool::Erase, "Erase", "Erase [R]");
+        cell(ui, s, t, Tool::Paint, "Paint", "Paint [G]");
+    });
+    grid(ui, "select_tools", &mut |ui| {
+        let s = cell_size(ui, 3.0, 22.0);
+        let t = &mut e.tool;
+        ui.horizontal(|ui| {
+            icon_cell(ui, s, t, Tool::Move, Icon::Move, "Transform: move, scale, wrap or rotate the selection, or the model");
+            icon_cell(ui, s, t, Tool::Marquee, Icon::Marquee, "Marquee select [M] : Add [Shift] : Remove [Shift+Alt]");
+            icon_cell(ui, s, t, Tool::Region, Icon::Wand, "Region select [N] : Add [Shift] : Remove [Shift+Alt]");
+        });
+        ui.horizontal(|ui| {
+            icon_cell(ui, s, t, Tool::Pick, Icon::Dropper, "Pick voxel color [Alt+LButton]");
+            icon_cell(ui, s, t, Tool::RegionRemove, Icon::Trash, "Region remove");
+            icon_cell(ui, s, t, Tool::RegionReplace, Icon::Bucket, "Region replace with the current color");
+        });
+    });
+    grid(ui, "mirror_axis", &mut |ui| {
+        let s = cell_size(ui, 4.0, 20.0);
+        // The row's icon turns the whole row off.
+        let row = |ui: &mut Ui, icon: Icon, hint: &str, on: &mut [bool; 3], keys: bool| {
             ui.horizontal(|ui| {
+                if icon_button(ui, s, false, icon, &format!("{hint} : Off [Click]")).clicked() {
+                    *on = [false; 3];
+                }
                 for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
-                    ui.add(egui::DragValue::new(&mut e.opts.wrap_space[i]).range(0..=256)).on_hover_text(format!("Wrap spacing : {n}"));
+                    let tip = if keys { format!("{hint} {n} [F{}]", 5 + i) } else { format!("{hint} {n}") };
+                    if ui.add_sized(s, egui::Button::selectable(on[i], *n)).on_hover_text(tip).clicked() {
+                        on[i] ^= true;
+                    }
                 }
             });
-        }
-        if e.xform_pending() {
-            ui.weak("Commit [Enter] : Cancel [Esc]");
-        }
-        return;
-    }
-    if e.tool == Tool::Marquee {
-        ui.label("Marquee");
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut e.opts.marquee, MarqueeMode::Rect, "Rect").on_hover_text("Rect select");
-            ui.selectable_value(&mut e.opts.marquee, MarqueeMode::Brush, "Brush").on_hover_text("Brush select (voxel brush size)");
-            ui.selectable_value(&mut e.opts.marquee, MarqueeMode::Box, "Box").on_hover_text("Box select");
-        });
-        if e.opts.marquee == MarqueeMode::Rect {
-            ui.checkbox(&mut e.opts.visible_only, "Visible only").on_hover_text("Skip voxels hidden behind others");
-        }
-        if e.opts.marquee != MarqueeMode::Brush {
-            return;
-        }
+        };
+        row(ui, Icon::Mirror, "Mirror mode", &mut e.mirror, true);
+        row(ui, Icon::Axis, "Axis mode: extend the brush through the canvas", &mut e.opts.axis, false);
+    });
+}
+
+/// A fold-out section of the Brush panel, open by default, with optional
+/// controls on the right of its header.
+fn brush_section(ui: &mut Ui, title: &str, right: impl FnOnce(&mut Ui), body: impl FnOnce(&mut Ui)) {
+    let id = ui.make_persistent_id(("brush_section", title));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+        .show_header(ui, |ui| {
+            ui.label(egui::RichText::new(title.to_uppercase()).small().strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
+        })
+        .body(body);
+}
+
+/// A framed box of choices, `n` to a row.
+fn choice_box(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    egui::Frame::group(ui.style()).inner_margin(2.0).show(ui, |ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
+}
+
+/// A row of two choices for `v`, each half the box wide.
+fn pick2<T: PartialEq + Copy>(ui: &mut Ui, v: &mut T, a: (T, &str, &str), b: (T, &str, &str)) {
+    let s = cell_size(ui, 2.0, 20.0);
+    ui.horizontal(|ui| {
+        cell(ui, s, v, a.0, a.1, a.2);
+        cell(ui, s, v, b.0, b.1, b.2);
+    });
+}
+
+/// The sections for the current tool and brush mode.
+fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
+    match e.tool {
+        Tool::Move => brush_section(ui, "Transform", |_| {}, |ui| {
+            choice_box(ui, |ui| {
+                let s = cell_size(ui, 4.0, 20.0);
+                let x = &mut e.opts.xform;
+                ui.horizontal(|ui| {
+                    cell(ui, s, x, XformMode::Move, "Move", "Move/Loop [Ctrl+LButton] : Normal axis [Shift]");
+                    cell(ui, s, x, XformMode::Scale, "Scale", "Scale : Commit [Enter] : Cancel [Esc] : Two-sided [Shift]");
+                    cell(ui, s, x, XformMode::Wrap, "Wrap", "Wrap/Crop : Commit [Enter] : Cancel [Esc] : Two-sided [Shift]");
+                    cell(ui, s, x, XformMode::Rotate, "Rot", "Rotate : Commit [Enter] : Cancel [Esc] : Snap [Shift]");
+                });
+            });
+            if e.opts.xform == XformMode::Wrap {
+                ui.horizontal(|ui| {
+                    ui.label("Spacing");
+                    for (i, n) in ["X", "Y", "Z"].iter().enumerate() {
+                        ui.add(egui::DragValue::new(&mut e.opts.wrap_space[i]).range(0..=256)).on_hover_text(format!("Wrap spacing : {n}"));
+                    }
+                });
+            }
+            if e.xform_pending() {
+                ui.weak("Commit [Enter] : Cancel [Esc]");
+            }
+        }),
+        Tool::Marquee => brush_section(ui, "Marquee", |_| {}, |ui| {
+            choice_box(ui, |ui| {
+                let s = cell_size(ui, 3.0, 20.0);
+                let m = &mut e.opts.marquee;
+                ui.horizontal(|ui| {
+                    cell(ui, s, m, MarqueeMode::Rect, "Rect", "Rect select");
+                    cell(ui, s, m, MarqueeMode::Brush, "Brush", "Brush select (voxel brush size)");
+                    cell(ui, s, m, MarqueeMode::Box, "Box", "Box select");
+                });
+            });
+            if e.opts.marquee == MarqueeMode::Rect {
+                ui.checkbox(&mut e.opts.visible_only, "Visible only").on_hover_text("Skip voxels hidden behind others");
+            }
+        }),
+        Tool::Region | Tool::RegionRemove | Tool::RegionReplace => brush_section(ui, "Region", |_| {}, |ui| {
+            let r = &mut e.region;
+            choice_box(ui, |ui| {
+                pick2(ui, &mut r.same_color, (true, "Same", "Same palette color, anywhere"), (false, "Connected", "Connected region"));
+                if !r.same_color {
+                    pick2(ui, &mut r.by_color, (true, "Color", "Connect through the same color"), (false, "Geo", "Connect through any voxel"));
+                    pick2(ui, &mut r.diagonal, (false, "4", "Connect through faces"), (true, "8", "Also connect through edges and corners"));
+                }
+            });
+        }),
+        _ => {}
     }
     let o = &mut e.opts;
     match e.brush {
-        Brush::Voxel => {
-            ui.horizontal(|ui| {
-                ui.label("Size");
+        Brush::Voxel => brush_section(
+            ui,
+            "Voxel",
+            |ui| {
                 ui.add(egui::DragValue::new(&mut o.size).range(1..=64)).on_hover_text("Voxel size [1 - 64] : Change size [-/+/Ctrl+Alt+Drag]");
+            },
+            |ui| {
+                choice_box(ui, |ui| {
+                    let s = cell_size(ui, 2.0, 20.0);
+                    ui.horizontal(|ui| {
+                        icon_cell(ui, s, &mut o.sphere, false, Icon::Square, "Cube shape");
+                        icon_cell(ui, s, &mut o.sphere, true, Icon::Dot, "Sphere shape");
+                    });
+                    pick2(ui, &mut o.flat, (true, "2D", "Flat on the face under the cursor"), (false, "3D", "Solid"));
+                });
+            },
+        ),
+        Brush::Face => brush_section(ui, "Face", |_| {}, |ui| {
+            choice_box(ui, |ui| {
+                pick2(ui, &mut o.face_voxel_color, (false, "Palette", "Use palette color"), (true, "Voxel", "Use voxel color"));
+                pick2(ui, &mut o.face_by_color, (true, "Color", "Color connectivity"), (false, "Geo", "Geometry connectivity"));
+                pick2(ui, &mut o.face_diagonal, (false, "4", "4 neighbor searching"), (true, "8", "8 neighbor searching"));
             });
-            pick2(ui, &mut o.sphere, (false, "Cube", "Cube shape"), (true, "Sphere", "Sphere shape"));
-            pick2(ui, &mut o.flat, (true, "2D", "Flat on the face under the cursor"), (false, "3D", "Solid"));
-        }
-        Brush::Face => {
-            pick2(ui, &mut o.face_voxel_color, (false, "Palette", "Use palette color"), (true, "Voxel", "Use voxel color"));
-            pick2(ui, &mut o.face_by_color, (true, "Color", "Color connectivity"), (false, "Geo", "Geometry connectivity"));
-            pick2(ui, &mut o.face_diagonal, (false, "4", "4 neighbor searching"), (true, "8", "8 neighbor searching"));
-        }
-        Brush::Geo => {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut o.geo, GeoShape::Line, "Line");
-                ui.selectable_value(&mut o.geo, GeoShape::Square, "Square");
-                ui.selectable_value(&mut o.geo, GeoShape::Circle, "Circle");
+        }),
+        Brush::Geo => brush_section(ui, "Geometry", |_| {}, |ui| {
+            choice_box(ui, |ui| {
+                let s = cell_size(ui, 3.0, 22.0);
+                ui.horizontal(|ui| {
+                    icon_cell(ui, s, &mut o.geo, GeoShape::Line, Icon::Line, "Line");
+                    icon_cell(ui, s, &mut o.geo, GeoShape::Square, Icon::Square, "Square");
+                    icon_cell(ui, s, &mut o.geo, GeoShape::Circle, Icon::Dot, "Circle");
+                });
             });
             if o.geo == GeoShape::Line {
                 ui.checkbox(&mut o.project, "Project").on_hover_text("Project the line on the surface");
@@ -1425,48 +1649,67 @@ fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
                 ui.checkbox(&mut o.fill, "Fill").on_hover_text("Fill center");
                 ui.checkbox(&mut o.even, "Even").on_hover_text("Even size");
             }
-        }
+        }),
         Brush::Pattern => {
-            match &e.pattern {
-                Some(p) => {
-                    let d = p.volume.dims;
-                    ui.label(format!("{} ({}×{}×{})", p.name, d.x, d.y, d.z));
+            let right = |ui: &mut Ui| {
+                if icon_button(ui, egui::vec2(18.0, 16.0), false, Icon::Marquee, "Create pattern from selection").clicked() {
+                    cmds.push(Command::PatternFromSelection);
                 }
-                None => {
-                    ui.weak("Pick a model in Project > Pattern");
+            };
+            brush_section(ui, "Pattern", right, |ui| {
+                match &e.pattern {
+                    Some(p) => {
+                        let d = p.volume.dims;
+                        ui.label(format!("{} ({}×{}×{})", p.name, d.x, d.y, d.z));
+                    }
+                    None => {
+                        ui.weak("Pick a model in Project > Pattern");
+                    }
                 }
-            }
-            pick2(ui, &mut e.opts.pattern_palette, (true, "Palette", "Use palette color"), (false, "Voxel", "Use the pattern's colors"));
-            let off = e.opts.pattern_offset;
-            if off != IVec3::ZERO {
+                choice_box(ui, |ui| {
+                    pick2(ui, &mut e.opts.pattern_palette, (true, "Palette", "Use palette color"), (false, "Voxel", "Use the pattern's colors"));
+                });
+                let off = e.opts.pattern_offset;
+                if off != IVec3::ZERO {
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("Offset {} {} {}", off.x, off.y, off.z)).on_hover_text("Move [Dir/Page] : Reset [Home]");
+                        if ui.small_button("Reset").on_hover_text("[Home]").clicked() {
+                            e.opts.pattern_offset = IVec3::ZERO;
+                        }
+                    });
+                }
                 ui.horizontal(|ui| {
-                    ui.weak(format!("Offset {} {} {}", off.x, off.y, off.z)).on_hover_text("Move [Dir/Page] : Reset [Home]");
-                    if ui.small_button("Reset").on_hover_text("[Home]").clicked() {
-                        e.opts.pattern_offset = IVec3::ZERO;
+                    ui.label("Rot");
+                    if ui.small_button("Z").on_hover_text("[-/+]").clicked() {
+                        e.rotate_pattern(2, 1);
+                    }
+                    if ui.small_button("X").on_hover_text("[9]").clicked() {
+                        e.rotate_pattern(0, 1);
+                    }
+                    if ui.small_button("Y").on_hover_text("[0]").clicked() {
+                        e.rotate_pattern(1, 1);
                     }
                 });
-            }
-            ui.horizontal(|ui| {
-                command(ui, cmds, "From selection", "Create pattern from selection", Command::PatternFromSelection);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Rot");
-                if ui.small_button("Z").on_hover_text("[-/+]").clicked() {
-                    e.rotate_pattern(2, 1);
-                }
-                if ui.small_button("X").on_hover_text("[9/0]").clicked() {
-                    e.rotate_pattern(0, 1);
-                }
-                if ui.small_button("Y").clicked() {
-                    e.rotate_pattern(1, 1);
-                }
             });
         }
-        Brush::Code => {
-            ui.weak("Drag a box to fill it with the shader chosen in Project > Shader");
-        }
-        Brush::Box => {}
+        Brush::Code | Brush::Box => {}
     }
+}
+
+/// MagicaVoxel's Display section: how the modeler draws the scene.
+fn display_options(ui: &mut Ui, o: &mut ModelerOptions) {
+    brush_section(ui, "Display", |_| {}, |ui| {
+        ui.checkbox(&mut o.ao, "AO").on_hover_text("Ambient occlusion");
+        ui.checkbox(&mut o.constant, "Constant").on_hover_text("Constant shading");
+        ui.checkbox(&mut o.fade, "Fade").on_hover_text("Fade Background Objects");
+        let mut bg = o.background.to_array();
+        ui.horizontal(|ui| {
+            ui.color_edit_button_rgb(&mut bg);
+            ui.label("Background");
+        });
+        o.background = bg.into();
+        ui.checkbox(&mut o.frame, "Frame").on_hover_text("Frame grid every 10 voxels [Ctrl+F]");
+    });
 }
 
 /// Far-right column in the modeler: project, pattern and shader lists.
