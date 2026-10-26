@@ -1288,7 +1288,7 @@ pub fn brush_panel(ui: &mut Ui, e: &mut Editor, display: Option<&mut ModelerOpti
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         let cw = ((w - 16.0) / 3.0).floor();
-        let s = egui::vec2(cw, 18.0);
+        let s = egui::vec2(cw, 26.0);
         ui.horizontal(|ui| {
             cell(ui, s, &mut tab, BrushTab::All, "All", "Show All Options");
             icon_cell(ui, s, &mut tab, BrushTab::Brush, Icon::Brush, "Show Brush Options");
@@ -1331,16 +1331,19 @@ enum Icon {
     Brush,
     Gear,
     Dot,
-    Star,
     Square,
-    Extrude,
-    Cube,
+    Voxel,
+    Geo,
+    Shader,
+    Pattern,
+    Face,
+    Box,
     Move,
     Marquee,
-    Wand,
-    Dropper,
-    Trash,
-    Bucket,
+    Region,
+    Pick,
+    RegionRemove,
+    RegionReplace,
     Mirror,
     Axis,
     Line,
@@ -1362,8 +1365,38 @@ fn paint_icon(p: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Color32, icon
     };
     match icon {
         Icon::Brush => {
-            p.line_segment([at(0.9, -0.9), at(-0.1, 0.1)], Stroke::new(2.0, col));
-            p.circle_filled(at(-0.45, 0.45), r * 0.4, col);
+            // A paintbrush, drawn on a 24-unit grid.
+            let g = |x: f32, y: f32| at((x - 11.5) / 9.5, (y - 11.5) / 9.5);
+            let s = Stroke::new(1.5, egui::Color32::from_rgb(0x69, 0xbf, 0xe2));
+            // The handle's rounded end.
+            let mut handle = vec![g(14.7, 6.3), g(17.7, 3.3)];
+            handle.extend((1..8).map(|k| {
+                let a = (-135.0 + k as f32 * 22.5f32).to_radians();
+                g(19.2 + 2.12 * a.cos(), 4.8 + 2.12 * a.sin())
+            }));
+            handle.extend([g(20.7, 6.3), g(17.7, 9.3)]);
+            p.add(Shape::line(handle, s));
+            p.add(Shape::closed_line(vec![g(14.7, 6.3), g(17.7, 9.3), g(8.9, 18.1), g(5.8, 15.0)], s));
+            // The bristles, from four cubic curves.
+            let mut tip = vec![g(5.8, 15.0)];
+            let mut from = (5.8f32, 15.0f32);
+            for [c1, c2, to] in [
+                [(4.2, 15.4), (3.3, 16.5), (3.3, 18.2)],
+                [(3.3, 19.4), (2.8, 20.3), (2.0, 21.0)],
+                [(4.3, 21.0), (6.5, 20.7), (7.9, 19.3)],
+                [(9.0, 18.2), (9.3, 16.9), (8.9, 15.6)],
+            ] {
+                for k in 1..=6 {
+                    let t = k as f32 / 6.0;
+                    let u = 1.0 - t;
+                    let w = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+                    let x = w[0] * from.0 + w[1] * c1.0 + w[2] * c2.0 + w[3] * to.0;
+                    let y = w[0] * from.1 + w[1] * c1.1 + w[2] * c2.1 + w[3] * to.1;
+                    tip.push(g(x, y));
+                }
+                from = to;
+            }
+            p.add(Shape::line(tip, s));
         }
         Icon::Gear => {
             for k in 0..8 {
@@ -1376,61 +1409,86 @@ fn paint_icon(p: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Color32, icon
         Icon::Dot => {
             p.circle_filled(c, r * 0.6, col);
         }
-        Icon::Star => {
-            let pt = |k: usize| {
-                let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 5.0;
-                let d = if k % 2 == 0 { 1.0 } else { 0.42 };
-                at(a.cos() * d, a.sin() * d + 0.08)
-            };
-            for k in 0..10 {
-                p.add(Shape::convex_polygon(vec![c + vec2(0.0, 0.08 * r), pt(k), pt(k + 1)], col, Stroke::NONE));
-            }
-        }
         Icon::Square => {
             p.rect_filled(egui::Rect::from_center_size(c, vec2(1.0, 1.0) * r), 0.0, col);
         }
-        Icon::Extrude => {
-            line((-0.9, 0.8), (0.9, 0.8));
-            arrow((0.0, 0.5), (0.0, -0.9));
-        }
-        Icon::Cube => {
-            let h = |x: f32, y: f32| at(x * 0.87, y);
-            let top = vec![h(0.0, -1.0), h(1.0, -0.5), h(0.0, 0.0), h(-1.0, -0.5)];
-            p.add(Shape::convex_polygon(top, col, Stroke::NONE));
-            p.add(Shape::closed_line(vec![h(0.0, -1.0), h(1.0, -0.5), h(1.0, 0.5), h(0.0, 1.0), h(-1.0, 0.5), h(-1.0, -0.5)], s));
-            p.line_segment([h(0.0, 0.0), h(0.0, 1.0)], s);
-        }
-        Icon::Move => {
-            for (x, y) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
-                arrow((x * 0.15, y * 0.15), (x * 0.9, y * 0.9));
+        Icon::Voxel => {
+            // A shaded cube, drawn on a 64-unit grid.
+            let g = |x: f32, y: f32| at((x - 32.0) / 26.0, (y - 32.0) / 26.0);
+            let rgb = egui::Color32::from_rgb;
+            for (face, fill) in [
+                ([(32.0, 7.0), (55.0, 20.0), (32.0, 33.0), (9.0, 20.0)], rgb(0xb6, 0xe6, 0xf5)),
+                ([(9.0, 20.0), (32.0, 33.0), (32.0, 58.0), (9.0, 45.0)], rgb(0x55, 0xb6, 0xdc)),
+                ([(32.0, 33.0), (55.0, 20.0), (55.0, 45.0), (32.0, 58.0)], rgb(0x27, 0x79, 0xa7)),
+            ] {
+                p.add(Shape::convex_polygon(face.iter().map(|&(x, y)| g(x, y)).collect(), fill, s));
             }
         }
-        Icon::Marquee => {
-            for (x, y) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
-                line((x * 0.85, y * 0.85), (x * 0.4, y * 0.85));
-                line((x * 0.85, y * 0.85), (x * 0.85, y * 0.4));
+        Icon::Geo => {
+            // A sphere behind a shaded cube, drawn on a 64-unit grid.
+            let g = |x: f32, y: f32| at((x - 32.0) / 26.0, (y - 32.0) / 26.0);
+            let rgb = egui::Color32::from_rgb;
+            p.circle(g(39.0, 25.0), 17.0 / 26.0 * r, rgb(0xa5, 0xda, 0xe9), s);
+            for (face, fill) in [
+                ([(7.0, 30.0), (24.0, 21.0), (41.0, 30.0), (24.0, 39.0)], rgb(0x80, 0xc8, 0xe6)),
+                ([(7.0, 30.0), (24.0, 39.0), (24.0, 56.0), (7.0, 47.0)], rgb(0x43, 0x9a, 0xc6)),
+                ([(24.0, 39.0), (41.0, 30.0), (41.0, 47.0), (24.0, 56.0)], rgb(0x27, 0x77, 0xa6)),
+            ] {
+                p.add(Shape::convex_polygon(face.iter().map(|&(x, y)| g(x, y)).collect(), fill, s));
             }
         }
-        Icon::Wand => {
-            p.line_segment([at(-0.9, 0.9), at(0.3, -0.3)], Stroke::new(2.0, col));
-            for (x, y) in [(0.55, -0.85), (0.85, -0.55), (0.2, -0.85), (0.85, -0.2)] {
-                p.circle_filled(at(x, y), 1.2, col);
+        Icon::Shader => {
+            // A shaded cube with a sparkle, drawn on a 64-unit grid.
+            let g = |x: f32, y: f32| at((x - 32.0) / 26.0, (y - 32.0) / 26.0);
+            let rgb = egui::Color32::from_rgb;
+            for (face, fill) in [
+                ([(29.0, 12.0), (49.0, 23.0), (29.0, 34.0), (9.0, 23.0)], rgb(0xc5, 0xea, 0xf5)),
+                ([(9.0, 23.0), (29.0, 34.0), (29.0, 55.0), (9.0, 44.0)], rgb(0x65, 0xba, 0xdd)),
+                ([(29.0, 34.0), (49.0, 23.0), (49.0, 44.0), (29.0, 55.0)], rgb(0x27, 0x79, 0xa7)),
+            ] {
+                p.add(Shape::convex_polygon(face.iter().map(|&(x, y)| g(x, y)).collect(), fill, s));
+            }
+            let spark: Vec<_> = [(47.0, 5.0), (49.0, 12.0), (56.0, 14.0), (49.0, 16.0), (47.0, 23.0), (45.0, 16.0), (38.0, 14.0), (45.0, 12.0)].iter().map(|&(x, y)| g(x, y)).collect();
+            let mid = g(47.0, 14.0);
+            for k in 0..spark.len() {
+                p.add(Shape::convex_polygon(vec![mid, spark[k], spark[(k + 1) % spark.len()]], rgb(0xff, 0xe5, 0x9a), Stroke::NONE));
+            }
+            p.add(Shape::closed_line(spark, Stroke::new(1.0, rgb(0xda, 0xae, 0x46))));
+        }
+        Icon::Pattern => {
+            // A dashed frame round a 3x3 grid of dots, drawn on a 64-unit grid.
+            let g = |x: f32, y: f32| at((x - 32.0) / 26.0, (y - 32.0) / 26.0);
+            let frame = vec![g(9.0, 14.0), g(55.0, 14.0), g(55.0, 50.0), g(9.0, 50.0), g(9.0, 14.0)];
+            p.extend(Shape::dashed_line(&frame, Stroke::new(1.2, col.gamma_multiply(0.7)), 2.5, 1.5));
+            for (j, y) in [21.0, 32.0, 43.0].into_iter().enumerate() {
+                for (i, x) in [18.0, 32.0, 46.0].into_iter().enumerate() {
+                    let fill = if (i + j) % 2 == 0 { egui::Color32::from_rgb(0x55, 0xb4, 0xda) } else { egui::Color32::from_rgb(0xa3, 0xde, 0xef) };
+                    p.circle_filled(g(x, y), 3.5 / 26.0 * r, fill);
+                }
             }
         }
-        Icon::Dropper => {
-            p.line_segment([at(-0.85, 0.85), at(0.2, -0.2)], Stroke::new(2.5, col));
-            p.circle_filled(at(0.45, -0.45), r * 0.4, col);
+        Icon::Face => {
+            // A cube with its left face filled, drawn on a 64-unit grid.
+            let g = |x: f32, y: f32| at((x - 32.0) / 26.0, (y - 32.0) / 26.0);
+            let blue = egui::Color32::from_rgb(0x51, 0xb4, 0xdd);
+            p.add(Shape::convex_polygon(vec![g(9.0, 18.0), g(32.0, 31.0), g(32.0, 58.0), g(9.0, 44.0)], blue, Stroke::new(1.0, blue)));
+            p.add(Shape::closed_line(vec![g(32.0, 6.0), g(55.0, 18.0), g(32.0, 31.0), g(9.0, 18.0)], s));
+            p.add(Shape::closed_line(vec![g(32.0, 31.0), g(55.0, 18.0), g(55.0, 44.0), g(32.0, 58.0)], s));
         }
-        Icon::Trash => {
-            p.add(Shape::convex_polygon(vec![at(-0.6, -0.45), at(0.6, -0.45), at(0.5, 0.95), at(-0.5, 0.95)], col, Stroke::NONE));
-            line((-0.85, -0.7), (0.85, -0.7));
-            line((-0.25, -0.95), (0.25, -0.95));
+        Icon::Box => {
+            // A dashed cube with a faint far edge, drawn on a 64-unit grid.
+            let g = |x: f32, y: f32| at((x - 32.0) / 26.0, (y - 32.0) / 26.0);
+            for path in [
+                vec![g(10.0, 18.0), g(32.0, 7.0), g(54.0, 18.0), g(32.0, 30.0), g(10.0, 18.0)],
+                vec![g(10.0, 18.0), g(10.0, 46.0), g(32.0, 58.0), g(32.0, 30.0)],
+                vec![g(54.0, 18.0), g(54.0, 46.0), g(32.0, 58.0)],
+            ] {
+                p.extend(Shape::dashed_line(&path, s, 2.5, 1.5));
+            }
+            p.add(Shape::line(vec![g(10.0, 46.0), g(32.0, 35.0), g(54.0, 46.0)], Stroke::new(1.5, col.gamma_multiply(0.45))));
         }
-        Icon::Bucket => {
-            p.add(Shape::closed_line(vec![at(-0.2, -0.95), at(0.6, -0.15), at(0.0, 0.45), at(-0.8, -0.35)], s));
-            p.add(Shape::convex_polygon(vec![at(-0.8, -0.35), at(0.6, -0.15), at(0.0, 0.45)], col, Stroke::NONE));
-            p.circle_filled(at(0.75, 0.6), r * 0.25, col);
-        }
+        // Drawn from pictures; see `Icon::png`.
+        Icon::Move | Icon::Marquee | Icon::Region | Icon::Pick | Icon::RegionRemove | Icon::RegionReplace => {}
         Icon::Mirror => {
             line((0.0, -0.9), (0.0, 0.9));
             p.add(Shape::convex_polygon(vec![at(-0.9, -0.5), at(-0.25, 0.0), at(-0.9, 0.5)], col, Stroke::NONE));
@@ -1450,9 +1508,48 @@ fn paint_icon(p: &egui::Painter, c: egui::Pos2, r: f32, col: egui::Color32, icon
 fn icon_button(ui: &mut Ui, size: egui::Vec2, selected: bool, icon: Icon, hint: &str) -> egui::Response {
     let b = ui.add_sized(size, egui::Button::selectable(selected, "")).on_hover_text(hint);
     let col = ui.style().interact_selectable(&b, selected).fg_stroke.color;
-    let r = (size.y * 0.32).min(size.x * 0.32);
-    paint_icon(ui.painter(), b.rect.center(), r, col, icon);
+    let r = (size.y * 0.4).min(size.x * 0.4);
+    match icon.png() {
+        Some((name, bytes)) => {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            let at = egui::Rect::from_center_size(b.rect.center(), egui::Vec2::splat(r * 2.6));
+            ui.painter().image(icon_texture(ui.ctx(), name, bytes).id(), at, uv, egui::Color32::WHITE);
+        }
+        None => paint_icon(ui.painter(), b.rect.center(), r, col, icon),
+    }
     b
+}
+
+impl Icon {
+    /// The bundled picture for icons drawn from one.
+    fn png(self) -> Option<(&'static str, &'static [u8])> {
+        Some(match self {
+            Icon::Move => ("icon:move", include_bytes!("../assets/icons/move.png")),
+            Icon::Marquee => ("icon:marquee", include_bytes!("../assets/icons/marquee.png")),
+            Icon::Region => ("icon:region", include_bytes!("../assets/icons/region.png")),
+            Icon::Pick => ("icon:pick", include_bytes!("../assets/icons/pick.png")),
+            Icon::RegionRemove => ("icon:region_remove", include_bytes!("../assets/icons/region_remove.png")),
+            Icon::RegionReplace => ("icon:region_replace", include_bytes!("../assets/icons/region_replace.png")),
+            _ => return None,
+        })
+    }
+}
+
+/// The texture for a bundled icon picture, decoded on first use.
+fn icon_texture(ctx: &egui::Context, name: &'static str, bytes: &[u8]) -> egui::TextureHandle {
+    let id = egui::Id::unique(name);
+    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return t;
+    }
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+    let mut reader = dec.read_info().expect("bundled icon");
+    let mut buf = vec![0; reader.output_buffer_size().expect("bundled icon")];
+    let info = reader.next_frame(&mut buf).expect("bundled icon");
+    let image = egui::ColorImage::from_rgba_unmultiplied([info.width as usize, info.height as usize], &buf[..info.buffer_size()]);
+    let t = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, t.clone()));
+    t
 }
 
 /// A selectable icon cell: `v` becomes `val` when clicked.
@@ -1471,17 +1568,17 @@ fn brush_grids(ui: &mut Ui, e: &mut Editor) {
         });
     };
     grid(ui, "modes", &mut |ui| {
-        let s = cell_size(ui, 3.0, 22.0);
+        let s = cell_size(ui, 3.0, 36.0);
         let b = &mut e.brush;
         ui.horizontal(|ui| {
-            icon_cell(ui, s, b, Brush::Geo, Icon::Dot, "Geometry mode [L]: line, square, circle");
-            cell(ui, s, b, Brush::Code, "</>", "Voxel shader mode [C]");
-            icon_cell(ui, s, b, Brush::Pattern, Icon::Star, "Pattern mode [P] : Rot [-/+/0/9] : Move [Dir/Page/Home]");
+            icon_cell(ui, s, b, Brush::Geo, Icon::Geo, "Geometry mode [L]: line, square, circle");
+            icon_cell(ui, s, b, Brush::Code, Icon::Shader, "Voxel shader mode [C]");
+            icon_cell(ui, s, b, Brush::Pattern, Icon::Pattern, "Pattern mode [P] : Rot [-/+/0/9] : Move [Dir/Page/Home]");
         });
         ui.horizontal(|ui| {
-            icon_cell(ui, s, b, Brush::Voxel, Icon::Square, "Voxel mode [V] : Resize [-/+/Ctrl+Alt+Drag]");
-            icon_cell(ui, s, b, Brush::Face, Icon::Extrude, "Face mode [F] : Extrude [Drag]");
-            icon_cell(ui, s, b, Brush::Box, Icon::Cube, "Box mode [B]");
+            icon_cell(ui, s, b, Brush::Voxel, Icon::Voxel, "Voxel mode [V] : Resize [-/+/Ctrl+Alt+Drag]");
+            icon_cell(ui, s, b, Brush::Face, Icon::Face, "Face mode [F] : Extrude [Drag]");
+            icon_cell(ui, s, b, Brush::Box, Icon::Box, "Box mode [B]");
         });
     });
     grid(ui, "tools", &mut |ui| {
@@ -1492,17 +1589,17 @@ fn brush_grids(ui: &mut Ui, e: &mut Editor) {
         cell(ui, s, t, Tool::Paint, "Paint", "Paint [G]");
     });
     grid(ui, "select_tools", &mut |ui| {
-        let s = cell_size(ui, 3.0, 22.0);
+        let s = cell_size(ui, 3.0, 30.0);
         let t = &mut e.tool;
         ui.horizontal(|ui| {
             icon_cell(ui, s, t, Tool::Move, Icon::Move, "Transform: move, scale, wrap or rotate the selection, or the model");
             icon_cell(ui, s, t, Tool::Marquee, Icon::Marquee, "Marquee select [M] : Add [Shift] : Remove [Shift+Alt]");
-            icon_cell(ui, s, t, Tool::Region, Icon::Wand, "Region select [N] : Add [Shift] : Remove [Shift+Alt]");
+            icon_cell(ui, s, t, Tool::Region, Icon::Region, "Region select [N] : Add [Shift] : Remove [Shift+Alt]");
         });
         ui.horizontal(|ui| {
-            icon_cell(ui, s, t, Tool::Pick, Icon::Dropper, "Pick voxel color [Alt+LButton]");
-            icon_cell(ui, s, t, Tool::RegionRemove, Icon::Trash, "Region remove");
-            icon_cell(ui, s, t, Tool::RegionReplace, Icon::Bucket, "Region replace with the current color");
+            icon_cell(ui, s, t, Tool::Pick, Icon::Pick, "Pick voxel color [Alt+LButton]");
+            icon_cell(ui, s, t, Tool::RegionRemove, Icon::RegionRemove, "Region remove");
+            icon_cell(ui, s, t, Tool::RegionReplace, Icon::RegionReplace, "Region replace with the current color");
         });
     });
     grid(ui, "mirror_axis", &mut |ui| {
@@ -1636,7 +1733,7 @@ fn brush_options(ui: &mut Ui, e: &mut Editor, cmds: &mut Vec<Command>) {
         }),
         Brush::Geo => brush_section(ui, "Geometry", |_| {}, |ui| {
             choice_box(ui, |ui| {
-                let s = cell_size(ui, 3.0, 22.0);
+                let s = cell_size(ui, 3.0, 30.0);
                 ui.horizontal(|ui| {
                     icon_cell(ui, s, &mut o.geo, GeoShape::Line, Icon::Line, "Line");
                     icon_cell(ui, s, &mut o.geo, GeoShape::Square, Icon::Square, "Square");
