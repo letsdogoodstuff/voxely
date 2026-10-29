@@ -149,6 +149,53 @@ pub enum Command {
     Quit,
     /// The answer to "Save changes?" before a command that drops them.
     Unsaved(UnsavedChoice),
+    // The command palette reaches what is otherwise only a panel click or
+    // a hotkey.
+    SetBrush(crate::edit::Brush),
+    SetTool(crate::edit::Tool),
+    /// Mirror drawing across this axis, on or off [F5/F6/F7].
+    ToggleMirror(usize),
+    ToggleDisplay(Display),
+    SetView(View),
+    /// Model <-> Render [F1].
+    ToggleRender,
+    TogglePanel(Panel),
+    /// Interface scale: +1 bigger, -1 smaller, 0 back to 100%.
+    UiScale(i32),
+    /// Play or pause the animation [/].
+    TogglePlay,
+    /// Open or close the command palette [Ctrl+K].
+    CommandPalette,
+}
+
+/// The modeler's display toggles (the bottom bar's BO / Edge / Grid ...).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Display {
+    Others,
+    Edge,
+    Grid,
+    Frame,
+    Ao,
+    Shadow,
+    Wire,
+    CanvasBox,
+}
+
+/// The bottom bar's camera modes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum View {
+    Perspective,
+    Free,
+    Orthographic,
+    Isometric,
+}
+
+/// Panels and windows that open and close.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Panel {
+    Timeline,
+    Agents,
+    PaletteLibrary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -617,6 +664,7 @@ pub fn top_bar(ui: &mut Ui, modeling: &mut bool, name: &str, history: (bool, boo
         ui.label(egui::RichText::new(name).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             command(ui, cmds, "Preferences", "Preferences [Ctrl+,]", Command::Preferences);
+            command(ui, cmds, "Commands", "Search and run any command [Ctrl+K]", Command::CommandPalette);
             ui.separator();
             command(ui, cmds, "Save As", "Save as [Ctrl+Shift+S]", Command::SaveAs);
             command(ui, cmds, "Save", "Save [Ctrl+S]", Command::Save);

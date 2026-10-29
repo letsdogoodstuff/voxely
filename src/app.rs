@@ -95,6 +95,7 @@ pub struct EditState {
     pub confirm_delete: Option<PathBuf>,
     /// What the last action did, or why it failed (the status bar).
     pub notice: Option<Notice>,
+    pub command_palette: crate::command_palette::CommandPalette,
     /// Unsaved changes since the last save or open.
     pub dirty: Dirty,
     /// A command that would drop unsaved changes, waiting for Save /
@@ -216,6 +217,7 @@ impl EditState {
             image: ui::ImageSettings::default(),
             export_status: None,
             agent: crate::agents::AgentState::default(),
+            command_palette: Default::default(),
             prefs: crate::prefs::Prefs::default(),
             prefs_open: false,
             ui_scale: 1.0,
@@ -1701,6 +1703,76 @@ pub fn run_command(cmd: Command, r: &mut Renderer, scene: &mut Scene, ed: &mut E
             }
             false
         }
+        Command::SetBrush(b) => {
+            ed.editor.brush = b;
+            false
+        }
+        Command::SetTool(t) => {
+            ed.editor.tool = t;
+            false
+        }
+        Command::ToggleMirror(axis) => {
+            ed.editor.mirror[axis] ^= true;
+            false
+        }
+        Command::ToggleDisplay(d) => {
+            use ui::Display;
+            if let Some(m) = r.modeler.as_mut() {
+                let o = &mut m.options;
+                match d {
+                    Display::Others => o.others ^= true,
+                    Display::Edge => o.edge ^= true,
+                    Display::Grid => o.grid ^= true,
+                    Display::Frame => o.frame ^= true,
+                    Display::Ao => o.ao ^= true,
+                    Display::Shadow => o.shadow ^= true,
+                    Display::Wire => o.wire ^= true,
+                    Display::CanvasBox => o.canvas_box ^= true,
+                }
+            }
+            false
+        }
+        Command::SetView(v) => {
+            use ui::View;
+            match v {
+                View::Perspective | View::Free => {
+                    r.settings.projection = Projection::Perspective;
+                    ed.free_look = v == View::Free;
+                }
+                View::Orthographic => r.settings.projection = Projection::Orthographic,
+                View::Isometric => iso_camera(r),
+            }
+            r.reset();
+            false
+        }
+        Command::ToggleRender => {
+            r.modeling ^= true;
+            ed.enabled = r.modeling;
+            r.reset();
+            false
+        }
+        Command::TogglePanel(p) => {
+            use ui::Panel;
+            match p {
+                Panel::Timeline => ed.timeline.open ^= true,
+                Panel::Agents => ed.agent.open ^= true,
+                Panel::PaletteLibrary => ed.palette.library_open ^= true,
+            }
+            false
+        }
+        Command::UiScale(dir) => {
+            ed.prefs.step_scale(dir);
+            ed.prefs.save();
+            false
+        }
+        Command::TogglePlay => {
+            ed.timeline.play(!ed.timeline.playing);
+            false
+        }
+        Command::CommandPalette => {
+            ed.command_palette.toggle();
+            false
+        }
     };
     if changed {
         sync_volume(r, scene, &mut ed.editor);
@@ -1983,6 +2055,9 @@ pub fn build_ui(
             egui::Panel::bottom("agents").resizable(true).default_size(190.0).show(ui, |ui| crate::agents::panel(ui, &mut ed.agent));
         }
     }
+    // The command palette, over everything, panels hidden or not.
+    let entries = crate::command_palette::entries(r, scene, ed);
+    crate::command_palette::show(ui.ctx(), &mut ed.command_palette, entries, cmds);
     // Autosave shows what's in use (an agent may have changed it).
     let mut autosave = ed.tools.inspect.autosave_config();
     if ui::preferences_window(ui.ctx(), &mut ed.prefs_open, &mut ed.prefs, ed.ui_scale, &mut autosave) {

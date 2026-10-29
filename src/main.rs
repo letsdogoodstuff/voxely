@@ -3,6 +3,7 @@ mod agents;
 mod anim;
 mod app;
 mod backdrop;
+mod command_palette;
 mod control;
 mod edit;
 mod env;
@@ -90,6 +91,7 @@ editor controls (MagicaVoxel layout; Cmd works for Ctrl on macOS):
   Ctrl+Z undo  Ctrl+Y redo         Ctrl+S save  Ctrl+Shift+S save as
   Ctrl+O open  Ctrl+P new          Ctrl+G grid  Ctrl+F frame  Ctrl+E edges
   F1 model/render                  Ctrl+Tab  hide panels
+  Ctrl+K command palette: search every command, project and export
   Ctrl+B other models  Ctrl+W shadow  Ctrl+M model boxes (World)
   Ctrl+, preferences               Ctrl+= / Ctrl+- / Ctrl+0  interface scale
   arrows sun angle                 6  save a PNG snapshot to export/
