@@ -9,6 +9,9 @@ cargo build --release
 ./target/release/voxely --help                # all options and controls
 ```
 
+**Ctrl+K** (Cmd+K on macOS) opens the command palette: type a few letters of any command,
+project, sample or export format, arrow to it and press Enter. `voxely --help` lists the hotkeys.
+
 ## Driving voxely from an agent (MCP)
 
 `voxely mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio.
