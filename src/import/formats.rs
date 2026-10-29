@@ -1,6 +1,7 @@
-//! Other voxel formats: Qubicle `.qb`, MagicaVoxel `.xraw`, Ace of Spades
-//! `.vxl`, Build/Voxlap `.kvx`, `.binvox`, and Minecraft `.schematic`
-//! (MCEdit/Schematica) and `.schem` (Sponge v1-v3).
+//! Other voxel files: MagicaVoxel `.vox` (another project, merged in) and
+//! `.xraw`, Qubicle `.qb`, Ace of Spades `.vxl`, Build/Voxlap `.kvx`,
+//! `.binvox`, and Minecraft `.schematic` (MCEdit/Schematica) and `.schem`
+//! (Sponge v1-v3).
 //!
 //! Every reader turns its file's axes into voxely's (z up, a model faces -y)
 //! by a rotation, never a mirror, so models keep their handedness:
@@ -8,7 +9,9 @@
 //! - **qb** is Y-up. Right-handed files (the flag export.rs writes) map qb
 //!   `(x, y, z)` to `(x, sz-1-z, y)`; left-handed ones to `(x, z, y)`.
 //!   Matrix positions map the same way.
-//! - **xraw** is MagicaVoxel's own axes, x fastest.
+//! - **vox** and **xraw** are MagicaVoxel's own axes (xraw x fastest). A vox
+//!   file's visible models come in turned to world orientation, each at its
+//!   place in the file's scene.
 //! - **vxl** and **kvx** have z pointing down and y south: `(x, y, z)` goes to
 //!   `(x, sy-1-y, sz-1-z)` (the same turn export.rs uses for SLAB6).
 //! - **binvox** is Y-up and right-handed, y fastest, then z, then x:
@@ -30,7 +33,7 @@ use glam::IVec3;
 use super::Model;
 
 /// File extensions these readers handle (lowercase, no dot).
-pub const EXTENSIONS: &[&str] = &["qb", "xraw", "vxl", "kvx", "binvox", "schematic", "schem"];
+pub const EXTENSIONS: &[&str] = &["vox", "qb", "xraw", "vxl", "kvx", "binvox", "schematic", "schem"];
 
 /// Largest model accepted per axis.
 const MAX_AXIS: i64 = 4096;
@@ -59,6 +62,7 @@ pub fn load(path: &Path) -> Result<Vec<Model>> {
 /// Same, from bytes (ext without the dot), for tests.
 pub fn parse(ext: &str, bytes: &[u8]) -> Result<Vec<Model>> {
     match ext.to_ascii_lowercase().as_str() {
+        "vox" => vox(bytes),
         "qb" => qb(bytes),
         "xraw" => Ok(vec![xraw(bytes)?]),
         "vxl" => Ok(vec![vxl(bytes)?]),
@@ -138,6 +142,27 @@ fn dims(what: &str, x: i64, y: i64, z: i64) -> Result<IVec3> {
 
 fn to_i32(what: &str, v: i64) -> Result<i32> {
     i32::try_from(v).with_context(|| format!("{what}: position {v} is out of range"))
+}
+
+// ---------------------------------------------------------------- vox
+
+/// Every visible model of a MagicaVoxel file, in world orientation at its
+/// world position, named as in the file. Colors only: materials stay behind.
+fn vox(b: &[u8]) -> Result<Vec<Model>> {
+    let f = crate::vox::VoxFile::parse(b)?;
+    let w = crate::world::World::from_vox(&f);
+    let mut out = Vec::new();
+    for id in w.models() {
+        let Some(c) = w.composite_where(|m| m == id) else { continue };
+        let color = |i: u8| {
+            let [r, g, b, _] = f.palette.get(i as usize).copied().unwrap_or(GRAY);
+            [r, g, b, 255]
+        };
+        let name = w.node(id).map_or(String::new(), |n| n.name.clone());
+        out.push(Model { name, dims: c.volume.dims, offset: c.origin, voxels: c.volume.filled().map(|(p, i)| (p, color(i))).collect() });
+    }
+    ensure!(!out.is_empty(), "no visible models");
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- qb
@@ -1308,6 +1333,43 @@ mod tests {
         assert_eq!(m[0].name, "rt");
         assert_eq!(m[0].dims, s.volume.dims);
         assert_eq!(sorted(m[0].voxels.clone()), scene_voxels(&s));
+    }
+
+    /// A two-model .vox: `a` at the origin, `b` placed up and to the side.
+    fn two_model_vox(dir: &std::path::Path) -> (std::path::PathBuf, Vec<[u8; 4]>) {
+        use crate::scene::Volume;
+        use crate::world::{ROOT, World};
+        let mut w = World::empty();
+        let mut a = Volume::new(IVec3::new(2, 1, 1));
+        a.set(IVec3::new(0, 0, 0), 3);
+        a.set(IVec3::new(1, 0, 0), 3);
+        let mut b = Volume::new(IVec3::new(1, 1, 2));
+        b.set(IVec3::new(0, 0, 1), 7);
+        w.add_model(ROOT, "a", a, IVec3::ZERO);
+        w.add_model(ROOT, "b", b, IVec3::new(5, 2, 4));
+        let pal = crate::vox::default_palette();
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("two.vox");
+        crate::vox::write(&path, &w, &pal, &[], &[], &[]).unwrap();
+        (path, pal)
+    }
+
+    #[test]
+    fn vox_models_come_in_where_the_file_put_them() {
+        let dir = std::env::temp_dir().join(format!("voxely-import-vox-{}", std::process::id()));
+        let (path, pal) = two_model_vox(&dir);
+        let mut models = load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        models.sort_by(|x, y| x.name.cmp(&y.name));
+        let rgb = |i: usize| [pal[i][0], pal[i][1], pal[i][2], 255];
+        assert_eq!(models.len(), 2);
+        let (a, b) = (&models[0], &models[1]);
+        assert_eq!((a.name.as_str(), b.name.as_str()), ("a", "b"));
+        assert_eq!(b.offset - a.offset, IVec3::new(5, 2, 4));
+        assert_eq!(sorted(a.voxels.clone()), vec![([0, 0, 0], rgb(3)), ([1, 0, 0], rgb(3))]);
+        assert_eq!(sorted(b.voxels.clone()), vec![([0, 0, 1], rgb(7))]);
+        assert!(crate::import::is_importable(&path));
+        assert!(parse("vox", b"not a vox file").is_err());
     }
 
     #[test]

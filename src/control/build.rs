@@ -76,15 +76,16 @@ pub fn tools() -> Vec<Value> {
         }), &["name"]),
         tool("list_stamps", "Saved stamps with their sizes and voxel counts.", json!({}), &[]),
         tool("delete_stamp", "Delete a saved stamp.", json!({ "name": { "type": "string" } }), &["name"]),
-        tool("place_stamp", "Place a saved stamp into the part being edited. Only its solid cells are written; empty cells leave what's there. Colors map by RGB to the current palette.", json!({
-            "name": { "type": "string" },
+        tool("place_stamp", "Place a saved stamp, or any .vox file (like the window's Pattern brush), into the part being edited. Only its solid cells are written; empty cells leave what's there. Colors map by RGB to the current palette. A file's visible models are flattened into one stamp, cropped to its voxels; import_file brings a .vox in as separate parts instead.", json!({
+            "name": { "type": "string", "description": "A saved stamp (see list_stamps)" },
+            "path": { "type": "string", "description": "Or a .vox file to stamp, e.g. another project's" },
             "at": xyz("Where the stamp's anchor goes"),
             "anchor": { "type": "string", "enum": ["min", "center", "bottom"], "description": "min (default): its minimum corner; center; bottom: the middle of its bottom (low z) face" },
             "rotate": { "type": ["integer", "array"], "items": { "type": "integer" }, "description": "Counter-clockwise quarter turns: n about z, or [x, y, z] turns applied x then y then z" },
             "flip": { "type": ["string", "array"], "items": axis.clone(), "description": "Axis or axes to mirror the stamp along (before rotating)" },
             "replace": { "type": "object", "description": "Recolor: {\"<stamp color index>\": color, ...}" },
             "color": color_schema(),
-        }), &["name", "at"]),
+        }), &["at"]),
     ]
 }
 
@@ -702,8 +703,10 @@ pub fn write_stamp(path: &std::path::Path, v: &Volume, palette: &[[u8; 4]]) -> R
 pub fn read_stamp(path: &std::path::Path) -> Result<(Volume, Vec<[u8; 4]>)> {
     let f = crate::vox::VoxFile::load(path)?;
     let w = crate::world::World::from_vox(&f);
-    let id = *w.models().first().context("the stamp file has no model")?;
-    let (v, _) = w.checkout(id).context("the stamp file has no model")?;
+    // Any .vox can be a stamp: its visible models flattened into one,
+    // cropped to its voxels.
+    let c = w.composite(None).context("the file has no visible model")?;
+    let v = crate::ops::fit(&c.volume).context("the file has no voxels")?;
     Ok((v, f.palette))
 }
 
@@ -824,11 +827,24 @@ pub fn orient(v: &Volume, flips: &[usize], rot: crate::world::Rot) -> (Vec<(IVec
 }
 
 fn place_stamp(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
-    let name = stamp_name(a)?;
-    let path = stamp_path(&name);
-    if !path.exists() {
-        bail!("no stamp named {name:?}; see list_stamps");
-    }
+    let (name, path) = match string(a, "path") {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            if !path.is_file() {
+                bail!("no file at {}", path.display());
+            }
+            (path.file_stem().map_or(String::new(), |n| n.to_string_lossy().into_owned()), path)
+        }
+        None if get(a, "name").is_none() => bail!("give a stamp `name` or a .vox `path`"),
+        None => {
+            let name = stamp_name(a)?;
+            let path = stamp_path(&name);
+            if !path.exists() {
+                bail!("no stamp named {name:?}; see list_stamps");
+            }
+            (name, path)
+        }
+    };
     let (v, pal) = read_stamp(&path)?;
     let at = ivec3(a, "at")?;
     let flips = axes_arg(get(a, "flip"))?;
@@ -1012,6 +1028,28 @@ mod tests {
         let hole = vec![Vec2::new(1.0, 1.0), Vec2::new(2.0, 1.0), Vec2::new(2.0, 2.0), Vec2::new(1.0, 2.0)];
         let h = extrude_volume(&v, 2, &l, &[hole], 0, 0, 1, false);
         assert_eq!(n(&h), 75 - 4);
+    }
+
+    #[test]
+    fn any_vox_file_stamps_as_one_cropped_model() {
+        use crate::world::{ROOT, World};
+        let dir = std::env::temp_dir().join(format!("voxely-stamp-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scene.vox");
+        // Two models with empty margins, 4 apart on x.
+        let mut a = Volume::new(IVec3::new(4, 4, 4));
+        a.set(IVec3::new(1, 1, 0), 2);
+        let mut b = Volume::new(IVec3::new(4, 4, 4));
+        b.set(IVec3::new(1, 1, 0), 5);
+        let mut w = World::empty();
+        w.add_model(ROOT, "a", a, IVec3::ZERO);
+        w.add_model(ROOT, "b", b, IVec3::new(4, 0, 0));
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[], &[]).unwrap();
+        let (v, _) = read_stamp(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(v.dims, IVec3::new(5, 1, 1));
+        assert_eq!(v.get(IVec3::new(0, 0, 0)), 2);
+        assert_eq!(v.get(IVec3::new(4, 0, 0)), 5);
     }
 
     #[test]
