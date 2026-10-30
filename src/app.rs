@@ -1850,6 +1850,24 @@ fn outline(p: &egui::Painter, r: &Renderer, ppp: f32, lo: Vec3, hi: Vec3, stroke
     }
 }
 
+/// MagicaVoxel's cursor marker: the face under the mouse filled red, with
+/// every tool and brush.
+fn hover_marker(p: &egui::Painter, r: &Renderer, ppp: f32, h: edit::Pick) {
+    let (axis, coord) = h.plane();
+    let (u, w) = ((axis + 1) % 3, (axis + 2) % 3);
+    let corner = |a: f32, b: f32| {
+        let mut q = h.cell.as_vec3();
+        q[axis] = coord;
+        q[u] += a;
+        q[w] += b;
+        r.project(q).map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+    };
+    let pts: Option<Vec<egui::Pos2>> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].into_iter().map(|(a, b)| corner(a, b)).collect();
+    if let Some(pts) = pts {
+        p.add(egui::Shape::convex_polygon(pts, egui::Color32::from_rgb(255, 0, 0), egui::Stroke::NONE));
+    }
+}
+
 /// World mode: the picked models' boxes in white, plus, with `layers` on
 /// (MagicaVoxel's wireframes [WR], off by default), each shown model's box in
 /// its layer's color. None while editing.
@@ -1908,8 +1926,12 @@ fn draw_overlay(p: &egui::Painter, r: &Renderer, scene: &Scene, ed: &EditState, 
             return;
         }
     }
+    if let Some(h) = ed.hover {
+        hover_marker(p, r, ppp, h);
+    }
     let cells = ed.editor.preview(&scene.volume, ed.hover);
-    if cells.is_empty() {
+    // A single cell is the one at the cursor, which the marker shows.
+    if cells.len() <= 1 {
         return;
     }
     let color = match ed.editor.tool {

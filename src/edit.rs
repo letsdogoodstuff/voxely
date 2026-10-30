@@ -1406,8 +1406,10 @@ impl Editor {
                 let cells = self.pattern_cells(t, hit.normal);
                 self.apply_colored(v, &cells)
             }
+            // Like MagicaVoxel, the shape draws as it is dragged.
+            Brush::Geo => self.redraw_geo(v),
             // Applied on release; the overlay shows the preview meanwhile.
-            Brush::Box | Brush::Geo | Brush::Code => false,
+            Brush::Box | Brush::Code => false,
         }
     }
 
@@ -1454,8 +1456,23 @@ impl Editor {
         match self.brush {
             // Fill the gap from the previous cell so fast drags stay connected.
             Brush::Voxel if marquee.is_none() => self.apply(v, &line(prev, cell)),
+            Brush::Geo if marquee.is_none() => self.redraw_geo(v),
             _ => false,
         }
+    }
+
+    /// Geometry brush: redo the stroke from the volume before it with the
+    /// shape out to the current cell.
+    fn redraw_geo(&mut self, v: &mut Volume) -> bool {
+        let s = self.stroke.as_mut().unwrap();
+        let undone = !s.changes.is_empty();
+        for (i, (before, _)) in s.changes.drain() {
+            v.set_index(i, before);
+        }
+        let cells = self.geo_cells(v, self.stroke.as_ref().unwrap());
+        let changed = self.apply(v, &cells);
+        v.refresh_bricks();
+        undone || changed
     }
 
     /// Face brush drag: attach (or erase) as many layers of the region as
@@ -1502,7 +1519,7 @@ impl Editor {
             x.drag = None;
             return false;
         }
-        let pending = self.stroke.as_ref().map(|s| self.pending_cells(v, s));
+        let pending = self.stroke.as_ref().map(|s| self.pending_cells(s));
         let code = self.code.take().filter(|_| self.brush == Brush::Code);
         let changed = match pending {
             Some(cells) if !cells.is_empty() => {
@@ -1541,13 +1558,12 @@ impl Editor {
     }
 
     /// Cells a drag-and-release brush will fill when released.
-    fn pending_cells(&self, v: &Volume, s: &Stroke) -> Vec<IVec3> {
+    fn pending_cells(&self, s: &Stroke) -> Vec<IVec3> {
         if self.tool == Tool::Marquee {
             return if self.opts.marquee == MarqueeMode::Box { cuboid(s.anchor, s.current) } else { Vec::new() };
         }
         match self.brush {
             Brush::Box | Brush::Code => cuboid(s.anchor, s.current),
-            Brush::Geo => self.geo_cells(v, s),
             _ => Vec::new(),
         }
     }
@@ -1657,7 +1673,7 @@ impl Editor {
         let normal = hover.map_or(IVec3::Z, |h| h.normal);
         let cells: Vec<IVec3> = match (&self.stroke, self.tool) {
             (Some(s), _) => {
-                let pending = self.pending_cells(v, s);
+                let pending = self.pending_cells(s);
                 if pending.is_empty() {
                     return Vec::new();
                 }
@@ -1671,10 +1687,9 @@ impl Editor {
             // MagicaVoxel only the voxel under the cursor is outlined.
             (None, Tool::Region | Tool::RegionRemove | Tool::RegionReplace) => hover.filter(|h| !h.on_ground()).map(|h| h.cell).into_iter().collect(),
             (None, _) => match (self.brush, hover) {
-                // Erase and Paint outline just the voxel under the cursor;
-                // Attach shows the whole layer it will add.
-                (Brush::Face, Some(h)) if self.tool != Tool::Attach => target(self.tool, h).into_iter().collect(),
-                (Brush::Face, Some(h)) => self.face_cells(v, h).into_iter().map(|(c, _)| c).collect(),
+                // Like MagicaVoxel, only the red cursor marker, not the
+                // whole face.
+                (Brush::Face, Some(_)) => return Vec::new(),
                 // Attach shows the pattern itself instead (see `ghost`).
                 (Brush::Pattern, Some(_)) if self.tool == Tool::Attach => return Vec::new(),
                 (Brush::Pattern, Some(h)) => {
@@ -1920,6 +1935,28 @@ mod tests {
             e.end(&mut v);
             assert_eq!(count(&v, 4), expect, "{shape:?} fill {fill}");
         }
+    }
+
+    #[test]
+    fn geo_line_draws_while_dragging() {
+        let mut e = Editor::new(4);
+        e.brush = Brush::Geo;
+        let mut v = Volume::new(IVec3::splat(24));
+        let (ro, down) = (Vec3::new(2.5, 2.5, 30.0), Vec3::NEG_Z);
+        let hit = pick(&v, ro, down).unwrap();
+        e.begin(&mut v, hit, ro, down);
+        assert_eq!(count(&v, 4), 1);
+        // Out to x 8, then back to x 5: the line follows, before release.
+        let ro2 = Vec3::new(8.5, 2.5, 30.0);
+        assert!(e.drag(&mut v, ro2, down, None));
+        assert_eq!(count(&v, 4), 7);
+        let ro2 = Vec3::new(5.5, 2.5, 30.0);
+        assert!(e.drag(&mut v, ro2, down, None));
+        assert_eq!((count(&v, 4), v.get(IVec3::new(7, 2, 0))), (4, 0));
+        e.end(&mut v);
+        assert_eq!(count(&v, 4), 4);
+        assert!(e.undo(&mut v));
+        assert_eq!(count(&v, 4), 0);
     }
 
     /// Geo shape cell count for a drag of (dx, dy) on the floor.
