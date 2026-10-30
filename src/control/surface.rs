@@ -487,7 +487,7 @@ fn direction(name: &str) -> Result<Vec<IVec3>> {
         "-y" | "south" | "front" => vec![IVec3::NEG_Y],
         "sides" | "side" => vec![IVec3::X, IVec3::NEG_X, IVec3::Y, IVec3::NEG_Y],
         "all" | "any" => NEIGHBORS.to_vec(),
-        d => bail!("unknown direction {d:?}"),
+        d => bail!("unknown direction {d:?}; use +x, -x, +y, -y, +z, -z (or right, left, back, front, up, down), sides or all"),
     })
 }
 

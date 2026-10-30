@@ -301,7 +301,7 @@ pub fn run(args: &[String]) -> Result<()> {
         let result = match method {
             "initialize" => Ok(json!({
                 "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
-                "capabilities": { "tools": { "listChanged": false }, "prompts": { "listChanged": false } },
+                "capabilities": { "tools": { "listChanged": false }, "prompts": { "listChanged": false }, "resources": { "listChanged": false } },
                 "serverInfo": { "name": "voxely", "version": env!("CARGO_PKG_VERSION") },
                 "instructions": control::INSTRUCTIONS,
             })),
@@ -312,6 +312,14 @@ pub fn run(args: &[String]) -> Result<()> {
                 Ok(json!({ "tools": tools }))
             }
             "prompts/list" => Ok(control::guide::prompts()),
+            "resources/list" => Ok(backend.resources()),
+            "resources/templates/list" => Ok(json!({ "resourceTemplates": [{
+                "uriTemplate": "voxely://part/{name}",
+                "name": "part",
+                "title": "voxely part",
+                "description": "A part (or group) of the open scene: its place, size and voxel count, and a picture of it from four sides",
+            }] })),
+            "resources/read" => backend.read_resource(params.get("uri").and_then(Value::as_str).unwrap_or("")).map_err(|e| json!({ "code": -32002, "message": e })),
             "prompts/get" => control::guide::prompt(&params).map_err(|e| json!({ "code": -32602, "message": e.to_string() })),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
@@ -377,6 +385,60 @@ impl Backend {
         }
     }
 
+    /// Every part and group of the open scene, and the scene itself, as
+    /// resources a user can attach to a message (@-mention).
+    fn resources(&mut self) -> Value {
+        let mut list = vec![json!({ "uri": "voxely://scene", "name": "scene", "title": "voxely scene", "description": "The open scene: size, colors, camera, and a health check (stray pieces, overlaps, ground)", "mimeType": "application/json" })];
+        let parts = self.call("list_parts", &json!({}));
+        let tree: Value = parts["content"][0]["text"].as_str().and_then(|t| serde_json::from_str(t).ok()).unwrap_or(Value::Null);
+        fn walk(nodes: &Value, out: &mut Vec<Value>) {
+            for n in nodes.as_array().into_iter().flatten() {
+                let Some(name) = n["name"].as_str() else { continue };
+                let what = if n["kind"] == "group" { "group".to_string() } else { format!("part, {} voxels", n["voxels"]) };
+                out.push(json!({
+                    "uri": format!("voxely://part/{}", uri_escape(name)),
+                    "name": name,
+                    "description": format!("{what}, size {}, at {}", n["size"], n["position"]),
+                    "mimeType": "application/json",
+                }));
+                walk(&n["children"], out);
+            }
+        }
+        walk(&tree["parts"], &mut list);
+        json!({ "resources": list })
+    }
+
+    fn read_resource(&mut self, uri: &str) -> Result<Value, String> {
+        let text_of = |r: &Value| -> Result<String, String> {
+            let t = r["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n");
+            if r["isError"].as_bool() == Some(true) { Err(t) } else { Ok(t) }
+        };
+        if uri == "voxely://scene" {
+            let info = text_of(&self.call("get_scene_info", &json!({ "health": true })))?;
+            return Ok(json!({ "contents": [{ "uri": uri, "mimeType": "application/json", "text": info }] }));
+        }
+        let Some(name) = uri.strip_prefix("voxely://part/").map(uri_unescape) else {
+            return Err(format!("unknown resource {uri}; voxely has voxely://scene and voxely://part/{{name}}"));
+        };
+        let parts = self.call("list_parts", &json!({}));
+        let tree: Value = serde_json::from_str(&text_of(&parts)?).map_err(|e| e.to_string())?;
+        fn find(nodes: &Value, name: &str) -> Option<Value> {
+            nodes.as_array()?.iter().find_map(|n| if n["name"].as_str().is_some_and(|m| m.eq_ignore_ascii_case(name)) { Some(n.clone()) } else { find(&n["children"], name) })
+        }
+        let node = find(&tree["parts"], &name).ok_or_else(|| format!("no part named `{name}` in the open scene"))?;
+        let mut contents = vec![json!({ "uri": uri, "mimeType": "application/json", "text": node.to_string() })];
+        // A picture of it from four sides, framed on it, the rest of the scene around it.
+        let shot = self.call("screenshot", &json!({ "views": "quad", "scope": "scene", "focus": name, "max_size": 640 }));
+        for c in shot["content"].as_array().into_iter().flatten() {
+            match c["type"].as_str() {
+                Some("image") => contents.push(json!({ "uri": format!("{uri}#quad"), "mimeType": "image/png", "blob": c["data"] })),
+                Some("text") => contents.push(json!({ "uri": format!("{uri}#views"), "mimeType": "text/plain", "text": c["text"] })),
+                _ => {}
+            }
+        }
+        Ok(json!({ "contents": contents }))
+    }
+
     /// Poll a background render (`r` says which) until it finishes or the
     /// call's `wait` runs out, reporting samples traced. The window answers
     /// each poll at once, so it stays usable all the while.
@@ -401,6 +463,30 @@ impl Backend {
         }
         r
     }
+}
+
+/// Percent-encode a part name for a resource URI.
+fn uri_escape(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+fn uri_unescape(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(v)) => {
+                out.push(v);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn reply(out: &mut std::io::Stdout, v: Value) -> Result<()> {

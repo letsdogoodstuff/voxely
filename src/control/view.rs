@@ -133,7 +133,7 @@ fn parse_views(v: Option<&Value>) -> Result<Vec<View>> {
             "quad" => vec![View::Front, View::Right, View::Top, View::ThreeQuarter],
             "turnaround" => vec![View::Front, View::Right, View::Back, View::Left],
             "all" => vec![View::Front, View::Back, View::Left, View::Right, View::Top, View::Iso],
-            _ => vec![View::parse(s).ok_or_else(|| anyhow::anyhow!("unknown view {s:?}"))?],
+            _ => vec![View::parse(s).ok_or_else(|| anyhow::anyhow!("unknown view {s:?}; use single, quad, all, turnaround, current, front, back, left, right, top, bottom, iso, 3/4, or an [x, y, z] direction"))?],
         })
     };
     match v {
@@ -373,8 +373,20 @@ fn parse_focus(ctx: &Ctx, a: &Value, world0: IVec3, offset: IVec3) -> Result<Opt
         None | Some(Value::Null) => return Ok(None),
         Some(v @ Value::String(_)) => {
             let id = super::find_part(ctx.scene, Some(v))?;
-            let (lo, size) = ctx.scene.synced_world().bounds(id).ok_or_else(|| anyhow::anyhow!("`{}` has no voxels to focus on", ctx.scene.world.label(id)))?;
-            (lo - world0, lo - world0 + size)
+            let w = ctx.scene.synced_world();
+            // Its voxels (and those of what's in or attached to it), not its
+            // canvas: parts are often drawn in a canvas as big as the scene.
+            let mut ids = Vec::new();
+            w.visit(id, &mut |i, _| ids.push(i));
+            let solid = w.composite_where(|m| ids.contains(&m)).and_then(|c| super::bounds(&c.volume).map(|(l, h)| (l + c.origin, h + c.origin + IVec3::ONE)));
+            let (lo, hi) = match solid {
+                Some(b) => b,
+                None => {
+                    let (lo, size) = w.bounds(id).ok_or_else(|| anyhow::anyhow!("`{}` has no voxels to focus on", ctx.scene.world.label(id)))?;
+                    (lo, lo + size)
+                }
+            };
+            (lo - world0, hi - world0)
         }
         Some(v @ Value::Object(_)) => {
             let (from, to) = (super::ivec3(v, "from")?, super::ivec3(v, "to")?);

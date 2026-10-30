@@ -117,5 +117,6 @@ fn import_file(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let new = boolean(a, "as_new_project").unwrap_or(false);
     let msg = app::import_file(path, &how, new, boolean(a, "add_colors").unwrap_or(true), ctx.r, ctx.scene, ctx.ed)?;
     super::materials_changed(ctx);
-    Ok(vec![text(msg)])
+    // Imports land at whatever size and place the file had: say how to check.
+    Ok(vec![text(format!("{msg} Check it with screenshot views \"quad\" (size, facing, place) and get_scene_info health (stray pieces, overlaps, ground)."))])
 }

@@ -560,7 +560,7 @@ fn axis_named(args: &Value, key: &str) -> Result<usize> {
         "x" | "X" => Ok(0),
         "y" | "Y" => Ok(1),
         "z" | "Z" => Ok(2),
-        a => bail!("unknown axis {a:?}"),
+        a => bail!("unknown axis {a:?}; use x, y or z"),
     }
 }
 
@@ -879,7 +879,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let tree: Vec<Value> = top.iter().map(|&c| part_json(ctx.scene, c)).collect();
             let w = &ctx.scene.world;
             let layers: Vec<Value> = w.layers.iter().map(|l| json!({ "id": l.id, "name": l.label(), "hidden": l.hidden, "color": format!("#{:02x}{:02x}{:02x}", l.color[0], l.color[1], l.color[2]) })).collect();
-            Ok(vec![text(serde_json::to_string_pretty(&json!({ "mode": if ctx.scene.editing().is_some() { "edit" } else { "world" }, "parts": tree, "layers": layers, "current_layer": w.current_layer }))?)])
+            Ok(vec![text(serde_json::to_string(&json!({ "mode": if ctx.scene.editing().is_some() { "edit" } else { "world" }, "parts": tree, "layers": layers, "current_layer": w.current_layer }))?)])
         }
         "set_layer" => {
             use crate::outline::TreeOp;
@@ -1577,7 +1577,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if let Some((name, files)) = &ctx.ed.folder {
                 out["opened_folder"] = json!({ "name": name, "files": files.iter().map(stem).collect::<Vec<_>>() });
             }
-            Ok(vec![text(serde_json::to_string_pretty(&out)?)])
+            Ok(vec![text(serde_json::to_string(&out)?)])
         }
         "open_project" => {
             let name = string(a, "name").context("missing `name`")?;
@@ -1802,7 +1802,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             if out.is_empty() {
                 return Ok(vec![text("No shader folder found. Open a model from MagicaVoxel's vox folder first, or pass inline GLSL `source` to run_shader.")]);
             }
-            Ok(vec![text(serde_json::to_string_pretty(&out)?)])
+            Ok(vec![text(serde_json::to_string(&out)?)])
         }
         "run_shader" => {
             let shader = match (string(a, "name"), string(a, "source")) {

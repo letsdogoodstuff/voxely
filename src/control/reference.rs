@@ -677,7 +677,7 @@ fn list_references(ctx: &mut Ctx) -> Result<Vec<Value>> {
             })
         })
         .collect();
-    Ok(vec![text(serde_json::to_string_pretty(&json!({ "project": project, "references": list }))?)])
+    Ok(vec![text(serde_json::to_string(&json!({ "project": project, "references": list }))?)])
 }
 
 // ---------------------------------------------------------------- targets

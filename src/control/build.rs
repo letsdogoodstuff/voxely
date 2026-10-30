@@ -771,7 +771,7 @@ fn list_stamps() -> Result<Vec<Value>> {
             }
         })
         .collect();
-    Ok(vec![text(serde_json::to_string_pretty(&json!({ "folder": stamp_dir().display().to_string(), "stamps": list }))?)])
+    Ok(vec![text(serde_json::to_string(&json!({ "folder": stamp_dir().display().to_string(), "stamps": list }))?)])
 }
 
 /// A list of axes: "x" or ["x", "z"].
@@ -780,7 +780,7 @@ fn axes_arg(v: Option<&Value>) -> Result<Vec<usize>> {
         Some("x" | "X") => Ok(0),
         Some("y" | "Y") => Ok(1),
         Some("z" | "Z") => Ok(2),
-        _ => bail!("unknown axis {v}"),
+        _ => bail!("unknown axis {v}; use \"x\", \"y\" or \"z\""),
     };
     match v {
         None => Ok(Vec::new()),
