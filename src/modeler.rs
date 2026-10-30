@@ -362,6 +362,10 @@ pub struct Modeler {
     /// Faces of highlighted cells (color 1 solid, 2 empty), drawn over
     /// everything, faint where hidden.
     highlight: Option<(wgpu::Buffer, u32)>,
+    /// Voxels about to be placed (the Pattern brush under the cursor),
+    /// drawn like the model's own, and the cells they were built from.
+    ghost: Option<(wgpu::Buffer, u32)>,
+    ghost_cells: Vec<(IVec3, u8)>,
     mark_pipeline: wgpu::RenderPipeline,
     mark_xray_pipeline: wgpu::RenderPipeline,
     palette: [[f32; 4]; 256],
@@ -571,6 +575,8 @@ impl Modeler {
             vertex_count,
             context: None,
             highlight: None,
+            ghost: None,
+            ghost_cells: Vec::new(),
             mark_pipeline,
             mark_xray_pipeline,
             palette: [[0.0; 4]; 256],
@@ -608,6 +614,23 @@ impl Modeler {
     /// size `dims`, or nothing if empty.
     pub fn set_highlight(&mut self, device: &wgpu::Device, dims: IVec3, cells: &[(IVec3, bool)]) {
         self.highlight = highlight_mesh(dims, cells).map(|mesh| (mesh_buffer(device, &mesh), mesh.len() as u32));
+    }
+
+    /// Show `cells` (with their colors) of a volume of size `dims` as
+    /// voxels about to be placed, or nothing if empty.
+    pub fn set_ghost(&mut self, device: &wgpu::Device, dims: IVec3, cells: &[(IVec3, u8)]) {
+        if cells == self.ghost_cells.as_slice() {
+            return;
+        }
+        self.ghost_cells = cells.to_vec();
+        let mut v = Volume::new(dims);
+        for &(p, c) in cells {
+            if v.contains(p) {
+                v.set(p, c);
+            }
+        }
+        let mesh = build_mesh(&v, None);
+        self.ghost = (!mesh.is_empty()).then(|| (mesh_buffer(device, &mesh), mesh.len() as u32));
     }
 
     /// Use an RGBA picture (rows top down) as the reference, or none.
@@ -740,6 +763,10 @@ impl Modeler {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.draw(0..self.vertex_count, 0..1);
+            if let Some((buf, count)) = &self.ghost {
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..*count, 0..1);
+            }
             if let Some((buf, count, _)) = self.context.as_ref().filter(|_| o.others) {
                 pass.set_vertex_buffer(0, buf.slice(..));
                 pass.draw(0..*count, 0..1);

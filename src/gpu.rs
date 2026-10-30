@@ -887,6 +887,13 @@ impl Renderer {
         }
     }
 
+    /// Voxels about to be placed, in the modeler (see `Modeler::set_ghost`).
+    pub fn set_ghost(&mut self, dims: glam::IVec3, cells: &[(glam::IVec3, u8)]) {
+        if let Some(m) = self.modeler.as_mut() {
+            m.set_ghost(&self.device, dims, cells);
+        }
+    }
+
     /// Mark cells in the modeler (see `Modeler::set_highlight`).
     pub fn set_highlight(&mut self, dims: glam::IVec3, cells: &[(glam::IVec3, bool)]) {
         if let Some(m) = self.modeler.as_mut() {

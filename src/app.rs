@@ -2890,6 +2890,9 @@ impl App {
                     self.update_hover();
                     let hover = self.edit.hover;
                     self.edit.editor.sel_mode = self.sel_mode();
+                    if let Some(g) = self.gfx.as_ref() {
+                        self.edit.editor.view_up = g.renderer.camera.basis().2;
+                    }
                     let tool = self.edit.editor.tool;
                     let alt = self.modifiers.alt_key();
                     let alt_only = alt && !self.modifiers.shift_key() && !cmd;
@@ -2962,6 +2965,9 @@ impl App {
         if self.edit.editor.sel_dirty {
             sync_selection(&mut g.renderer, &self.scene, &mut self.edit.editor);
         }
+        let show = g.renderer.modeling && self.edit.enabled && self.scene.mode != Mode::World;
+        let ghost = if show { self.edit.editor.ghost(&self.scene.volume, self.edit.hover) } else { Vec::new() };
+        g.renderer.set_ghost(self.scene.volume.dims, &ghost);
         let frame = match g.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {

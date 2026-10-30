@@ -393,15 +393,53 @@ struct Stroke {
 }
 
 /// Face brush drag [Extrude: Drag]: more layers the further the cursor
-/// goes along the face normal.
+/// goes, as in MagicaVoxel: out along the face normal on screen to attach,
+/// into the face to erase or paint.
 struct Extrude {
     /// First layer's cells with their colors.
     base: Vec<(IVec3, u8)>,
-    /// Center of the pressed face, and the offset along the normal the
-    /// press ray was at.
-    origin: Vec3,
-    t0: f32,
+    /// Where the press ray met the camera-facing plane through the pressed
+    /// face; drags are measured on that plane.
+    p0: Vec3,
+    plane: Vec3,
+    /// One layer's step on that plane: the way the layers grow as it
+    /// appears on screen, or up (Attach) or down the view when the face is
+    /// seen head-on.
+    step: Vec3,
     layers: i32,
+}
+
+impl Extrude {
+    /// Attach grows out along the face `normal`; Erase and Paint go in.
+    fn new(base: Vec<(IVec3, u8)>, origin: Vec3, normal: IVec3, attach: bool, ro: Vec3, rd: Vec3, up: Vec3) -> Self {
+        let plane = rd.normalize_or_zero();
+        let flat = |d: Vec3| d - plane * d.dot(plane);
+        let sign = if attach { 1.0 } else { -1.0 };
+        let n = flat(normal.as_vec3()) * sign;
+        // Seen head-on, the normal is too short on screen to drag along, so
+        // dragging up (Attach) or down (Erase, Paint) grows it a voxel at a
+        // time.
+        let step = if n.length() >= 0.35 { n } else { flat(up).normalize_or_zero() * sign };
+        let p0 = plane_hit(origin, plane, ro, rd).unwrap_or(origin);
+        Extrude { base, p0, plane, step, layers: 1 }
+    }
+
+    /// Layers out from the face for the cursor ray, at least one.
+    fn layers(&self, ro: Vec3, rd: Vec3, max: i32) -> Option<i32> {
+        let p = plane_hit(self.p0, self.plane, ro, rd)?;
+        let out = (p - self.p0).dot(self.step) / self.step.length_squared().max(1e-6);
+        Some((out.round() as i32).clamp(1, max.max(1)))
+    }
+}
+
+/// Where the ray meets the plane through `p` with normal `n`, ahead of it.
+fn plane_hit(p: Vec3, n: Vec3, ro: Vec3, rd: Vec3) -> Option<Vec3> {
+    let d = rd.dot(n);
+    if d.abs() < 1e-6 {
+        return None;
+    }
+    let t = (p - ro).dot(n) / d;
+    (t > 0.0).then(|| ro + rd * t)
 }
 
 /// A pending Scale / Wrap / Rotate of the selection (or the whole model),
@@ -538,6 +576,8 @@ pub struct Editor {
     pub color: u8,
     pub mirror: [bool; 3],
     pub sel_mode: SelMode,
+    /// The view's up direction, for Face extrude drags on faces seen head-on.
+    pub view_up: Vec3,
     pub region: ops::RegionOptions,
     pub opts: BrushOptions,
     pub pattern: Option<Pattern>,
@@ -568,6 +608,7 @@ impl Editor {
             color,
             mirror: [false; 3],
             sel_mode: SelMode::Replace,
+            view_up: Vec3::Z,
             region: ops::RegionOptions::default(),
             opts: BrushOptions::default(),
             pattern: None,
@@ -1355,10 +1396,9 @@ impl Editor {
             Brush::Face => {
                 let cells = self.face_cells(v, hit);
                 let origin = hit.cell.as_vec3() + 0.5 + hit.normal.as_vec3() * 0.5;
-                let t0 = axis_offset(origin, axis, ro, rd).unwrap_or(0.0);
                 let changed = self.apply_colored(v, &cells);
-                if matches!(self.tool, Tool::Attach | Tool::Erase) {
-                    self.stroke.as_mut().unwrap().extrude = Some(Extrude { base: cells, origin, t0, layers: 1 });
+                if matches!(self.tool, Tool::Attach | Tool::Erase | Tool::Paint) {
+                    self.stroke.as_mut().unwrap().extrude = Some(Extrude::new(cells, origin, hit.normal, self.tool == Tool::Attach, ro, rd, self.view_up));
                 }
                 changed
             }
@@ -1419,16 +1459,13 @@ impl Editor {
     }
 
     /// Face brush drag: attach (or erase) as many layers of the region as
-    /// the cursor is away from the face along its normal, at least one.
+    /// the cursor has moved the way they grow on screen, at least one. Like MagicaVoxel, Erase digs and Paint recolors that many in;
+    /// dragging back keeps one.
     fn drag_extrude(&mut self, v: &mut Volume, ro: Vec3, rd: Vec3) -> bool {
         let s = self.stroke.as_mut().unwrap();
         let (axis, normal) = (s.axis, s.normal);
         let x = s.extrude.as_ref().unwrap();
-        let Some(t) = axis_offset(x.origin, axis, ro, rd) else { return false };
-        // Layers = how far the cursor is out along the face normal, like
-        // MagicaVoxel (Erase digs that many in); dragging inward keeps one.
-        let out = (t - x.t0) * normal[axis].signum() as f32;
-        let layers = (out.round() as i32).clamp(1, v.dims[axis].max(1));
+        let Some(layers) = x.layers(ro, rd, v.dims[axis]) else { return false };
         if layers == x.layers {
             return false;
         }
@@ -1606,6 +1643,16 @@ impl Editor {
     }
 
     /// Cells to outline: the pending shape, or what a click would touch.
+    /// Voxels to show, in their colors, where an Attach with the Pattern
+    /// brush would place them: like MagicaVoxel, the pattern itself follows
+    /// the cursor before it is placed.
+    pub fn ghost(&self, v: &Volume, hover: Option<Pick>) -> Vec<(IVec3, u8)> {
+        let Some(h) = hover.filter(|_| self.stroke.is_none() && self.tool == Tool::Attach && self.brush == Brush::Pattern) else { return Vec::new() };
+        let Some(t) = target(self.tool, h) else { return Vec::new() };
+        let cells = self.pattern_cells(t, h.normal);
+        self.expand(v, &cells, h.normal).into_iter().filter(|&(c, _)| v.contains(c) && v.get(c) == 0).collect()
+    }
+
     pub fn preview(&self, v: &Volume, hover: Option<Pick>) -> Vec<IVec3> {
         let normal = hover.map_or(IVec3::Z, |h| h.normal);
         let cells: Vec<IVec3> = match (&self.stroke, self.tool) {
@@ -1624,7 +1671,12 @@ impl Editor {
             // MagicaVoxel only the voxel under the cursor is outlined.
             (None, Tool::Region | Tool::RegionRemove | Tool::RegionReplace) => hover.filter(|h| !h.on_ground()).map(|h| h.cell).into_iter().collect(),
             (None, _) => match (self.brush, hover) {
+                // Erase and Paint outline just the voxel under the cursor;
+                // Attach shows the whole layer it will add.
+                (Brush::Face, Some(h)) if self.tool != Tool::Attach => target(self.tool, h).into_iter().collect(),
                 (Brush::Face, Some(h)) => self.face_cells(v, h).into_iter().map(|(c, _)| c).collect(),
+                // Attach shows the pattern itself instead (see `ghost`).
+                (Brush::Pattern, Some(_)) if self.tool == Tool::Attach => return Vec::new(),
                 (Brush::Pattern, Some(h)) => {
                     target(self.tool, h).map(|t| self.pattern_cells(t, h.normal).into_iter().map(|(c, _)| c).collect()).unwrap_or_default()
                 }
@@ -1967,9 +2019,11 @@ mod tests {
         }
     }
 
-    /// A horizontal ray along +x through height z.
-    fn level_ray(z: f32) -> (Vec3, Vec3) {
-        (Vec3::new(-10.0, 1.5, z), Vec3::X)
+    /// A ray from above and in front (-y) through point `p`, always in the
+    /// same direction, so drag offsets on screen match offsets in the scene.
+    fn toward(p: Vec3) -> (Vec3, Vec3) {
+        let rd = Vec3::new(0.0, 1.0, -1.0).normalize();
+        (p - rd * 50.0, rd)
     }
 
     #[test]
@@ -1978,18 +2032,19 @@ mod tests {
         slab(&mut v, 1, 9);
         let mut e = Editor::new(9);
         e.brush = Brush::Face;
-        let (ro, rd) = (Vec3::new(1.5, 1.5, 20.0), Vec3::NEG_Z);
+        let (ro, rd) = toward(Vec3::new(1.5, 1.5, 1.0));
         let hit = pick(&v, ro, rd).unwrap();
         assert!(e.begin(&mut v, hit, ro, rd));
         assert_eq!(count(&v, 9), 32);
-        // Three cells above the face: three layers, then back down to one.
-        let (ro, rd) = level_ray(4.0);
+        // The cursor over a point three cells above the face: three
+        // layers, then back down to one.
+        let (ro, rd) = toward(Vec3::new(1.5, 1.5, 4.0));
         assert!(e.drag(&mut v, ro, rd, None));
         assert_eq!(count(&v, 9), 16 * 4);
-        let (ro, rd) = level_ray(1.2);
+        let (ro, rd) = toward(Vec3::new(1.5, 1.5, 1.2));
         assert!(e.drag(&mut v, ro, rd, None));
         assert_eq!(count(&v, 9), 32);
-        let (ro, rd) = level_ray(3.0);
+        let (ro, rd) = toward(Vec3::new(1.5, 1.5, 3.0));
         e.drag(&mut v, ro, rd, None);
         e.end(&mut v);
         assert_eq!(count(&v, 9), 48);
@@ -2005,22 +2060,90 @@ mod tests {
         let mut e = Editor::new(9);
         e.brush = Brush::Face;
         e.tool = Tool::Erase;
-        let (ro, rd) = (Vec3::new(1.5, 1.5, 20.0), Vec3::NEG_Z);
+        let (ro, rd) = toward(Vec3::new(1.5, 1.5, 4.0));
         let hit = pick(&v, ro, rd).unwrap();
         e.begin(&mut v, hit, ro, rd);
-        // Two cells out from the face: MagicaVoxel digs two layers in.
-        let (ro2, rd2) = level_ray(6.0);
+        // Two cells in from the face: MagicaVoxel digs two layers in.
+        let (ro2, rd2) = toward(Vec3::new(1.5, 1.5, 2.0));
         e.drag(&mut v, ro2, rd2, None);
         e.end(&mut v);
         assert_eq!(count(&v, 9), 32);
         assert_eq!((v.get(IVec3::new(0, 0, 1)), v.get(IVec3::new(0, 0, 2))), (9, 0));
-        // Dragging into the model keeps one layer.
+        // Dragging out of the model keeps one layer.
         e.undo(&mut v);
         e.begin(&mut v, hit, ro, rd);
-        let (ro2, rd2) = level_ray(2.0);
+        let (ro2, rd2) = toward(Vec3::new(1.5, 1.5, 6.0));
         e.drag(&mut v, ro2, rd2, None);
         e.end(&mut v);
         assert_eq!(count(&v, 9), 48);
+    }
+
+    #[test]
+    fn face_drag_paints_layers() {
+        let mut v = vol();
+        slab(&mut v, 4, 9);
+        let mut e = Editor::new(5);
+        e.brush = Brush::Face;
+        e.tool = Tool::Paint;
+        let (ro, rd) = toward(Vec3::new(1.5, 1.5, 4.0));
+        let hit = pick(&v, ro, rd).unwrap();
+        e.begin(&mut v, hit, ro, rd);
+        assert_eq!(count(&v, 5), 16);
+        // Two cells in from the face: the top two layers take the color.
+        let (ro2, rd2) = toward(Vec3::new(1.5, 1.5, 2.0));
+        e.drag(&mut v, ro2, rd2, None);
+        e.end(&mut v);
+        assert_eq!((count(&v, 5), count(&v, 9)), (32, 32));
+        assert_eq!((v.get(IVec3::new(0, 0, 2)), v.get(IVec3::new(0, 0, 1))), (5, 9));
+        assert!(e.undo(&mut v));
+        assert_eq!(count(&v, 9), 64);
+    }
+
+    #[test]
+    fn face_drag_head_on_attaches_up_and_erases_down() {
+        // Looking straight down at the top face, whose normal has no length
+        // on screen: dragging up the screen (+y here) adds a layer a cell.
+        let mut v = vol();
+        slab(&mut v, 1, 9);
+        let mut e = Editor::new(9);
+        e.brush = Brush::Face;
+        e.view_up = Vec3::Y;
+        let (ro, rd) = (Vec3::new(1.5, 1.5, 20.0), Vec3::NEG_Z);
+        let hit = pick(&v, ro, rd).unwrap();
+        e.begin(&mut v, hit, ro, rd);
+        e.drag(&mut v, Vec3::new(1.5, 4.5, 20.0), rd, None);
+        assert_eq!(count(&v, 9), 16 * 4);
+        // Down the screen keeps one layer rather than running away.
+        e.drag(&mut v, Vec3::new(1.5, -1.5, 20.0), rd, None);
+        assert_eq!(count(&v, 9), 32);
+        e.end(&mut v);
+        // Erase digs in going down the screen.
+        e.tool = Tool::Erase;
+        let hit = pick(&v, ro, rd).unwrap();
+        e.begin(&mut v, hit, ro, rd);
+        e.drag(&mut v, Vec3::new(1.5, -0.5, 20.0), rd, None);
+        e.end(&mut v);
+        assert_eq!(count(&v, 9), 0);
+    }
+
+    #[test]
+    fn pattern_ghost_shows_what_attach_will_place() {
+        let mut v = Volume::new(IVec3::splat(16));
+        let mut e = Editor::new(1);
+        let mut p = Volume::new(IVec3::new(1, 1, 2));
+        p.set(IVec3::ZERO, 7);
+        p.set(IVec3::Z, 8);
+        e.pattern = Some(Pattern { name: "p".into(), volume: p });
+        e.brush = Brush::Pattern;
+        let hover = pick(&v, Vec3::new(8.5, 8.5, 20.0), Vec3::NEG_Z);
+        let mut ghost = e.ghost(&v, hover);
+        ghost.sort_by_key(|g| g.0.z);
+        assert_eq!(ghost, vec![(IVec3::new(8, 8, 0), 7), (IVec3::new(8, 8, 1), 8)]);
+        // Clicking places exactly that, and other tools show no ghost.
+        click(&mut e, &mut v, 8.5, 8.5);
+        assert_eq!((v.get(IVec3::new(8, 8, 0)), v.get(IVec3::new(8, 8, 1))), (7, 8));
+        e.tool = Tool::Paint;
+        assert!(e.ghost(&v, hover).is_empty());
     }
 
     #[test]
@@ -2285,3 +2408,4 @@ mod tests {
         assert_eq!(count(&v, 1), 6 * 3 + 2 * 3);
     }
 }
+
