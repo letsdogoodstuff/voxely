@@ -112,6 +112,96 @@ impl BuildCheck {
     }
 }
 
+/// Opt-in local log of how much context tool definitions and results take:
+/// set `VOXELY_CONTEXT_LOG=1` (or a file path) in the MCP client's env for
+/// this server. One JSON line per tools/list and tools/call, with names and
+/// sizes only: never arguments or result content. Nothing is sent anywhere.
+struct ContextLog(Option<PathBuf>);
+
+impl ContextLog {
+    fn from_env() -> Self {
+        ContextLog(std::env::var_os("VOXELY_CONTEXT_LOG").and_then(|v| match v.to_str() {
+            Some("" | "0" | "false" | "off") => None,
+            Some("1" | "true" | "on" | "yes") => context_log_path(),
+            _ => Some(PathBuf::from(v)),
+        }))
+    }
+
+    fn write(&self, entry: Value) {
+        let Some(path) = &self.0 else { return };
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let mut entry = entry;
+        entry["t"] = json!(t);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{entry}");
+        }
+    }
+
+    fn call(&self, tool: &str, result: &Value, ms: u128) {
+        if self.0.is_none() {
+            return;
+        }
+        let (mut text, mut images, mut image_bytes) = (0, 0, 0);
+        for c in result["content"].as_array().into_iter().flatten() {
+            match c["type"].as_str() {
+                Some("text") => text += c["text"].as_str().map_or(0, str::len),
+                Some("image") => {
+                    images += 1;
+                    image_bytes += c["data"].as_str().map_or(0, str::len);
+                }
+                _ => {}
+            }
+        }
+        let ok = result["isError"].as_bool() != Some(true);
+        self.write(json!({ "kind": "call", "tool": tool, "ok": ok, "text_chars": text, "images": images, "image_b64_chars": image_bytes, "ms": ms as u64 }));
+    }
+}
+
+/// `context-log.jsonl` beside the preferences file.
+fn context_log_path() -> Option<PathBuf> {
+    Some(crate::prefs::Prefs::path()?.with_file_name("context-log.jsonl"))
+}
+
+/// `voxely mcp --context-report [log]`: the tool definitions' sizes, and
+/// per-tool result sizes from a context log.
+fn context_report(log: Option<PathBuf>) -> Result<()> {
+    let tools = control::tools();
+    let list = tools.as_array().map_or(&[][..], Vec::as_slice);
+    let total = serde_json::to_string(&tools)?.len();
+    let mut sizes: Vec<(usize, &str)> = list.iter().map(|t| (t.to_string().len(), t["name"].as_str().unwrap_or("?"))).collect();
+    sizes.sort_by(|a, b| b.cmp(a));
+    println!("Instructions: {} chars (~{} tokens)", control::INSTRUCTIONS.len(), control::INSTRUCTIONS.len() / 4);
+    println!("Tool definitions: {} tools, {total} chars (~{} tokens). Largest:", list.len(), total / 4);
+    for (n, name) in sizes.iter().take(15) {
+        println!("  {n:6}  {name}");
+    }
+    let Some(path) = log.or_else(context_log_path) else { return Ok(()) };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        println!("\nNo context log at {} (set VOXELY_CONTEXT_LOG=1 in the MCP client's env for voxely to record one).", path.display());
+        return Ok(());
+    };
+    // tool -> (calls, errors, text chars, image chars)
+    let mut per: std::collections::BTreeMap<String, (usize, usize, usize, usize)> = Default::default();
+    for e in text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|e| e["kind"] == "call") {
+        let r = per.entry(e["tool"].as_str().unwrap_or("?").to_string()).or_default();
+        r.0 += 1;
+        r.1 += usize::from(e["ok"] == false);
+        r.2 += e["text_chars"].as_u64().unwrap_or(0) as usize;
+        r.3 += e["image_b64_chars"].as_u64().unwrap_or(0) as usize;
+    }
+    let mut rows: Vec<_> = per.into_iter().collect();
+    rows.sort_by_key(|(_, r)| std::cmp::Reverse(r.2 + r.3));
+    println!("\nResults in {} (by total size; images as base64 chars):", path.display());
+    println!("  {:<22} {:>6} {:>6} {:>12} {:>12}", "tool", "calls", "errors", "text", "images");
+    for (name, (calls, errors, text, img)) in rows {
+        println!("  {name:<22} {calls:>6} {errors:>6} {text:>12} {img:>12}");
+    }
+    Ok(())
+}
+
 /// MagicaVoxel's install folder (for shaders, palettes and models).
 pub(crate) fn assets_dir(arg: Option<PathBuf>) -> Option<PathBuf> {
     arg.or_else(app::magicavoxel_dir)
@@ -181,12 +271,14 @@ pub fn run(args: &[String]) -> Result<()> {
         match a.as_str() {
             "--headless" => headless_only = true,
             "--assets" => assets = it.next().map(PathBuf::from),
+            "--context-report" => return context_report(it.next().map(PathBuf::from)),
             other => anyhow::bail!("voxely mcp: unknown option {other}"),
         }
     }
     let assets = assets_dir(assets);
     let mut headless: Option<Headless> = None;
     let mut build = BuildCheck::new();
+    let log = ContextLog::from_env();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -215,14 +307,19 @@ pub fn run(args: &[String]) -> Result<()> {
                 "instructions": control::INSTRUCTIONS,
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": control::tools() })),
+            "tools/list" => {
+                let tools = control::tools();
+                log.write(json!({ "kind": "tools/list", "tools": tools.as_array().map_or(0, Vec::len), "chars": tools.to_string().len(), "instructions_chars": control::INSTRUCTIONS.len() }));
+                Ok(json!({ "tools": tools }))
+            }
             "prompts/list" => Ok(control::guide::prompts()),
             "prompts/get" => control::guide::prompt(&params).map_err(|e| json!({ "code": -32602, "message": e.to_string() })),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                let started = std::time::Instant::now();
                 let live = if headless_only { None } else { call_live(name, &args) };
-                Ok(match live {
+                let r = match live {
                     Some(Ok(mut v)) => {
                         let is_error = v["isError"].as_bool() == Some(true);
                         if let (Some(note), Some(content)) = (build.window_note(is_error), v["content"].as_array_mut()) {
@@ -244,7 +341,9 @@ pub fn run(args: &[String]) -> Result<()> {
                         }
                         headless.as_mut().unwrap().call(name, &args)
                     }
-                })
+                };
+                log.call(name, &r, started.elapsed().as_millis());
+                Ok(r)
             }
             _ => Err(json!({ "code": -32601, "message": format!("method not found: {method}") })),
         };

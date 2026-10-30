@@ -18,7 +18,7 @@ pub fn tools() -> Vec<Value> {
         "screenshot",
         "Fast image of the model in the editor's modeler view, plus a text summary (part, size, voxel count, bounds, top colors, views, last edit). \
          views: \"single\" (default: the current camera, as the window shows it), \"quad\" (2x2: front, right, top orthographic and a 3/4 perspective), \
-         \"all\" (front, back, left, right, top, iso), \"turnaround\" (front, right, back, left), or a list of 1-16 names from current, front, back, left, right, top, bottom, iso, 3/4. \
+         \"all\" (front, back, left, right, top, iso), \"turnaround\" (front, right, back, left), or a list of 1-16 names from current, front, back, left, right, top, bottom, iso, 3/4, or [x, y, z] directions. \
          scope \"scene\" (default when the project has more than one part) shows every visible part at full color, framed together, with rulers \
          in world coordinates; scope \"part\" (default with one part) frames the part being edited with the other parts dimmed, rulers in the part's \
          own coordinates (what the voxel tools use). Either way the window's mode and camera are left as they were. \
@@ -30,7 +30,8 @@ pub fn tools() -> Vec<Value> {
         json!({
             "width": { "type": "integer", "minimum": 16, "maximum": 4096, "description": "Whole image width, up to 4096 and at least 16 per tile column (default 800 for one view, 512 per tile otherwise)" },
             "height": { "type": "integer", "minimum": 16, "maximum": 4096, "description": "Whole image height, up to 4096 and at least 16 per tile row (default 600 for one view, 384 per tile otherwise)" },
-            "views": { "type": ["string", "array"], "items": { "type": "string" }, "minItems": 1, "maxItems": 16, "description": "\"single\", \"quad\", \"all\", \"turnaround\" (front, right, back, left), one view name, or a list of 1-16 view names" },
+            "views": { "type": ["string", "array"], "items": { "anyOf": [{ "type": "string" }, { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }] }, "minItems": 1, "maxItems": 16, "description": "\"single\", \"quad\", \"all\", \"turnaround\" (front, right, back, left), one view name, or a list of 1-16 view names and [x, y, z] directions (from the model toward the eye, perspective: [1, -2, 0.5] is front-right, a little above)" },
+            "max_size": { "type": "integer", "minimum": 64, "maximum": 4096, "description": "Longest side of the whole image when width and height aren't given. Images stay in the conversation: ~512 for a quick check, larger only to read fine detail" },
             "overlay": { "type": "boolean", "description": "Axis gizmo, rulers and titles (default: on unless the only view is the current camera)" },
             "grid_step": { "type": "integer", "minimum": 1, "maximum": 1024, "description": "Voxels between labeled ruler ticks (default 8; widened if labels would crowd)" },
             "fit": { "type": "string", "enum": ["canvas", "voxels"], "description": "What named views frame: the whole canvas (default; in scene scope the box around all parts) or just the solid voxels" },
@@ -55,7 +56,7 @@ pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Va
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum View {
     Current,
     Front,
@@ -66,6 +67,8 @@ enum View {
     Bottom,
     Iso,
     ThreeQuarter,
+    /// Perspective, from this direction: target toward the eye.
+    Dir([f32; 3]),
 }
 
 impl View {
@@ -84,8 +87,8 @@ impl View {
         })
     }
 
-    fn name(self) -> &'static str {
-        match self {
+    fn name(self) -> String {
+        let name = match self {
             View::Current => "CURRENT",
             View::Front => "FRONT -Y",
             View::Back => "BACK +Y",
@@ -95,7 +98,9 @@ impl View {
             View::Bottom => "BOTTOM -Z",
             View::Iso => "ISO",
             View::ThreeQuarter => "3/4",
-        }
+            View::Dir([x, y, z]) => return format!("FROM ({x}, {y}, {z})"),
+        };
+        name.to_string()
     }
 
     /// Camera yaw and pitch (degrees) and whether it's orthographic, for
@@ -113,6 +118,11 @@ impl View {
             View::Bottom => (-90.0, -UP, true),
             View::Iso => (225.0, 35.264, true),
             View::ThreeQuarter => (225.0, 25.0, false),
+            View::Dir(d) => {
+                // The camera's yaw puts the eye at (cos yaw, sin yaw) around the target.
+                let d = Vec3::from_array(d).normalize();
+                (d.y.atan2(d.x).to_degrees(), d.z.asin().to_degrees().clamp(-UP, UP), false)
+            }
         })
     }
 }
@@ -132,11 +142,27 @@ fn parse_views(v: Option<&Value>) -> Result<Vec<View>> {
         Some(Value::Array(a)) if !a.is_empty() && a.len() <= 16 => {
             let mut out = Vec::new();
             for x in a {
-                out.extend(one(x.as_str().ok_or_else(|| anyhow::anyhow!("views are strings"))?)?);
+                match x {
+                    Value::String(s) => out.extend(one(s)?),
+                    Value::Array(d) => out.push(direction(d)?),
+                    _ => bail!("each view is a name or an [x, y, z] direction, not {x}"),
+                }
+            }
+            if out.len() > 16 {
+                bail!("at most 16 views; {} asked for", out.len());
             }
             Ok(out)
         }
-        _ => bail!("`views` is \"single\", \"quad\", \"all\", \"turnaround\", a view name, or a list of 1-16 view names"),
+        _ => bail!("`views` is \"single\", \"quad\", \"all\", \"turnaround\", a view name, or a list of 1-16 view names and [x, y, z] directions"),
+    }
+}
+
+/// An [x, y, z] view direction: from the model toward the eye.
+fn direction(d: &[Value]) -> Result<View> {
+    let n: Vec<f32> = d.iter().filter_map(Value::as_f64).map(|f| f as f32).collect();
+    match n[..] {
+        [x, y, z] if n.iter().all(|f| f.is_finite()) && (x != 0.0 || y != 0.0 || z != 0.0) => Ok(View::Dir([x, y, z])),
+        _ => bail!("a view direction is three numbers, not all zero, from the model toward the eye ([0, -1, 0.3] is the front, slightly above); got {}", Value::Array(d.to_vec())),
     }
 }
 
@@ -231,6 +257,7 @@ pub fn render_framed(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let cols = if n <= 4 { n } else { (n as f32).sqrt().ceil() as u32 };
     let rows = n.div_ceil(cols);
     let (dw, dh) = if n == 1 { (960, 640) } else { (480 * cols, 600 * rows) };
+    let (dw, dh) = super::fit_max_size(a, dw, dh);
     let max = max_image_side(ctx);
     let tiles = || format!("{n} views in {cols} columns and {rows} rows need 16 pixels per tile");
     let width = int_in(a, "width", dw as i64, 16 * cols as i64, max).with_context(tiles)? as u32;
@@ -257,15 +284,15 @@ pub fn render_framed(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         let mut tile = Canvas::new(tw, th, r.render_image(spp)?);
         if n > 1 {
             let sc = if tw.min(th) >= 280 { 2 } else { 1 };
-            tile.text(8, 8, view.name(), sc, WHITE);
+            tile.text(8, 8, &view.name(), sc, WHITE);
         }
         out.blit(&tile, (i as u32 % cols * tw) as i32, (i as u32 / cols * th) as i32);
         // In world coordinates, as set_camera takes them.
         let t = cam.target + ctx.scene.origin.as_vec3();
         cams.push(format!(
             "{}: yaw {:.0}, pitch {:.0}, distance {:.1}, target [{:.1}, {:.1}, {:.1}], {:?}",
-            if view == View::Current { "camera" } else { view.name() },
-            cam.yaw.to_degrees(),
+            if view == View::Current { "camera".to_string() } else { view.name() },
+            cam.yaw.to_degrees().rem_euclid(360.0),
             cam.pitch.to_degrees(),
             cam.dist,
             t.x,
@@ -361,6 +388,7 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let cols = (n as f32).sqrt().ceil() as u32;
     let rows = n.div_ceil(cols);
     let (dw, dh) = if n == 1 { (800, 600) } else { (512 * cols, 384 * rows) };
+    let (dw, dh) = super::fit_max_size(a, dw, dh);
     let size = |key: &str, default: u32, min: u32| -> Result<u32> {
         match get(a, key) {
             None => Ok(default.min(4096)),
@@ -472,7 +500,7 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             };
             let px = ctx.r.modeler_image_from(tw, th, &shot.camera, shot.projection)?;
             let mut tile = Canvas::new(tw, th, px);
-            let title = if overlay { overlay_tile(&mut tile, &shot, view, &frame, sc) } else { view.name().to_string() };
+            let title = if overlay { overlay_tile(&mut tile, &shot, view, &frame, sc) } else { view.name() };
             if !overlay && n > 1 {
                 tile.text(6, 6, &title, sc, WHITE);
             }
@@ -534,8 +562,8 @@ fn overlay_tile(t: &mut Canvas, shot: &Shot, view: View, f: &Frame, sc: i32) -> 
         box_rulers(t, cam, f, sc, &proj);
     }
     // The name at full size; the axis hint smaller if it would crowd the gizmo.
-    t.text(6, 6, name, sc, WHITE);
-    let (nw, _) = text_size(name, sc);
+    t.text(6, 6, &name, sc, WHITE);
+    let (nw, _) = text_size(&name, sc);
     let room = t.w as i32 - 6 - nw - 16 - 50 * sc;
     let hs = if text_size(&hint, sc).0 <= room { sc } else { 1 };
     t.text(6 + nw, 6 + (sc - hs) * 7, &hint, hs, WHITE);
@@ -787,7 +815,7 @@ fn summary(ctx: &Ctx, what: &Shown, names: &[String], f: &Frame, framed: bool, h
     };
     lines.push(format!(
         "Views: {views}.{framing} Window camera (unchanged): yaw {:.0}, pitch {:.0}, distance {:.1}, target [{:.1}, {:.1}, {:.1}] world, {:?}.",
-        cam.yaw.to_degrees(),
+        cam.yaw.to_degrees().rem_euclid(360.0),
         cam.pitch.to_degrees(),
         cam.dist,
         target.x,
@@ -859,6 +887,20 @@ mod tests {
     #[test]
     fn turnaround_is_four_sides() {
         assert_eq!(parse_views(Some(&json!("turnaround"))).unwrap(), vec![View::Front, View::Right, View::Back, View::Left]);
+    }
+
+    #[test]
+    fn directions_put_the_eye_on_their_side() {
+        let views = parse_views(Some(&json!([[0, -1, 0], [1, 0, 0.0001], "top"]))).unwrap();
+        let eye = |v: View| {
+            let (yaw, pitch, ortho) = v.orient().unwrap();
+            assert!(!ortho);
+            let c = Camera { target: Vec3::ZERO, yaw: yaw.to_radians(), pitch: pitch.to_radians(), dist: 1.0 };
+            c.eye()
+        };
+        assert!((eye(views[0]) - Vec3::NEG_Y).length() < 1e-3);
+        assert!((eye(views[1]) - Vec3::X).length() < 1e-3);
+        assert!(parse_views(Some(&json!([[0, 0, 0]]))).is_err());
     }
 
     #[test]

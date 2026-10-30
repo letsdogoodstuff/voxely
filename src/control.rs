@@ -273,13 +273,14 @@ fn base_tools() -> Value {
         tool("render", "Path-traced image with the current render settings. By default from the window's camera exactly as it is. \
             frame: true keeps the camera's yaw and pitch but fits distance and target to all the voxels with a margin (a good default for a first look). \
             views path traces several auto-framed views tiled side by side with labels, same lighting: \"turnaround\" (front, right, back, left), \
-            \"quad\", \"all\", or a list of front, back, left, right, top, bottom, iso, 3/4. Named views are orthographic except 3/4 unless projection says otherwise. \
+            \"quad\", \"all\", or a list of front, back, left, right, top, bottom, iso, 3/4 and [x, y, z] directions (model toward the eye, perspective). Named views are orthographic except 3/4 unless projection says otherwise. \
             Neither changes the window's camera; the result lists the cameras used.", json!({
             "width": { "type": "integer", "minimum": 16, "maximum": 8192, "description": "Whole image width (default 960; with views 480 per tile, at least 16 per tile)" },
             "height": { "type": "integer", "minimum": 16, "maximum": 8192, "description": "Whole image height (default 640; with views 600 per tile, at least 16 per tile)" },
             "samples": { "type": "integer", "minimum": 1, "maximum": 65536, "description": "Samples per pixel (default 128; more is smoother and slower)" },
             "frame": { "type": "boolean", "description": "Fit the camera to the whole scene from its current angle" },
-            "views": { "type": ["string", "array"], "items": { "type": "string" }, "description": "\"turnaround\", \"quad\", \"all\", a view name, or a list of view names" },
+            "views": { "type": ["string", "array"], "items": { "anyOf": [{ "type": "string" }, { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }] }, "description": "\"turnaround\", \"quad\", \"all\", a view name, or a list of view names and [x, y, z] directions" },
+            "max_size": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Longest side of the whole image when width and height aren't given (scales the default size)" },
             "projection": { "type": "string", "enum": ["orthographic", "perspective"], "description": "For frame/views (default: each view's own; frame keeps the current projection)" },
             "save_path": { "type": "string", "description": "Also save the PNG here (the whole tiled image with views)" },
         }), &[]),
@@ -516,6 +517,18 @@ pub(crate) fn int_in(args: &Value, key: &str, default: i64, lo: i64, hi: i64) ->
 }
 
 /// The largest image side the GPU renders.
+/// A default image size scaled so its longest side is `max_size`, if given.
+/// Images stay in the agent's context, so small ones keep long sessions cheap.
+pub(crate) fn fit_max_size(a: &Value, w: u32, h: u32) -> (u32, u32) {
+    match int(a, "max_size") {
+        Some(m) if m > 0 => {
+            let s = m as f32 / w.max(h) as f32;
+            (((w as f32 * s).round() as u32).max(16), ((h as f32 * s).round() as u32).max(16))
+        }
+        _ => (w, h),
+    }
+}
+
 pub(crate) fn max_image_side(ctx: &Ctx) -> i64 {
     ctx.r.device.limits().max_texture_dimension_2d.min(8192) as i64
 }
@@ -1467,13 +1480,14 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "part_position_frame": ctx.scene.world.frame,
                 "parts": ctx.scene.world.models().len(),
                 "animation": { "frames": ctx.scene.world.anim.frames, "frame": ctx.scene.world.frame, "fps": ctx.scene.world.anim.fps, "loop": ctx.scene.world.anim.looping, "smooth": ctx.scene.world.anim.smooth },
-                "camera": { "yaw": cam.yaw.to_degrees(), "pitch": cam.pitch.to_degrees(), "distance": cam.dist, "target": (cam.target + ctx.scene.origin.as_vec3()).to_array() },
+                "camera": { "yaw": cam.yaw.to_degrees().rem_euclid(360.0), "pitch": cam.pitch.to_degrees(), "distance": cam.dist, "target": (cam.target + ctx.scene.origin.as_vec3()).to_array() },
             });
             let mut info = info;
             if boolean(a, "health").unwrap_or(false) {
                 info["health"] = health::report(ctx.scene);
             }
-            Ok(vec![text(serde_json::to_string_pretty(&info)?)])
+            // One line: indentation would cost the agent tokens on every call.
+            Ok(vec![text(serde_json::to_string(&info)?)])
         }
         "new_scene" => {
             let size = opt_ivec3(a, "size")?.unwrap_or(IVec3::splat(40));
@@ -2121,7 +2135,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let t = cam.target + origin;
             Ok(vec![text(format!(
                 "Camera yaw {:.1}, pitch {:.1}, distance {:.1}, target [{:.1}, {:.1}, {:.1}] world",
-                cam.yaw.to_degrees(),
+                cam.yaw.to_degrees().rem_euclid(360.0),
                 cam.pitch.to_degrees(),
                 cam.dist,
                 t.x,
@@ -2211,7 +2225,8 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 return view::render_framed(ctx, a);
             }
             let max = max_image_side(ctx);
-            let (w, h) = (int_in(a, "width", 960, 16, max)? as u32, int_in(a, "height", 640, 16, max)? as u32);
+            let (dw, dh) = fit_max_size(a, 960, 640);
+            let (w, h) = (int_in(a, "width", dw as i64, 16, max)? as u32, int_in(a, "height", dh as i64, 16, max)? as u32);
             let spp = int_in(a, "samples", 128, 1, 65536)? as u32;
             let t = std::time::Instant::now();
             let px = render_pixels(ctx, w, h, spp)?;
