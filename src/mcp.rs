@@ -495,3 +495,69 @@ fn reply(out: &mut std::io::Stdout, v: Value) -> Result<()> {
     lock.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn steps() -> Vec<(&'static str, Value)> {
+        vec![
+            ("fill_box", json!({ "from": [0, 0, 0], "to": [39, 39, 1], "color": 3 })),
+            ("create_part", json!({ "name": "ball", "size": [16, 16, 16], "position": [8, 8, 2] })),
+            ("draw_shape", json!({ "part": "ball", "shape": "sphere", "from": [0, 0, 0], "to": [15, 15, 15], "color": 5 })),
+            ("screenshot", json!({ "views": "quad", "max_size": 256 })),
+            ("transform_part", json!({ "part": "ball", "move": [2, 0, 0] })),
+            ("render", json!({ "width": 32, "height": 32, "samples": 2, "wait": 30 })),
+            ("set_voxels", json!({ "part": "ball", "voxels": [[0, 0, 0, 9]] })),
+            ("undo", json!({})),
+            ("run_script", json!({ "source": "voxely.setVoxels({ part: 'ball', voxels: [[1, 1, 1, 7]] }); 'ok'" })),
+        ]
+    }
+
+    /// What the scene holds, as tool replies.
+    fn fingerprint(h: &mut Headless) -> String {
+        let text = |r: Value| r["content"][0]["text"].as_str().unwrap_or_default().to_string();
+        [text(h.call("list_parts", &json!({}))), text(h.call("get_voxels", &json!({ "part": "ball" })))].join("\n")
+    }
+
+    fn collect(h: &mut Headless, mut r: Value) -> Value {
+        for _ in 0..600 {
+            let Some(job) = r.get("job").cloned() else { return r };
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            r = h.call("render", &json!({ "job": job["id"] }));
+        }
+        panic!("render job never finished");
+    }
+
+    #[test]
+    #[ignore = "needs a GPU; run with --ignored"]
+    fn switching_model_and_render_between_calls_changes_nothing() {
+        let run = |toggle: bool| {
+            let mut h = Headless::new(None).expect("gpu");
+            for (i, (tool, args)) in steps().into_iter().enumerate() {
+                if toggle {
+                    let r = h.call("set_view_mode", &json!({ "mode": if i % 2 == 0 { "render" } else { "model" } }));
+                    assert_eq!(r["isError"], false, "{r}");
+                }
+                let r = h.call(tool, &args);
+                assert_eq!(r["isError"], false, "{tool}: {r}");
+                collect(&mut h, r);
+            }
+            fingerprint(&mut h)
+        };
+        assert_eq!(run(false), run(true));
+    }
+
+    #[test]
+    #[ignore = "needs a GPU; run with --ignored"]
+    fn a_background_render_is_collected_by_its_job_id() {
+        let mut h = Headless::new(None).expect("gpu");
+        h.call("fill_box", &json!({ "from": [0, 0, 0], "to": [9, 9, 9], "color": 2 }));
+        let first = h.call("render", &json!({ "width": 64, "height": 48, "samples": 256 }));
+        assert!(first.get("job").is_some(), "a render from voxely mcp runs as a job: {first}");
+        let done = collect(&mut h, first);
+        assert!(done["content"].as_array().unwrap().iter().any(|c| c["type"] == "image"), "{done}");
+        let bad = h.call("render", &json!({ "job": "r999" }));
+        assert_eq!(bad["isError"], true);
+    }
+}
