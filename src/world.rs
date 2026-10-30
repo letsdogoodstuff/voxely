@@ -265,11 +265,22 @@ impl Node {
     }
 }
 
+/// MagicaVoxel's layers: a fixed set of 8 (ids 0-7), each with a name and
+/// a hidden flag. Every node is on one; a hidden layer hides its nodes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
     pub id: i32,
+    /// Empty shows the id, like MagicaVoxel's default names "0".."7".
     pub name: String,
     pub hidden: bool,
+}
+
+pub const LAYERS: i32 = 8;
+
+impl Layer {
+    pub fn label(&self) -> String {
+        if self.name.is_empty() { self.id.to_string() } else { self.name.clone() }
+    }
 }
 
 /// The tree. Node 0 is the root group; deleted nodes leave `None` so ids
@@ -278,6 +289,8 @@ pub struct Layer {
 pub struct World {
     pub nodes: Vec<Option<Node>>,
     pub layers: Vec<Layer>,
+    /// The layer new objects go on [Set Layer for New Objects].
+    pub current_layer: i32,
     pub anim: crate::anim::Anim,
     /// The frame the tree is posed for.
     pub frame: u32,
@@ -300,9 +313,33 @@ impl World {
         Node::new("", None, -1, Kind::Group)
     }
 
+    fn default_layers() -> Vec<Layer> {
+        (0..LAYERS).map(|id| Layer { id, name: String::new(), hidden: false }).collect()
+    }
+
+    pub fn layer(&self, id: i32) -> Option<&Layer> {
+        self.layers.iter().find(|l| l.id == id)
+    }
+
+    pub fn layer_mut(&mut self, id: i32) -> Option<&mut Layer> {
+        self.layers.iter_mut().find(|l| l.id == id)
+    }
+
+    /// Put `ids` and everything inside them on `layer` [Set Layer for
+    /// Selected Objects].
+    pub fn set_layer(&mut self, ids: &[usize], layer: i32) {
+        let mut todo = ids.to_vec();
+        while let Some(id) = todo.pop() {
+            if let Some(n) = self.node_mut(id) {
+                n.layer = layer;
+                todo.extend_from_slice(n.children());
+            }
+        }
+    }
+
     /// Just the root group.
     pub fn empty() -> World {
-        World { nodes: vec![Some(Self::root_group())], layers: vec![Layer { id: 0, name: String::new(), hidden: false }], anim: Default::default(), frame: 0 }
+        World { nodes: vec![Some(Self::root_group())], layers: Self::default_layers(), current_layer: 0, anim: Default::default(), frame: 0 }
     }
 
     /// One model filling the box `[0, size)`.
@@ -576,7 +613,7 @@ impl World {
         let name = &self.unique_name(name, None);
         let parent = self.group_of(parent);
         let pp = self.frame(parent);
-        let layer = self.layers.first().map_or(-1, |l| l.id);
+        let layer = self.current_layer;
         let node = Node { rot: pp.rot.inverse(), ..Node::new(name, Some(parent), layer, Kind::Model(Volume::new(IVec3::ONE))) };
         let id = self.push(parent, node);
         self.checkin(id, &volume, origin);
@@ -678,7 +715,7 @@ impl World {
         while parent != ROOT && !picked.iter().all(|&i| self.is_ancestor(parent, i)) {
             parent = self.node(parent).and_then(|n| n.parent).unwrap_or(ROOT);
         }
-        let g = Node::new("", Some(parent), self.layers.first().map_or(-1, |l| l.id), Kind::Group);
+        let g = Node::new("", Some(parent), self.current_layer, Kind::Group);
         let gid = self.push(parent, g);
         for id in picked {
             self.reparent(id, gid);
@@ -1105,15 +1142,14 @@ fn read_extras(n: &mut Node, attrs: &crate::vox::Dict) {
 
 impl World {
     pub fn from_vox(f: &VoxFile) -> World {
-        let mut w = World { nodes: vec![Some(Self::root_group())], layers: Vec::new(), anim: Default::default(), frame: 0 };
-        let mut ids: Vec<i32> = f.layers.keys().copied().collect();
-        ids.sort();
-        for id in ids {
-            let d = &f.layers[&id];
-            w.layers.push(Layer { id, name: d.get("_name").cloned().unwrap_or_default(), hidden: d.get("_hidden").is_some_and(|v| v == "1") });
-        }
-        if w.layers.is_empty() {
-            w.layers.push(Layer { id: 0, name: String::new(), hidden: false });
+        let mut w = World::empty();
+        // Always the 8 layers; a name equal to the id is MagicaVoxel's
+        // default, kept empty.
+        for l in &mut w.layers {
+            if let Some(d) = f.layers.get(&l.id) {
+                l.name = d.get("_name").filter(|n| **n != l.id.to_string()).cloned().unwrap_or_default();
+                l.hidden = d.get("_hidden").is_some_and(|v| v == "1");
+            }
         }
         if f.nodes.is_empty() {
             // Old files: every model at the origin.
@@ -1486,6 +1522,35 @@ mod tests {
         assert_eq!(n.pivot, Some(Vec3::new(0.5, 1.5, 0.0)));
         assert_eq!(n.tilt, Vec3::new(0.0, 15.0, -30.0));
         assert_eq!(n.sockets, w.node(m).unwrap().sockets);
+    }
+
+    #[test]
+    fn layers_like_magicavoxel() {
+        let mut w = World::single(vol(IVec3::splat(3), &[(IVec3::ONE, 4)]));
+        assert_eq!(w.layers.iter().map(|l| l.label()).collect::<Vec<_>>(), ["0", "1", "2", "3", "4", "5", "6", "7"]);
+        // New objects go on the current layer.
+        w.current_layer = 3;
+        let a = w.add_model(ROOT, "a", vol(IVec3::ONE, &[(IVec3::ZERO, 1)]), IVec3::new(10, 0, 0));
+        assert_eq!(w.node(a).unwrap().layer, 3);
+        // Setting a group's layer takes its contents along.
+        let first = w.models()[0];
+        let g = w.group(&[first, a]).unwrap();
+        w.set_layer(&[g], 5);
+        assert!([g, first, a].iter().all(|&i| w.node(i).unwrap().layer == 5));
+        // Hiding a layer hides what's on it.
+        w.layer_mut(5).unwrap().hidden = true;
+        assert!(!w.visible(a));
+        w.layer_mut(2).unwrap().name = "props".into();
+        let path = std::env::temp_dir().join(format!("voxely-layers-{}.vox", std::process::id()));
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[], &[]).unwrap();
+        let f = VoxFile::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        // MagicaVoxel's own files always name all 8.
+        assert_eq!(f.layers.len(), 8);
+        assert_eq!(f.layers[&0].get("_name").map(String::as_str), Some("0"));
+        let back = World::from_vox(&f);
+        assert_eq!(back.layers, w.layers);
+        assert!(!back.visible(back.find("a").unwrap()));
     }
 
     #[test]

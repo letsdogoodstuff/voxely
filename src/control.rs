@@ -391,6 +391,13 @@ fn base_tools() -> Value {
             "name": { "type": "string", "description": "New name (rename) or the copy's name (duplicate)" },
             "offset": xyz("duplicate: where the copy goes relative to the original (default: just beside it on x)"),
         }), &["part", "action"]),
+        tool("set_layer", "MagicaVoxel's 8 layers (0-7): put parts on one, show or hide it, rename it, or make it the layer new parts go on. A hidden layer hides every part on it; list_parts shows each part's layer.", json!({
+            "layer": { "type": "integer", "minimum": 0, "maximum": 7 },
+            "parts": { "type": "array", "items": { "type": ["string", "integer"] }, "description": "Parts or groups to put on this layer (a group's contents go too)" },
+            "hidden": { "type": "boolean" },
+            "name": { "type": "string" },
+            "current": { "type": "boolean", "description": "true: new parts go on this layer" },
+        }), &["layer"]),
         tool("group_parts", "Put parts and groups into a new group, so they move and turn together.", json!({
             "parts": { "type": "array", "items": { "type": ["string", "integer"] } },
             "name": { "type": "string" },
@@ -711,6 +718,7 @@ fn part_json(scene: &Scene, id: usize) -> Value {
         "kind": if n.is_group() { "group" } else { "part" },
         "position": arr(lo),
         "size": arr(size),
+        "layer": n.layer,
     });
     if n.hidden {
         v["hidden"] = json!(true);
@@ -836,7 +844,40 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "list_parts" => {
             let top = ctx.scene.world.node(crate::world::ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
             let tree: Vec<Value> = top.iter().map(|&c| part_json(ctx.scene, c)).collect();
-            Ok(vec![text(serde_json::to_string_pretty(&json!({ "mode": if ctx.scene.editing().is_some() { "edit" } else { "world" }, "parts": tree }))?)])
+            let w = &ctx.scene.world;
+            let layers: Vec<Value> = w.layers.iter().map(|l| json!({ "id": l.id, "name": l.label(), "hidden": l.hidden })).collect();
+            Ok(vec![text(serde_json::to_string_pretty(&json!({ "mode": if ctx.scene.editing().is_some() { "edit" } else { "world" }, "parts": tree, "layers": layers, "current_layer": w.current_layer }))?)])
+        }
+        "set_layer" => {
+            use crate::outline::TreeOp;
+            let layer = a.get("layer").and_then(Value::as_i64).context("missing `layer`")? as i32;
+            if !(0..crate::world::LAYERS).contains(&layer) {
+                bail!("`layer` is 0-7");
+            }
+            let mut done = Vec::new();
+            if let Some(parts) = a.get("parts").and_then(Value::as_array) {
+                let ids = parts.iter().map(|p| find_part(ctx.scene, Some(p))).collect::<Result<Vec<_>>>()?;
+                ctx.scene.change_quiet(|w| w.set_layer(&ids, layer));
+                done.push(format!("put {} on it", ids.len()));
+            }
+            if let Some(hidden) = a.get("hidden").and_then(Value::as_bool) {
+                if ctx.scene.world.layer(layer).is_some_and(|l| l.hidden != hidden) {
+                    app::tree_op(TreeOp::LayerShow(layer), ctx.scene, ctx.ed);
+                }
+                done.push((if hidden { "hidden" } else { "shown" }).to_string());
+            }
+            if let Some(name) = string(a, "name") {
+                app::tree_op(TreeOp::LayerName(layer, name.to_string()), ctx.scene, ctx.ed);
+                done.push(format!("named `{}`", ctx.scene.world.layer(layer).map(|l| l.label()).unwrap_or_default()));
+            }
+            if a.get("current").and_then(Value::as_bool) == Some(true) {
+                ctx.scene.world.current_layer = layer;
+                done.push("new parts go on it".into());
+            }
+            if done.is_empty() {
+                bail!("nothing to do: give parts, hidden, name or current");
+            }
+            Ok(vec![text(format!("Layer {layer}: {}", done.join(", ")))])
         }
         "edit_part" => {
             if get(a, "part").and_then(Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case("world")) {

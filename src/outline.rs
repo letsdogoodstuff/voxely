@@ -20,6 +20,12 @@ pub enum TreeOp {
     /// Hide the picked nodes [Ctrl+H], or show everything [Ctrl+Shift+H].
     Hide(bool),
     ToggleHidden(usize),
+    /// MagicaVoxel's layer panel: show or hide a layer, pick the layer new
+    /// objects go on, rename one, put the picked objects on one.
+    LayerShow(i32),
+    LayerCurrent(i32),
+    LayerName(i32, String),
+    LayerSet(i32),
     /// Move by whole voxels [arrows, PageUp/PageDown].
     Move(IVec3),
     /// Quarter turns about a world axis [+/- for z, 9/0 for x].
@@ -79,6 +85,7 @@ impl Extras {
 #[derive(Default)]
 pub struct OutlineState {
     pub rename: Option<(usize, String)>,
+    pub layers: crate::layers::LayerState,
 }
 
 fn op(ui: &mut Ui, cmds: &mut Vec<Command>, label: &str, hint: &str, enabled: bool, o: TreeOp) {
@@ -226,6 +233,9 @@ pub fn panel(ui: &mut Ui, scene: &Scene, state: &mut OutlineState, cmds: &mut Ve
                 op(ui, cmds, "Go inside", hint, inner, TreeOp::Enter(picked.first().copied().unwrap_or(ROOT)));
                 ui.end_row();
             });
+        });
+        CollapsingHeader::new("Layer").default_open(true).show(ui, |ui| {
+            crate::layers::panel(ui, w, picked, &mut state.layers, cmds);
         });
         // Open while the scene has no rig yet, to show it can make one.
         let has_rig = w.node(ROOT).is_some_and(|r| r.children().iter().any(|&t| !crate::rig::find_bones(w, t).is_empty()));

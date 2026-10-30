@@ -285,6 +285,7 @@ mod tests {
             ("run_script", json!({ "source": "1 + 1", "args": { "n": 3 }, "timeout": 10 })),
             ("set_view_mode", json!({ "mode": "render" })),
             ("list_parts", json!({})),
+            ("set_layer", json!({ "layer": 2, "parts": ["roof"], "hidden": false, "name": "props", "current": true })),
             ("edit_part", json!({ "part": "world" })),
             ("create_part", json!({ "name": "arm", "size": [4, 4, 12], "position": [10, 0, 0], "parent": 1, "fill": 3 })),
             ("transform_part", json!({ "part": "arm", "move": [1, 0, 0], "rotate_axis": "z", "quarter_turns": -1, "free_rotation": [0, 0, 15], "attach_to": "body:shoulder_r", "attach_socket": "grip", "link": true, "frame": 2 })),

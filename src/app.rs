@@ -686,6 +686,25 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
                 n.hidden ^= true;
             }
         }),
+        TreeOp::LayerShow(l) => scene.change_quiet(|w| {
+            if let Some(l) = w.layer_mut(l) {
+                l.hidden ^= true;
+            }
+        }),
+        TreeOp::LayerCurrent(l) => scene.world.current_layer = l,
+        TreeOp::LayerName(l, name) => {
+            let name = name.trim().to_string();
+            if w.layer(l).is_none_or(|old| old.label() == name || name.is_empty() && old.name.is_empty()) {
+                return false;
+            }
+            scene.change_quiet(|w| {
+                if let Some(l) = w.layer_mut(l) {
+                    // Typing the id back is the default name.
+                    l.name = if name == l.id.to_string() { String::new() } else { name };
+                }
+            });
+        }
+        TreeOp::LayerSet(l) if !picked.is_empty() => scene.change_quiet(|w| w.set_layer(&picked, l)),
         TreeOp::Move(d) => scene.change(|w| picked.iter().for_each(|&p| w.translate(p, d))),
         TreeOp::Turn(axis, q) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::turn(axis, q)))),
         TreeOp::Flip(axis) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::flip(axis)))),

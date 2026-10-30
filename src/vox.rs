@@ -543,10 +543,9 @@ pub fn write_with(
         body.extend_from_slice(bytes);
     }
     for l in &world.layers {
+        // MagicaVoxel always writes a name, "0".."7" by default.
         let mut attrs = Dict::new();
-        if !l.name.is_empty() {
-            attrs.insert("_name".into(), l.name.clone());
-        }
+        attrs.insert("_name".into(), l.label());
         if l.hidden {
             attrs.insert("_hidden".into(), "1".into());
         }
