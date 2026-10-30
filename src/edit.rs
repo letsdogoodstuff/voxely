@@ -1297,15 +1297,27 @@ impl Editor {
         };
         match o.geo {
             GeoShape::Line if o.project => {
-                // Follow the surface: cast rays between the press and
-                // release rays.
+                // Follow the surface: the straight line between the end
+                // cells under the press and release rays, each of its cells
+                // moved to the surface the camera sees there. On a flat
+                // surface that is the plain line.
                 let ((ro0, rd0), (ro1, rd1)) = (s.ray0, s.ray1);
-                let steps = ((b - a).abs().max_element() * 3).clamp(2, 4096);
-                let mut out = Vec::new();
-                for k in 0..=steps {
-                    let f = k as f32 / steps as f32;
-                    let (ro, rd) = (ro0.lerp(ro1, f), rd0.lerp(rd1, f).normalize());
+                let end = |ro, rd| pick(v, ro, rd).and_then(|h| target(self.tool, h));
+                let (Some(a), Some(b)) = (end(ro0, rd0), end(ro1, rd1)) else { return Vec::new() };
+                // Aim at the face each cell shows: Attach targets sit on it,
+                // Erase and Paint targets are behind it.
+                let side = if self.tool == Tool::Attach { -0.5 } else { 0.5 };
+                let ortho = ro0.distance(ro1) > 1e-4;
+                let mut out: Vec<IVec3> = Vec::new();
+                for c in line(a, b) {
+                    let aim = c.as_vec3() + 0.5 + s.normal.as_vec3() * side;
+                    let (ro, rd) = if ortho { (aim - rd0 * 1e4, rd0) } else { (ro0, (aim - ro0).normalize()) };
                     if let Some(t) = pick(v, ro, rd).and_then(|h| target(self.tool, h)) {
+                        // Drop a corner where the line already steps
+                        // diagonally past it, so it stays one cell wide.
+                        if out.len() >= 2 && (t - out[out.len() - 2]).abs().max_element() <= 1 {
+                            out.pop();
+                        }
                         if out.last() != Some(&t) {
                             out.push(t);
                         }
@@ -1957,6 +1969,30 @@ mod tests {
         assert_eq!(count(&v, 4), 4);
         assert!(e.undo(&mut v));
         assert_eq!(count(&v, 4), 0);
+    }
+
+    #[test]
+    fn projected_line_is_clean_on_a_flat_surface() {
+        // Painting a shallow diagonal across a slab's top from a 3/4 view:
+        // the same cells as the plain line, one per column.
+        let mut v = Volume::new(IVec3::splat(32));
+        for p in cuboid(IVec3::ZERO, IVec3::new(31, 31, 3)) {
+            v.set(p, 9);
+        }
+        let mut e = Editor::new(4);
+        e.brush = Brush::Geo;
+        e.tool = Tool::Paint;
+        let eye = Vec3::new(-20.0, -30.0, 40.0);
+        let ray = |p: Vec3| (eye, (p - eye).normalize());
+        let (ro, rd) = ray(Vec3::new(2.5, 3.5, 4.0));
+        let hit = pick(&v, ro, rd).unwrap();
+        e.begin(&mut v, hit, ro, rd);
+        let (ro, rd) = ray(Vec3::new(16.5, 11.5, 4.0));
+        e.drag(&mut v, ro, rd, None);
+        e.end(&mut v);
+        let mut painted: Vec<IVec3> = v.cells.filled().filter(|&(_, c)| c == 4).map(|(i, _)| v.position(i)).collect();
+        painted.sort_by_key(|c| c.x);
+        assert_eq!(painted, line(IVec3::new(2, 3, 3), IVec3::new(16, 11, 3)));
     }
 
     /// Geo shape cell count for a drag of (dx, dy) on the floor.
