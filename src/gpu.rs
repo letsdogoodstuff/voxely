@@ -964,9 +964,22 @@ impl Renderer {
 
     /// Render `samples` samples offscreen and return RGBA8 pixels.
     pub fn render_image(&mut self, samples: u32) -> Result<Vec<u8>> {
+        self.render_image_counted(samples, &std::sync::atomic::AtomicU32::new(0))
+    }
+
+    /// `render_image`, adding each batch of samples to `done` once the GPU
+    /// has traced it (for progress reports).
+    pub fn render_image_counted(&mut self, samples: u32, done: &std::sync::atomic::AtomicU32) -> Result<Vec<u8>> {
         self.reset();
         let t0 = std::time::Instant::now();
-        self.trace(samples);
+        let mut left = samples;
+        while left > 0 {
+            let n = left.min(16);
+            self.trace(n);
+            self.device.poll(wgpu::PollType::wait_indefinitely())?;
+            done.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            left -= n;
+        }
         let pixels = self.read_pixels()?;
         let t = &self.targets;
         log::info!("{samples} spp at {}x{} in {:.2?}", t.width, t.height, t0.elapsed());

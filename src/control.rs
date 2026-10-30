@@ -24,6 +24,7 @@ mod arrange;
 mod build;
 pub mod guide;
 mod health;
+pub(crate) mod jobs;
 mod import;
 pub(crate) mod inspect;
 mod reference;
@@ -87,6 +88,9 @@ pub struct Ctx<'a> {
     pub ed: &'a mut EditState,
     /// True inside the window, false when running headless.
     pub live: bool,
+    /// The call came from `voxely mcp`, which waits on slow work: renders
+    /// run as background jobs (see `jobs`) instead of holding the window.
+    pub detach: bool,
 }
 
 /// Guidance sent to the client when it connects.
@@ -274,7 +278,7 @@ fn base_tools() -> Value {
             frame: true keeps the camera's yaw and pitch but fits distance and target to all the voxels with a margin (a good default for a first look). \
             views path traces several auto-framed views tiled side by side with labels, same lighting: \"turnaround\" (front, right, back, left), \
             \"quad\", \"all\", or a list of front, back, left, right, top, bottom, iso, 3/4 and [x, y, z] directions (model toward the eye, perspective). Named views are orthographic except 3/4 unless projection says otherwise. \
-            Neither changes the window's camera; the result lists the cameras used.", json!({
+            Neither changes the window's camera; the result lists the cameras used. It traces in the background: the window stays usable, and a long render returns a job id to collect later.", json!({
             "width": { "type": "integer", "minimum": 16, "maximum": 8192, "description": "Whole image width (default 960; with views 480 per tile, at least 16 per tile)" },
             "height": { "type": "integer", "minimum": 16, "maximum": 8192, "description": "Whole image height (default 640; with views 600 per tile, at least 16 per tile)" },
             "samples": { "type": "integer", "minimum": 1, "maximum": 65536, "description": "Samples per pixel (default 128; more is smoother and slower)" },
@@ -283,6 +287,8 @@ fn base_tools() -> Value {
             "max_size": { "type": "integer", "minimum": 64, "maximum": 8192, "description": "Longest side of the whole image when width and height aren't given (scales the default size)" },
             "projection": { "type": "string", "enum": ["orthographic", "perspective"], "description": "For frame/views (default: each view's own; frame keeps the current projection)" },
             "save_path": { "type": "string", "description": "Also save the PNG here (the whole tiled image with views)" },
+            "wait": { "type": "number", "minimum": 0, "maximum": 3600, "description": "Seconds to wait for the image (default 50). The window stays usable while it traces; a render still going after this returns a job id instead" },
+            "job": { "type": "string", "description": "Collect a render that was still going: the job id (like \"r3\") an earlier render returned. Other arguments are ignored" },
         }), &[]),
         tool("export", "Export the model: gltf (.glb, best for game engines), or MagicaVoxel's formats: obj/ply/mc/cube meshes, xraw/slab/qb/vox volumes, iso/2d/slice sprite images, point clouds.", json!({
             "format": { "type": "string", "enum": ["gltf", "obj", "ply", "mc", "xraw", "slab", "qb", "vox", "iso", "2d", "slice", "point", "cube"],
@@ -457,7 +463,11 @@ pub fn call(ctx: &mut Ctx, name: &str, args: &Value) -> Value {
         Err(e) => return json!({ "content": [text(format!("{e:#}"))], "isError": true }),
     };
     match dispatch(ctx, name, &args) {
-        Ok(content) => json!({ "content": content, "isError": false }),
+        Ok(mut content) => match jobs::take_marker(&mut content) {
+            // Still running: `voxely mcp` waits on `job` (see `jobs`).
+            Some(job) => json!({ "content": content, "isError": false, "job": job }),
+            None => json!({ "content": content, "isError": false }),
+        },
         Err(e) => json!({ "content": [text(format!("{e:#}"))], "isError": true }),
     }
 }
@@ -709,11 +719,14 @@ fn shader_path(ctx: &Ctx, name: &str) -> Result<PathBuf> {
 }
 
 /// Pixels of a final render from the current camera.
-fn render_pixels(ctx: &Ctx, w: u32, h: u32, spp: u32) -> Result<Vec<u8>> {
-    let mut out = Renderer::new(ctx.r.device.clone(), ctx.r.queue.clone(), ctx.scene, None, w, h);
-    out.settings = ctx.r.settings.clone();
-    out.set_camera(ctx.r.camera);
-    out.render_image(spp)
+/// Path trace `work` (`total` samples in all): in the background when the
+/// call came from `voxely mcp` (it waits and reports progress), else here.
+pub(crate) fn run_render(ctx: &Ctx, total: u32, work: impl FnOnce(&std::sync::atomic::AtomicU32) -> Result<Vec<Value>> + Send + 'static) -> Result<Vec<Value>> {
+    if ctx.detach {
+        let id = jobs::start(total, work);
+        return jobs::collect(&id);
+    }
+    work(&std::sync::atomic::AtomicU32::new(0))
 }
 
 // ---------------------------------------------------------------- tools
@@ -2221,6 +2234,9 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         }
         // "screenshot" lives in view.rs.
         "render" => {
+            if let Some(id) = string(a, "job") {
+                return jobs::collect(id);
+            }
             if get(a, "views").is_some() || boolean(a, "frame").unwrap_or(false) {
                 return view::render_framed(ctx, a);
             }
@@ -2228,17 +2244,22 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let (dw, dh) = fit_max_size(a, 960, 640);
             let (w, h) = (int_in(a, "width", dw as i64, 16, max)? as u32, int_in(a, "height", dh as i64, 16, max)? as u32);
             let spp = int_in(a, "samples", 128, 1, 65536)? as u32;
-            let t = std::time::Instant::now();
-            let px = render_pixels(ctx, w, h, spp)?;
-            let mut out = vec![image(w, h, &px)?];
-            let mut note = format!("Rendered {w}x{h} at {spp} spp in {:.1?}", t.elapsed());
-            if let Some(p) = string(a, "save_path") {
-                let path = Path::new(p);
-                crate::save_png(path, w, h, &px)?;
-                note.push_str(&format!("; saved {}", std::fs::canonicalize(path).unwrap_or(path.into()).display()));
-            }
-            out.push(text(note));
-            Ok(out)
+            let mut out_r = Renderer::new(ctx.r.device.clone(), ctx.r.queue.clone(), ctx.scene, None, w, h);
+            out_r.settings = ctx.r.settings.clone();
+            out_r.set_camera(ctx.r.camera);
+            let save = string(a, "save_path").map(PathBuf::from);
+            run_render(ctx, spp, move |done| {
+                let t = std::time::Instant::now();
+                let px = out_r.render_image_counted(spp, done)?;
+                let mut out = vec![image(w, h, &px)?];
+                let mut note = format!("Rendered {w}x{h} at {spp} spp in {:.1?}", t.elapsed());
+                if let Some(path) = save {
+                    crate::save_png(&path, w, h, &px)?;
+                    note.push_str(&format!("; saved {}", std::fs::canonicalize(&path).unwrap_or(path).display()));
+                }
+                out.push(text(note));
+                Ok(out)
+            })
         }
         "export" => {
             let name = string(a, "format").context("missing `format`")?;
@@ -2274,7 +2295,10 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                     _ => bail!("`timeout` must be a number of seconds from 0.1 to 3600, not {t}"),
                 },
             };
+            // A script uses each result as it comes, so its renders finish before the call returns.
+            let detach = std::mem::replace(&mut ctx.detach, false);
             let outcome = crate::script::run(ctx, source, file, get(a, "args").cloned().unwrap_or(Value::Null), timeout);
+            ctx.detach = detach;
             Ok(vec![text(crate::script::report(&outcome)?)])
         }
         "set_view_mode" => {

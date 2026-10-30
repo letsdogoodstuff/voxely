@@ -233,7 +233,7 @@ impl Headless {
     }
 
     pub(crate) fn call(&mut self, name: &str, args: &Value) -> Value {
-        let mut ctx = Ctx { r: &mut self.r, scene: &mut self.scene, ed: &mut self.ed, live: false };
+        let mut ctx = Ctx { r: &mut self.r, scene: &mut self.scene, ed: &mut self.ed, live: false, detach: true };
         call_guarded(&mut ctx, name, args)
     }
 }
@@ -256,7 +256,7 @@ pub(crate) fn call_live(name: &str, args: &Value) -> Option<Result<Value>> {
     let stream = UnixStream::connect(socket_path()).ok()?;
     Some((|| {
         let mut writer = stream.try_clone()?;
-        writeln!(writer, "{}", json!({ "tool": name, "args": args }))?;
+        writeln!(writer, "{}", json!({ "tool": name, "args": args, "detach": true }))?;
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line)?;
         serde_json::from_str(&line).context("bad reply from the voxely window")
@@ -276,8 +276,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
     let assets = assets_dir(assets);
-    let mut headless: Option<Headless> = None;
-    let mut build = BuildCheck::new();
+    let mut backend = Backend { headless_only, assets, headless: None, build: BuildCheck::new() };
     let log = ContextLog::from_env();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -318,30 +317,16 @@ pub fn run(args: &[String]) -> Result<()> {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let started = std::time::Instant::now();
-                let live = if headless_only { None } else { call_live(name, &args) };
-                let r = match live {
-                    Some(Ok(mut v)) => {
-                        let is_error = v["isError"].as_bool() == Some(true);
-                        if let (Some(note), Some(content)) = (build.window_note(is_error), v["content"].as_array_mut()) {
-                            content.push(json!({ "type": "text", "text": note }));
+                let token = params.pointer("/_meta/progressToken").cloned();
+                let mut r = backend.call(name, &args);
+                if r.get("job").is_some() {
+                    r = backend.wait_for_job(r, &args, |done, total| {
+                        if let Some(t) = &token {
+                            let note = json!({ "jsonrpc": "2.0", "method": "notifications/progress", "params": { "progressToken": t, "progress": done, "total": total, "message": "path tracing" } });
+                            let _ = reply(&mut stdout, note);
                         }
-                        v
-                    }
-                    Some(Err(e)) => json!({ "content": [{ "type": "text", "text": format!("voxely window error: {e:#}") }], "isError": true }),
-                    None => {
-                        if headless.is_none() {
-                            match Headless::new(assets.as_ref()) {
-                                Ok(h) => headless = Some(h),
-                                Err(e) => {
-                                    let msg = format!("couldn't start headless voxely: {e:#}");
-                                    reply(&mut stdout, json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": msg }], "isError": true } }))?;
-                                    continue;
-                                }
-                            }
-                        }
-                        headless.as_mut().unwrap().call(name, &args)
-                    }
-                };
+                    });
+                }
                 log.call(name, &r, started.elapsed().as_millis());
                 Ok(r)
             }
@@ -354,6 +339,68 @@ pub fn run(args: &[String]) -> Result<()> {
         reply(&mut stdout, response)?;
     }
     Ok(())
+}
+
+/// Where tool calls go: the open window, else a headless session.
+struct Backend {
+    headless_only: bool,
+    assets: Option<PathBuf>,
+    headless: Option<Headless>,
+    build: BuildCheck,
+}
+
+/// How long a call waits for a background render unless its `wait` says
+/// otherwise: under the 60 s tool timeout some MCP clients use.
+const RENDER_WAIT: f64 = 50.0;
+
+impl Backend {
+    fn call(&mut self, name: &str, args: &Value) -> Value {
+        let live = if self.headless_only { None } else { call_live(name, args) };
+        match live {
+            Some(Ok(mut v)) => {
+                let is_error = v["isError"].as_bool() == Some(true);
+                if let (Some(note), Some(content)) = (self.build.window_note(is_error), v["content"].as_array_mut()) {
+                    content.push(json!({ "type": "text", "text": note }));
+                }
+                v
+            }
+            Some(Err(e)) => json!({ "content": [{ "type": "text", "text": format!("voxely window error: {e:#}") }], "isError": true }),
+            None => {
+                if self.headless.is_none() {
+                    match Headless::new(self.assets.as_ref()) {
+                        Ok(h) => self.headless = Some(h),
+                        Err(e) => return json!({ "content": [{ "type": "text", "text": format!("couldn't start headless voxely: {e:#}") }], "isError": true }),
+                    }
+                }
+                self.headless.as_mut().unwrap().call(name, args)
+            }
+        }
+    }
+
+    /// Poll a background render (`r` says which) until it finishes or the
+    /// call's `wait` runs out, reporting samples traced. The window answers
+    /// each poll at once, so it stays usable all the while.
+    fn wait_for_job(&mut self, mut r: Value, args: &Value, mut progress: impl FnMut(u64, u64)) -> Value {
+        let wait = args.get("wait").and_then(Value::as_f64).unwrap_or(RENDER_WAIT).clamp(0.0, 3600.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(wait);
+        let mut last = None;
+        while let Some(job) = r.get("job").cloned() {
+            let (done, total) = (job["done"].as_u64().unwrap_or(0), job["total"].as_u64().unwrap_or(0));
+            if last != Some(done) {
+                progress(done, total);
+                last = Some(done);
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            r = self.call("render", &json!({ "job": job["id"] }));
+        }
+        if let Some(o) = r.as_object_mut() {
+            o.remove("job");
+        }
+        r
+    }
 }
 
 fn reply(out: &mut std::io::Stdout, v: Value) -> Result<()> {

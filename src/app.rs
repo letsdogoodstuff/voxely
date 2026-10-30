@@ -2244,7 +2244,8 @@ const FLY_KEYS: [&str; 6] = ["w", "s", "a", "d", "q", "e"];
 /// Events sent to the window from other threads.
 pub enum UserEvent {
     /// A tool call from `voxely mcp` and where to send the result.
-    Control { tool: String, args: serde_json::Value, reply: std::sync::mpsc::Sender<serde_json::Value> },
+    /// `detach`: the caller (`voxely mcp`) waits on background renders.
+    Control { tool: String, args: serde_json::Value, detach: bool, reply: std::sync::mpsc::Sender<serde_json::Value> },
 }
 
 /// Listen on the control socket and forward each request to the window.
@@ -2283,7 +2284,8 @@ pub fn serve_control(proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Opt
                             let (tx, rx) = std::sync::mpsc::channel();
                             let tool = req["tool"].as_str().unwrap_or("").to_string();
                             let args = req.get("args").cloned().unwrap_or(serde_json::json!({}));
-                            if proxy.send_event(UserEvent::Control { tool, args, reply: tx }).is_err() {
+                            let detach = req["detach"].as_bool() == Some(true);
+                            if proxy.send_event(UserEvent::Control { tool, args, detach, reply: tx }).is_err() {
                                 break;
                             }
                             rx.recv().unwrap_or_else(|_| serde_json::json!({ "content": [{ "type": "text", "text": "the voxely window closed" }], "isError": true }))
@@ -2413,7 +2415,7 @@ impl App {
         let Some(g) = self.gfx.as_mut() else { return };
         let sig = Sig::of(&g.renderer.settings, &self.scene, &self.edit);
         if self.edit.dirty.see(sig) && gui {
-            let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true };
+            let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true, detach: false };
             match crate::control::inspect::count_gui_edit(&mut ctx) {
                 Some(Ok(msg)) => self.edit.say(msg),
                 Some(Err(msg)) => self.edit.fail(msg),
@@ -3062,7 +3064,7 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::Control { tool, args, reply } = event;
+        let UserEvent::Control { tool, args, detach, reply } = event;
         let result = match self.gfx.as_mut() {
             Some(g) if !self.edit.agent.allow => {
                 let result = crate::agents::AgentState::paused_reply();
@@ -3073,7 +3075,7 @@ impl ApplicationHandler<UserEvent> for App {
             Some(_) => {
                 self.track_changes(true);
                 let g = self.gfx.as_mut().unwrap();
-                let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true };
+                let mut ctx = crate::control::Ctx { r: &mut g.renderer, scene: &mut self.scene, ed: &mut self.edit, live: true, detach };
                 let result = crate::mcp::call_guarded(&mut ctx, &tool, &args);
                 self.edit.agent.record(&tool, &result);
                 g.window.request_redraw();

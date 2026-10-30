@@ -266,67 +266,70 @@ pub fn render_framed(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     let spp = int_in(a, "samples", 128, 1, 65536)? as u32;
     let (lo, hi) = traced_bounds(ctx.scene).ok_or_else(|| anyhow::anyhow!("nothing to render: the scene has no voxels"))?;
 
-    let t = std::time::Instant::now();
     let mut r = crate::gpu::Renderer::new(ctx.r.device.clone(), ctx.r.queue.clone(), ctx.scene, None, tw, th);
     r.settings = ctx.r.settings.clone();
-    let fov = r.settings.fov;
-    let mut out = Canvas::new(tw * cols, th * rows, [0, 0, 0, 255].repeat((tw * cols * th * rows) as usize));
-    let mut cams = Vec::new();
-    for (i, &view) in views.iter().enumerate() {
-        let (yaw, pitch, ortho) = match view.orient() {
-            Some((y, p, o)) => (y.to_radians(), p.to_radians(), o),
-            None => (ctx.r.camera.yaw, ctx.r.camera.pitch, ctx.r.settings.projection == Projection::Orthographic),
-        };
-        let proj = projection.unwrap_or(if view == View::Current { ctx.r.settings.projection } else if ortho { Projection::Orthographic } else { Projection::Perspective });
-        let cam = fit_box(yaw, pitch, proj == Projection::Orthographic, lo, hi, fov, tw as f32, th as f32, 0.06);
-        r.settings.projection = proj;
-        r.set_camera(cam);
-        let mut tile = Canvas::new(tw, th, r.render_image(spp)?);
-        if n > 1 {
-            let sc = if tw.min(th) >= 280 { 2 } else { 1 };
-            tile.text(8, 8, &view.name(), sc, WHITE);
-        }
-        out.blit(&tile, (i as u32 % cols * tw) as i32, (i as u32 / cols * th) as i32);
-        // In world coordinates, as set_camera takes them.
-        let t = cam.target + ctx.scene.origin.as_vec3();
-        cams.push(format!(
-            "{}: yaw {:.0}, pitch {:.0}, distance {:.1}, target [{:.1}, {:.1}, {:.1}], {:?}",
-            if view == View::Current { "camera".to_string() } else { view.name() },
-            cam.yaw.to_degrees().rem_euclid(360.0),
-            cam.pitch.to_degrees(),
-            cam.dist,
-            t.x,
-            t.y,
-            t.z,
-            proj
-        ));
-    }
-    for c in 1..cols {
-        out.rect((c * tw) as i32 - 1, 0, 2, out.h as i32, [0, 0, 0], 0.8);
-    }
-    for row in 1..rows {
-        out.rect(0, (row * th) as i32 - 1, out.w as i32, 2, [0, 0, 0], 0.8);
-    }
+    let current = (ctx.r.camera.yaw, ctx.r.camera.pitch, ctx.r.settings.projection);
     let o = ctx.scene.origin.as_vec3();
-    let mut note = format!(
-        "Rendered {n} view{} at {tw}x{th} each, {spp} spp, in {:.1?}, framed on the voxels [{:.0}, {:.0}, {:.0}]..[{:.0}, {:.0}, {:.0}] world (exclusive). \
-         Cameras (set_camera takes these to keep one; the window's camera is unchanged): {}.",
-        if n == 1 { "" } else { "s" },
-        t.elapsed(),
-        lo.x + o.x,
-        lo.y + o.y,
-        lo.z + o.z,
-        hi.x + o.x,
-        hi.y + o.y,
-        hi.z + o.z,
-        cams.join("; ")
-    );
-    if let Some(p) = string(a, "save_path") {
-        let path = std::path::Path::new(p);
-        crate::save_png(path, out.w, out.h, &out.px)?;
-        note.push_str(&format!(" Saved {}.", std::fs::canonicalize(path).unwrap_or(path.into()).display()));
-    }
-    Ok(vec![super::image(out.w, out.h, &out.px)?, text(note)])
+    let save = string(a, "save_path").map(std::path::PathBuf::from);
+    super::run_render(ctx, spp * n, move |done| {
+        let t = std::time::Instant::now();
+        let fov = r.settings.fov;
+        let mut out = Canvas::new(tw * cols, th * rows, [0, 0, 0, 255].repeat((tw * cols * th * rows) as usize));
+        let mut cams = Vec::new();
+        for (i, &view) in views.iter().enumerate() {
+            let (yaw, pitch, ortho) = match view.orient() {
+                Some((y, p, o)) => (y.to_radians(), p.to_radians(), o),
+                None => (current.0, current.1, current.2 == Projection::Orthographic),
+            };
+            let proj = projection.unwrap_or(if view == View::Current { current.2 } else if ortho { Projection::Orthographic } else { Projection::Perspective });
+            let cam = fit_box(yaw, pitch, proj == Projection::Orthographic, lo, hi, fov, tw as f32, th as f32, 0.06);
+            r.settings.projection = proj;
+            r.set_camera(cam);
+            let mut tile = Canvas::new(tw, th, r.render_image_counted(spp, done)?);
+            if n > 1 {
+                let sc = if tw.min(th) >= 280 { 2 } else { 1 };
+                tile.text(8, 8, &view.name(), sc, WHITE);
+            }
+            out.blit(&tile, (i as u32 % cols * tw) as i32, (i as u32 / cols * th) as i32);
+            // In world coordinates, as set_camera takes them.
+            let t = cam.target + o;
+            cams.push(format!(
+                "{}: yaw {:.0}, pitch {:.0}, distance {:.1}, target [{:.1}, {:.1}, {:.1}], {:?}",
+                if view == View::Current { "camera".to_string() } else { view.name() },
+                cam.yaw.to_degrees().rem_euclid(360.0),
+                cam.pitch.to_degrees(),
+                cam.dist,
+                t.x,
+                t.y,
+                t.z,
+                proj
+            ));
+        }
+        for c in 1..cols {
+            out.rect((c * tw) as i32 - 1, 0, 2, out.h as i32, [0, 0, 0], 0.8);
+        }
+        for row in 1..rows {
+            out.rect(0, (row * th) as i32 - 1, out.w as i32, 2, [0, 0, 0], 0.8);
+        }
+        let mut note = format!(
+            "Rendered {n} view{} at {tw}x{th} each, {spp} spp, in {:.1?}, framed on the voxels [{:.0}, {:.0}, {:.0}]..[{:.0}, {:.0}, {:.0}] world (exclusive). \
+             Cameras (set_camera takes these to keep one; the window's camera is unchanged): {}.",
+            if n == 1 { "" } else { "s" },
+            t.elapsed(),
+            lo.x + o.x,
+            lo.y + o.y,
+            lo.z + o.z,
+            hi.x + o.x,
+            hi.y + o.y,
+            hi.z + o.z,
+            cams.join("; ")
+        );
+        if let Some(path) = save {
+            crate::save_png(&path, out.w, out.h, &out.px)?;
+            note.push_str(&format!(" Saved {}.", std::fs::canonicalize(&path).unwrap_or(path).display()));
+        }
+        Ok(vec![super::image(out.w, out.h, &out.px)?, text(note)])
+    })
 }
 
 fn axis_color(a: usize) -> Rgb {
