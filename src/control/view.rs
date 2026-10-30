@@ -23,7 +23,7 @@ pub fn tools() -> Vec<Value> {
          in world coordinates; scope \"part\" (default with one part) frames the part being edited with the other parts dimmed, rulers in the part's \
          own coordinates (what the voxel tools use). Either way the window's mode and camera are left as they were. \
          focus zooms named views onto a box {from, to} (inclusive cells, in the coordinates the rulers use) or onto a part or group by name, \
-         e.g. to inspect a face, a hand or a car's wheel. \
+         e.g. to inspect a face, a hand or a car's wheel; in scope \"part\" a part named by focus becomes the edited part. \
          With overlay (default on for named views) each tile gets a title, an x/y/z axis gizmo (red x, green y, blue z) and rulers labeled in voxel \
          coordinates: on front/back/left/right/top/bottom along the image edges, otherwise along the framed box's edges. Ticks mark cell centers. \
          highlight_last_edit marks the cells the last edit changed: magenta where they hold voxels, yellow where they're now empty, faint through other voxels.",
@@ -390,6 +390,22 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
     // Scene scope while a part is edited: draw every part flattened (World
     // mode's view) instead of the part with the rest dimmed.
     let scope = parse_scope(ctx, a)?;
+    // Part scope shows the edited part, so focusing on another part by name
+    // edits that one (as a voxel tool's `part` does); a group needs the
+    // scene scope.
+    let mut switched = None;
+    if scope == Scope::Part {
+        if let Some(v @ Value::String(_)) = get(a, "focus") {
+            let id = super::find_part(ctx.scene, Some(v))?;
+            if ctx.scene.world.node(id).is_some_and(|n| n.is_group()) {
+                bail!("`{}` is a group; focus on it with scope \"scene\"", ctx.scene.world.label(id));
+            }
+            if ctx.scene.editing() != Some(id) {
+                super::focus_part(ctx, Some(v))?;
+                switched = Some(ctx.scene.world.label(id));
+            }
+        }
+    }
     let whole = if scope == Scope::Scene && ctx.scene.editing().is_some() { ctx.scene.synced_world().composite(None) } else { None };
     let (vol, world0) = match &whole {
         Some(c) => (&c.volume, c.origin),
@@ -410,6 +426,9 @@ fn screenshot(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
 
     // Highlight the last edit if it was to what's shown.
     let mut notes = Vec::new();
+    if let Some(name) = &switched {
+        notes.push(format!("Now editing `{name}` (focus named it and scope \"part\" shows the edited part)."));
+    }
     let mut highlighted = false;
     if boolean(a, "highlight_last_edit").unwrap_or(false) {
         match &ctx.ed.tools.last_edit {

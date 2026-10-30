@@ -20,6 +20,7 @@ use crate::ui::{Op, TransformKind};
 // `PART_TOOLS` (tools that take a `part`), `dispatch` (None if the name
 // isn't one of its tools) and, if it needs one, a `State` kept in
 // `EditState::tools`.
+mod arrange;
 mod build;
 pub mod guide;
 mod import;
@@ -185,8 +186,9 @@ fn base_tools() -> Value {
             "max_cells": { "type": "integer", "description": "Max map width/height before downsampling (default 128)" },
         }), &[]),
         tool("edit_model", "MagicaVoxel's whole-model tools. fill/clear apply to the selection if there is one.", json!({
-            "op": { "type": "string", "enum": ["full", "fill", "clear", "reverse", "double", "half", "flip", "rotate", "fit", "loop", "mirror", "diagonal", "hull", "flood", "dilate", "erode", "maze", "perlin"],
-                "description": "full: fill empty space; fill: recolor voxels; reverse: swap empty/solid; double/half: scale 2x/0.5x; flip/rotate(90 deg)/mirror(make symmetric)/diagonal/loop(shift 1 with wrap) need `axis`; fit: shrink canvas to model; hull: remove hidden voxels; flood: fill enclosed space; dilate/erode: grow/shrink 1; maze/perlin: generate" },
+            "op": { "type": "string", "enum": ["full", "fill", "clear", "reverse", "double", "half", "flip", "rotate", "fit", "loop", "mirror", "diagonal", "hull", "hollow", "flood", "dilate", "erode", "maze", "perlin"],
+                "description": "full: fill empty space; fill: recolor voxels; reverse: swap empty/solid; double/half: scale 2x/0.5x (transform_model scale for other factors); flip/rotate(90 deg)/mirror(make symmetric)/diagonal/loop(shift 1 with wrap) need `axis`; fit: shrink canvas to model; hull: remove hidden voxels; hollow: keep a shell `thickness` thick (lanterns, pots, carved pumpkins), `color` paints its inside wall; flood: fill enclosed space; dilate/erode: grow/shrink 1; maze/perlin: generate" },
+            "thickness": { "type": "integer", "minimum": 1, "maximum": 64, "description": "hollow: shell thickness in voxels (default 1)" },
             "axis": axis.clone(),
             "direction": { "type": "integer", "description": "loop: -1 or 1" },
             "color": { "type": ["integer", "string"], "description": "full/fill/reverse/flood/maze/perlin: the color for this op only (1-255 or \"#rrggbb\"); default: the current color" },
@@ -283,7 +285,7 @@ fn base_tools() -> Value {
                 "description": "gltf: a .glb for game engines (Godot, Unity, Unreal, Three.js, Bevy) with metal/roughness, emission and glass materials; use a .gltf path for JSON" },
             "path": { "type": "string", "description": "Output file (default: <workspace>/export/<project>.<ext>)" },
         }), &["format"]),
-        tool("run_script", "Run a JavaScript program (QuickJS) inside voxely: one call instead of many. Every tool is voxely.<camelCase name>(args) with the same arguments, e.g. voxely.fillBox({from: [0, 0, 0], to: [9, 9, 0], color: \"#88aa44\"}); it returns parsed JSON or text and throws on errors. For bulk edits, v = voxely.getVolume({part}) gives a part's grid in its own coordinates (default: the part being edited): v.size and v.cells (a Uint8Array of palette indices, x fastest, then y, then z) with v.get(x, y, z), v.set(x, y, z, c) and v.forEach(fn); voxely.setVolume(v, {part}) writes it back (new Volume([x, y, z]) starts empty and resizes the part). voxely.color(\"#rrggbb\") gives the nearest palette index. Returns console.log output and the last expression's value. The whole script is one undo step. Scripts reach files only through the tools (saveFile, openFile, importFile, export, set_reference ...), with the same access those tools have; there is no other file, network or process access.", json!({
+        tool("run_script", "Run a JavaScript program (QuickJS) inside voxely: one call instead of many. Every tool is voxely.<camelCase name>(args) with the same arguments, e.g. voxely.fillBox({from: [0, 0, 0], to: [9, 9, 0], color: \"#88aa44\"}); it returns the tool's reply parsed as JSON where it is JSON (listParts() gives {mode, parts: [{id, name, kind, position, size, voxels, children?, attached?}], layers}; getSceneInfo() an object like get_scene_info shows), else its text, and throws on errors. For bulk edits, v = voxely.getVolume({part}) gives a part's grid in its own coordinates (default: the part being edited): v.size and v.cells (a Uint8Array of palette indices, x fastest, then y, then z) with v.get(x, y, z), v.set(x, y, z, c) and v.forEach(fn); voxely.setVolume(v, {part}) writes it back (new Volume([x, y, z]) starts empty and resizes the part). voxely.color(\"#rrggbb\") gives the nearest palette index. Returns console.log output and the last expression's value. The whole script is one undo step. Scripts reach files only through the tools (saveFile, openFile, importFile, export, set_reference ...), with the same access those tools have; there is no other file, network or process access.", json!({
             "source": { "type": "string", "description": "JavaScript source" },
             "path": { "type": "string", "description": "Or a .js file to run" },
             "args": { "description": "Any JSON value, available to the script as `args`" },
@@ -303,7 +305,7 @@ fn base_tools() -> Value {
             "parent": { "type": ["string", "integer"], "description": "Group to put it in (default: the top level)" },
             "fill": color_schema(),
         }), &["name", "size"]),
-        tool("transform_part", "Move, rotate or flip a part or group as a whole. 90° turns and flips are exact and turn about its pivot (default: its center), around world axes. free_rotation adds any angle (shown resampled; edit the part upright). attach_to attaches it to another part (snapping its pivot or own socket onto that part's socket) so it follows that part from then on, like a sword in a hand.", json!({
+        tool("transform_part", "Move, rotate or flip a part or group as a whole. 90° turns and flips are exact and turn about its pivot (default: its center), around world axes. free_rotation adds any angle (shown resampled; edit the part upright). attach_to attaches it to another part (snapping its pivot or own socket onto that part's socket) so it follows that part from then on, like a sword in a hand. To make a part bigger or smaller use transform_model kind scale; to set parts on the ground use drop_part.", json!({
             "part": { "type": ["string", "integer"] },
             "move": xyz("[dx, dy, dz] offset"),
             "position": xyz("New world position of its minimum corner"),
@@ -385,8 +387,8 @@ fn base_tools() -> Value {
             "name": { "type": "string" },
             "position": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3, "description": "[x, y, z] in the part's own coordinates; omit to remove the socket" },
         }), &["part", "name"]),
-        tool("modify_part", "Rename, duplicate, delete, hide, show or ungroup a part or group.", json!({
-            "part": { "type": ["string", "integer"] },
+        tool("modify_part", "Rename, duplicate, delete, hide, show or ungroup a part or group (or a list of them, except to rename).", json!({
+            "part": { "type": ["string", "integer", "array"], "items": { "type": ["string", "integer"] }, "description": "Part or group name or id, or a list of them" },
             "action": { "type": "string", "enum": ["rename", "duplicate", "delete", "hide", "show", "ungroup", "detach"], "description": "detach: stop following what it's attached to (it stays where it is)" },
             "name": { "type": "string", "description": "New name (rename) or the copy's name (duplicate)" },
             "offset": xyz("duplicate: where the copy goes relative to the original (default: just beside it on x)"),
@@ -415,7 +417,7 @@ const PART_TOOLS: &[&str] = &[
 ];
 
 fn is_part_tool(name: &str) -> bool {
-    [PART_TOOLS, build::PART_TOOLS, guide::PART_TOOLS, import::PART_TOOLS, inspect::PART_TOOLS, reference::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
+    [PART_TOOLS, arrange::PART_TOOLS, build::PART_TOOLS, guide::PART_TOOLS, import::PART_TOOLS, inspect::PART_TOOLS, reference::PART_TOOLS, surface::PART_TOOLS, view::PART_TOOLS].iter().any(|l| l.contains(&name))
 }
 
 /// Tools that pull agents away from the house style (noise, painted
@@ -433,7 +435,7 @@ pub fn tools() -> Value {
 /// `tools`, unlisted tools included.
 fn all_tools() -> Value {
     let mut list = base_tools();
-    let extra = [build::tools(), guide::tools(), import::tools(), inspect::tools(), reference::tools(), surface::tools(), view::tools()];
+    let extra = [arrange::tools(), build::tools(), guide::tools(), import::tools(), inspect::tools(), reference::tools(), surface::tools(), view::tools()];
     list.as_array_mut().unwrap().extend(extra.into_iter().flatten());
     for t in list.as_array_mut().into_iter().flatten() {
         if is_part_tool(t["name"].as_str().unwrap_or_default()) {
@@ -822,8 +824,8 @@ pub(crate) fn focus_part(ctx: &mut Ctx, part: Option<&Value>) -> Result<()> {
 /// Tools that only edit the part's voxels through the voxel editor (or
 /// don't edit at all). Any other tool may change the tree, so the voxel
 /// edits so far move into the tree's history first, one step each.
-const KEEPS_VOXEL_HISTORY: [&str; 34] = [
-    "set_voxels", "fill_box", "draw_shape", "draw_line", "draw_tube", "extrude_polygon", "place_stamp", "paint_faces", "vary_colors",
+const KEEPS_VOXEL_HISTORY: [&str; 35] = [
+    "project_pattern", "set_voxels", "fill_box", "draw_shape", "draw_line", "draw_tube", "extrude_polygon", "place_stamp", "paint_faces", "vary_colors",
     "shade_edges", "select", "move_selection", "undo", "redo", "get_scene_info", "get_voxels", "get_slice", "get_projection", "get_palette",
     "list_parts", "list_projects", "list_shaders", "list_stamps", "list_palette_presets", "list_references", "render", "screenshot",
     "set_camera", "set_render_settings", "set_view_mode", "set_symmetry", "save_stamp", "save_file", "checkpoint",
@@ -837,7 +839,7 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
     if is_part_tool(name) {
         focus_part(ctx, get(a, "part"))?;
     }
-    for family in [build::dispatch, guide::dispatch, import::dispatch, inspect::dispatch, reference::dispatch, surface::dispatch, view::dispatch] {
+    for family in [arrange::dispatch, build::dispatch, guide::dispatch, import::dispatch, inspect::dispatch, reference::dispatch, surface::dispatch, view::dispatch] {
         if let Some(result) = family(ctx, name, a) {
             return result;
         }
@@ -1330,6 +1332,23 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             })])
         }
         "modify_part" => {
+            if let Some(list) = get(a, "part").and_then(Value::as_array) {
+                if string(a, "action") == Some("rename") {
+                    bail!("rename takes one part, not a list");
+                }
+                // Resolve every name first, so a typo changes nothing.
+                let ids = list.iter().map(|p| find_part(ctx.scene, Some(p))).collect::<Result<Vec<_>>>()?;
+                let mut lines = Vec::new();
+                for id in ids {
+                    if ctx.scene.world.node(id).is_none() {
+                        continue; // went with an earlier delete
+                    }
+                    let mut one = a.clone();
+                    one["part"] = json!(id);
+                    lines.extend(dispatch(ctx, "modify_part", &one)?.into_iter().filter_map(|t| t["text"].as_str().map(str::to_string)));
+                }
+                return Ok(vec![text(lines.join("\n"))]);
+            }
             let id = find_part(ctx.scene, get(a, "part"))?;
             let label = ctx.scene.world.label(id);
             let msg = match string(a, "action").context("missing `action`")? {
@@ -1641,14 +1660,23 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
         "edit_model" => {
             let op_name = string(a, "op").context("missing `op`")?;
             let paint = get(a, "color").map(|c| color(ctx.scene, c)).transpose()?;
-            if paint.is_some() && !matches!(op_name, "full" | "fill" | "reverse" | "flood" | "maze" | "perlin") {
-                bail!("op {op_name} doesn't use a color (full, fill, reverse, flood, maze and perlin do)");
+            if paint.is_some() && !matches!(op_name, "full" | "fill" | "reverse" | "hollow" | "flood" | "maze" | "perlin") {
+                bail!("op {op_name} doesn't use a color (full, fill, reverse, hollow, flood, maze and perlin do)");
+            }
+            if get(a, "thickness").is_some() && op_name != "hollow" {
+                bail!("only op hollow uses `thickness`");
             }
             if paint == Some(0) {
                 bail!("color 0 is empty space; use op clear to erase");
             }
             if matches!(op_name, "flip" | "rotate" | "mirror" | "diagonal" | "loop") && get(a, "axis").is_none() {
                 bail!("op {op_name} needs `axis` (x, y or z)");
+            }
+            if op_name == "hollow" {
+                let thickness = int_in(a, "thickness", 1, 1, 64)? as i32;
+                let new = arrange::hollow_volume(&ctx.scene.volume, thickness, paint);
+                let changed = apply(ctx, new);
+                return Ok(edited(ctx, changed, &format!("Hollowed to a {thickness}-voxel shell")));
             }
             let ax = axis(a)?;
             let dir = match int(a, "direction") {

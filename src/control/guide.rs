@@ -92,6 +92,10 @@ const WORLD: &str = "\
 WORLDS AND LANDSCAPES
 - Pick the canvas from the scene: a diorama 64-128 wide, a level 256+. Decide the grid unit (how tall a door \
 or a person is) and keep everything on it.
+- Props are on the same grid as the buildings. With doors 24 tall: a person about 20, a pumpkin 8-12 across, \
+a cat about 10 tall, a fence 10-14. Build the main building first, big enough that the small props still \
+have room for their details; transform_model scale resizes a part that came out wrong, and drop_part sets \
+props down on the ground.
 - Terrain from a height function in run_script: layered util.noise at two or three scales, flattened where \
 paths and buildings go; then paint_faces top for grass/snow and sides for rock/dirt layers, in flat colors.
 - Water: a flat layer at sea level with a glass or blend material; rivers carved into the height function.
