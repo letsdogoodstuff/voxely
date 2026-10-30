@@ -21,6 +21,97 @@ pub fn socket_path() -> PathBuf {
     std::env::var_os("VOXELY_SOCKET").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("voxely-control.sock"))
 }
 
+/// The control socket's request/reply format. A window answers
+/// `{"hello": true}` with this, so `voxely mcp` can tell when the window is
+/// from another build.
+pub const CONTROL_PROTOCOL: u32 = 1;
+
+/// This program's file and when it was last written: a rebuild changes it.
+pub(crate) fn exe_stamp() -> Option<(PathBuf, std::time::SystemTime)> {
+    let exe = std::env::current_exe().ok()?;
+    let modified = std::fs::metadata(&exe).ok()?.modified().ok()?;
+    Some((exe, modified))
+}
+
+/// The window's answer to `{"hello": true}`. `started` is `exe_stamp` from
+/// when it opened.
+pub(crate) fn hello_reply(started: &Option<(PathBuf, std::time::SystemTime)>) -> Value {
+    let now = exe_stamp();
+    json!({
+        "protocol": CONTROL_PROTOCOL,
+        "exe": started.as_ref().map(|s| s.0.display().to_string()),
+        "rebuilt": matches!((started, &now), (Some(a), Some(b)) if a.1 != b.1),
+        "pid": std::process::id(),
+    })
+}
+
+/// Whether the window and this server run the same, current build. Checked
+/// once per window (socket file); the note goes on the first reply from a
+/// window and on its errors after that.
+#[derive(Default)]
+struct BuildCheck {
+    started: Option<(PathBuf, std::time::SystemTime)>,
+    socket: Option<u64>,
+    note: Option<String>,
+}
+
+impl BuildCheck {
+    fn new() -> Self {
+        BuildCheck { started: exe_stamp(), ..Default::default() }
+    }
+
+    /// This server's own file was rebuilt after it started.
+    fn self_stale(&self) -> Option<String> {
+        let (exe, then) = self.started.as_ref()?;
+        let (_, now) = exe_stamp()?;
+        (now != *then).then(|| {
+            format!("This voxely MCP server is older than {} on disk (it was rebuilt since the server started): reconnect the server (/mcp in Claude Code) to get the new tools.", exe.display())
+        })
+    }
+
+    /// A note for this call's reply from the window, if any: Some on the
+    /// first call to a new window, and on errors while something is stale.
+    fn window_note(&mut self, is_error: bool) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        let inode = std::fs::metadata(socket_path()).ok().map(|m| m.ino());
+        let fresh = inode != self.socket;
+        if fresh {
+            self.socket = inode;
+            self.note = self.hello();
+        }
+        let note = [self.note.clone(), self.self_stale()].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        (!note.is_empty() && (fresh || is_error)).then_some(note)
+    }
+
+    fn hello(&self) -> Option<String> {
+        let stream = UnixStream::connect(socket_path()).ok()?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
+        let mut writer = stream.try_clone().ok()?;
+        writeln!(writer, "{}", json!({ "hello": true })).ok()?;
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).ok()?;
+        let reply: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+        let restart = "Save, then close and reopen the voxely window to run the current build.";
+        let Some(protocol) = reply.get("protocol").and_then(Value::as_u64) else {
+            return Some(format!("The open voxely window is from an older build than this MCP server, so tools or arguments added since may fail there. {restart}"));
+        };
+        if protocol != CONTROL_PROTOCOL as u64 {
+            return Some(format!("The open voxely window speaks control protocol {protocol}, this server {CONTROL_PROTOCOL}. {restart}"));
+        }
+        let mut notes = Vec::new();
+        if reply["rebuilt"].as_bool() == Some(true) {
+            notes.push(format!("voxely was rebuilt after the open window started, so the window still runs the old code. {restart}"));
+        }
+        let mine = self.started.as_ref().map(|s| s.0.display().to_string());
+        if let (Some(theirs), Some(mine)) = (reply["exe"].as_str(), mine) {
+            if theirs != mine {
+                notes.push(format!("The open window runs {theirs}; this MCP server is {mine}."));
+            }
+        }
+        (!notes.is_empty()).then(|| notes.join(" "))
+    }
+}
+
 /// MagicaVoxel's install folder (for shaders, palettes and models).
 pub(crate) fn assets_dir(arg: Option<PathBuf>) -> Option<PathBuf> {
     arg.or_else(app::magicavoxel_dir)
@@ -95,6 +186,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     let assets = assets_dir(assets);
     let mut headless: Option<Headless> = None;
+    let mut build = BuildCheck::new();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -131,7 +223,13 @@ pub fn run(args: &[String]) -> Result<()> {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let live = if headless_only { None } else { call_live(name, &args) };
                 Ok(match live {
-                    Some(Ok(v)) => v,
+                    Some(Ok(mut v)) => {
+                        let is_error = v["isError"].as_bool() == Some(true);
+                        if let (Some(note), Some(content)) = (build.window_note(is_error), v["content"].as_array_mut()) {
+                            content.push(json!({ "type": "text", "text": note }));
+                        }
+                        v
+                    }
                     Some(Err(e)) => json!({ "content": [{ "type": "text", "text": format!("voxely window error: {e:#}") }], "isError": true }),
                     None => {
                         if headless.is_none() {

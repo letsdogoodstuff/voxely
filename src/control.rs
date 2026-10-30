@@ -23,6 +23,7 @@ use crate::ui::{Op, TransformKind};
 mod arrange;
 mod build;
 pub mod guide;
+mod health;
 mod import;
 pub(crate) mod inspect;
 mod reference;
@@ -138,7 +139,9 @@ fn size3(desc: &str) -> Value {
 fn base_tools() -> Value {
     let axis = json!({ "type": "string", "enum": ["x", "y", "z"] });
     json!([
-        tool("get_scene_info", "Canvas size, voxel count and bounds, colors in use, file, selection, camera and mode.", json!({}), &[]),
+        tool("get_scene_info", "Canvas size, voxel count and bounds, colors in use, file, selection, camera and mode. health: true also checks the whole model (every visible part, in world space): pieces not attached to the rest (touching only at an edge or corner, or hanging in the air), parts overlapping each other, empty parts, and whether it stands on the ground. Run it after a build or a cleanup.", json!({
+            "health": { "type": "boolean", "description": "Add the model health check (floating pieces, overlaps, ground, empty parts)" },
+        }), &[]),
         tool("new_project", "Create a named project in the workspace (it appears in the window's Project list) and make it current. Empty unless `fill` is given.", json!({
             "name": { "type": "string", "description": "Letters, digits, spaces, - and _" },
             "size": size3("Canvas size, default [40, 40, 40]; up to 1024 per axis"),
@@ -1466,6 +1469,10 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
                 "animation": { "frames": ctx.scene.world.anim.frames, "frame": ctx.scene.world.frame, "fps": ctx.scene.world.anim.fps, "loop": ctx.scene.world.anim.looping, "smooth": ctx.scene.world.anim.smooth },
                 "camera": { "yaw": cam.yaw.to_degrees(), "pitch": cam.pitch.to_degrees(), "distance": cam.dist, "target": (cam.target + ctx.scene.origin.as_vec3()).to_array() },
             });
+            let mut info = info;
+            if boolean(a, "health").unwrap_or(false) {
+                info["health"] = health::report(ctx.scene);
+            }
             Ok(vec![text(serde_json::to_string_pretty(&info)?)])
         }
         "new_scene" => {

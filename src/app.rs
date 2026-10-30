@@ -2268,13 +2268,17 @@ pub fn serve_control(proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Opt
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).ok()?);
+    let started = std::sync::Arc::new(crate::mcp::exe_stamp());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let proxy = proxy.clone();
+            let started = started.clone();
             std::thread::spawn(move || {
                 let Ok(mut writer) = stream.try_clone() else { return };
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
                     let reply = match serde_json::from_str::<serde_json::Value>(&line) {
+                        // Answered here, so it works while the window is busy.
+                        Ok(req) if req.get("hello").is_some() => crate::mcp::hello_reply(&started),
                         Ok(req) => {
                             let (tx, rx) = std::sync::mpsc::channel();
                             let tool = req["tool"].as_str().unwrap_or("").to_string();
