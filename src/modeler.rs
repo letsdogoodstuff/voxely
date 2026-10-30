@@ -146,7 +146,8 @@ pub struct ModelerOptions {
     pub fade: bool,
     /// Cast shadows from the modeler light [SW].
     pub shadow: bool,
-    /// Each model's box in World mode [WR].
+    /// Each model's box in its layer color in World mode [WR]. Off by
+    /// default; picked models' boxes show either way.
     pub wire: bool,
     /// The canvas box while editing [BB].
     pub canvas_box: bool,
@@ -165,7 +166,7 @@ impl Default for ModelerOptions {
             others: true,
             fade: true,
             shadow: false,
-            wire: true,
+            wire: false,
             canvas_box: true,
             background: Vec3::new(0.17, 0.17, 0.17),
             // `ambient_color` from MagicaVoxel's config.txt.
@@ -763,8 +764,8 @@ impl Modeler {
                 pass.set_pipeline(&self.mark_pipeline);
                 pass.draw(0..*count, 0..1);
             }
-            // The canvas box while editing; in World mode, model boxes [WR].
-            if self.lines.1 > 0 && (if editing { o.canvas_box } else { o.wire }) {
+            // The canvas box while editing; in World mode, model boxes.
+            if self.lines.1 > 0 && (!editing || o.canvas_box) {
                 pass.set_pipeline(&self.line_pipeline);
                 pass.set_bind_group(0, &self.plain_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.lines.0.slice(..));

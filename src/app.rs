@@ -1803,9 +1803,10 @@ fn outline(p: &egui::Painter, r: &Renderer, ppp: f32, lo: Vec3, hi: Vec3, stroke
     }
 }
 
-/// World mode: each shown model's box in its layer's color and the picked
-/// ones' in white, like MagicaVoxel's wireframes [WR]. None while editing.
-pub fn model_boxes(scene: &Scene) -> Option<Vec<(IVec3, IVec3, [u8; 3])>> {
+/// World mode: the picked models' boxes in white, plus, with `layers` on
+/// (MagicaVoxel's wireframes [WR], off by default), each shown model's box in
+/// its layer's color. None while editing.
+pub fn model_boxes(scene: &Scene, layers: bool) -> Option<Vec<(IVec3, IVec3, [u8; 3])>> {
     if scene.mode != Mode::World {
         return None;
     }
@@ -1817,7 +1818,7 @@ pub fn model_boxes(scene: &Scene) -> Option<Vec<(IVec3, IVec3, [u8; 3])>> {
             boxes.push((lo, lo + size, color));
         }
     };
-    for id in w.models() {
+    for id in w.models().into_iter().filter(|_| layers) {
         let layer = w.node(id).map_or(0, |n| n.layer.rem_euclid(8) as usize);
         add(id, crate::modeler::LAYER_COLORS[layer].map(|c| (c as u32 * 4 / 5) as u8));
     }
@@ -2078,7 +2079,7 @@ pub fn build_ui(
     crate::backdrop::window(ui.ctx(), &mut ed.backdrop, scene.volume.dims, scene.origin, cmds);
     if let Some(m) = r.modeler.as_mut() {
         m.reference_plane = ed.backdrop.plane(scene.volume.dims, scene.origin);
-        m.boxes = model_boxes(scene);
+        m.boxes = model_boxes(scene, m.options.wire);
     }
     confirm_delete(ui.ctx(), ed, cmds);
     confirm_unsaved(ui.ctx(), ed, cmds);
