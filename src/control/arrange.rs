@@ -26,7 +26,7 @@ pub fn tools() -> Vec<Value> {
             "colors": { "type": "object", "description": "What each character does: {\"#\": \"#1a1828\", \"o\": 12, \"x\": 0}; 0 carves the cell out" },
             "side": side,
             "center": xyz("Where the pattern's middle goes, in the part's own coordinates; only the two coordinates across the side are used (default: the part's center)"),
-            "depth": { "type": ["integer", "string"], "description": "How many voxels deep each cell paints or carves from the surface (default 1), or \"through\": the whole wall, up to the next empty cell" },
+            "depth": { "type": ["integer", "string"], "description": "How many voxels deep each cell paints or carves from the surface (default 1), or \"through\": the whole wall, up to the hollow behind it (walls up to 8 thick; cells that skim along a wall go as deep as the others)" },
             "scale": { "type": "integer", "minimum": 1, "maximum": 16, "description": "Voxels per pattern cell (default 1)" },
             "raise": { "type": "boolean", "description": "Add the colors one voxel out from the surface instead of replacing it (raised buttons, rivets); carving ignores it" },
         }), &["rows", "colors"]),
@@ -135,6 +135,10 @@ fn side_axes(side: &str) -> Result<(IVec3, IVec3, IVec3)> {
     })
 }
 
+/// The thickest wall "through" cuts; a longer run of solid runs along a
+/// wall rather than across it.
+const MAX_WALL: i32 = 8;
+
 enum Depth {
     Cells(i32),
     Through,
@@ -183,6 +187,8 @@ fn project_pattern(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
         }
         p
     };
+    // The first solid cell each pattern cell's ray hits, with its color.
+    let mut hits = Vec::new();
     for (j, row) in rows.iter().enumerate() {
         for (i, &ch) in row.iter().enumerate() {
             let Some(&c) = legend.get(&ch) else { continue };
@@ -195,35 +201,66 @@ fn project_pattern(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
                     while old.contains(p) && old.get(p) == 0 {
                         p += into;
                     }
-                    if !old.contains(p) {
+                    if old.contains(p) {
+                        hits.push((p, c));
+                    } else {
                         missed += 1;
-                        continue;
-                    }
-                    if c != 0 && raise {
-                        let q = p - into;
-                        if old.contains(q) {
-                            new.set(q, c);
-                            changed += 1;
-                        } else {
-                            missed += 1;
-                        }
-                        continue;
-                    }
-                    let mut n = 0;
-                    while old.contains(p) && old.get(p) != 0 && match depth {
-                        Depth::Cells(d) => n < d,
-                        Depth::Through => true,
-                    } {
-                        new.set(p, c);
-                        p += into;
-                        n += 1;
-                        changed += 1;
                     }
                 }
             }
         }
     }
-    let what = format!("Projected a {w}x{h} pattern{}", if missed > 0 { format!("; {missed} cells missed the model (nothing behind them)") } else { String::new() });
+    // "through": each ray's run of solid cells to the hollow behind the
+    // wall. A ray that doesn't reach a hollow within MAX_WALL is running
+    // along a wall (a floor, a curved side), not through it; it's cut as
+    // deep as the walls the other rays went through, not into a trench.
+    let run = |p: IVec3| -> Option<i32> {
+        (1..=MAX_WALL).find(|&n| {
+            let q = p + into * n;
+            !old.contains(q) || old.get(q) == 0
+        })
+    };
+    let mut runs: Vec<i32> = match depth {
+        Depth::Through => hits.iter().filter_map(|&(p, _)| run(p)).collect(),
+        Depth::Cells(_) => Vec::new(),
+    };
+    runs.sort_unstable();
+    let wall = runs.get(runs.len() / 2).copied().unwrap_or(1);
+    let mut shallow = 0;
+    for (p, c) in hits {
+        if c != 0 && raise {
+            let q = p - into;
+            if old.contains(q) {
+                new.set(q, c);
+                changed += 1;
+            } else {
+                missed += 1;
+            }
+            continue;
+        }
+        let n = match depth {
+            Depth::Cells(d) => d,
+            Depth::Through => run(p).unwrap_or_else(|| {
+                shallow += 1;
+                wall
+            }),
+        };
+        for k in 0..n {
+            let q = p + into * k;
+            if !old.contains(q) || old.get(q) == 0 {
+                break;
+            }
+            new.set(q, c);
+            changed += 1;
+        }
+    }
+    let mut what = format!("Projected a {w}x{h} pattern");
+    if missed > 0 {
+        what.push_str(&format!("; {missed} cells missed the model (nothing behind them)"));
+    }
+    if shallow > 0 {
+        what.push_str(&format!("; {shallow} cells ran along a wall instead of through it, so they were cut {wall} deep like the rest"));
+    }
     let committed = changed > 0 && apply(ctx, new);
     Ok(edited(ctx, committed, &what))
 }
