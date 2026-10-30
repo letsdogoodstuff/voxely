@@ -391,12 +391,14 @@ fn base_tools() -> Value {
             "name": { "type": "string", "description": "New name (rename) or the copy's name (duplicate)" },
             "offset": xyz("duplicate: where the copy goes relative to the original (default: just beside it on x)"),
         }), &["part", "action"]),
-        tool("set_layer", "MagicaVoxel's 8 layers (0-7): put parts on one, show or hide it, rename it, or make it the layer new parts go on. A hidden layer hides every part on it; list_parts shows each part's layer.", json!({
-            "layer": { "type": "integer", "minimum": 0, "maximum": 7 },
+        tool("set_layer", "MagicaVoxel-style layers (a scene starts with 0-7; a new id makes a new layer): put parts on one, show or hide it, rename or recolor it, make it the layer new parts go on, or delete it. A hidden layer hides every part on it; list_parts shows the layers and each part's layer.", json!({
+            "layer": { "type": "integer", "minimum": 0 },
             "parts": { "type": "array", "items": { "type": ["string", "integer"] }, "description": "Parts or groups to put on this layer (a group's contents go too)" },
             "hidden": { "type": "boolean" },
             "name": { "type": "string" },
             "current": { "type": "boolean", "description": "true: new parts go on this layer" },
+            "color": { "type": "string", "description": "\"#rrggbb\"" },
+            "delete": { "type": "boolean", "description": "true: remove the layer; its parts move to the first layer left" },
         }), &["layer"]),
         tool("group_parts", "Put parts and groups into a new group, so they move and turn together.", json!({
             "parts": { "type": "array", "items": { "type": ["string", "integer"] } },
@@ -845,16 +847,32 @@ fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Result<Vec<Value>> {
             let top = ctx.scene.world.node(crate::world::ROOT).map(|n| n.children().to_vec()).unwrap_or_default();
             let tree: Vec<Value> = top.iter().map(|&c| part_json(ctx.scene, c)).collect();
             let w = &ctx.scene.world;
-            let layers: Vec<Value> = w.layers.iter().map(|l| json!({ "id": l.id, "name": l.label(), "hidden": l.hidden })).collect();
+            let layers: Vec<Value> = w.layers.iter().map(|l| json!({ "id": l.id, "name": l.label(), "hidden": l.hidden, "color": format!("#{:02x}{:02x}{:02x}", l.color[0], l.color[1], l.color[2]) })).collect();
             Ok(vec![text(serde_json::to_string_pretty(&json!({ "mode": if ctx.scene.editing().is_some() { "edit" } else { "world" }, "parts": tree, "layers": layers, "current_layer": w.current_layer }))?)])
         }
         "set_layer" => {
             use crate::outline::TreeOp;
             let layer = a.get("layer").and_then(Value::as_i64).context("missing `layer`")? as i32;
-            if !(0..crate::world::LAYERS).contains(&layer) {
-                bail!("`layer` is 0-7");
+            if layer < 0 {
+                bail!("`layer` is 0 or more");
             }
             let mut done = Vec::new();
+            if a.get("delete").and_then(Value::as_bool) == Some(true) {
+                if !app::tree_op(TreeOp::LayerDelete(layer), ctx.scene, ctx.ed) {
+                    bail!("no layer {layer}, or it's the last one");
+                }
+                return Ok(vec![text(format!("Deleted layer {layer}"))]);
+            }
+            if ctx.scene.world.layer(layer).is_none() {
+                ctx.scene.change_quiet(|w| w.layers.push(crate::world::Layer::new(layer)));
+                done.push("made it".to_string());
+            }
+            if let Some(hex) = string(a, "color") {
+                let hex = hex.trim_start_matches('#');
+                let c = u32::from_str_radix(hex, 16).ok().filter(|_| hex.len() == 6).context("`color` is \"#rrggbb\"")?;
+                app::tree_op(TreeOp::LayerColor(layer, [(c >> 16) as u8, (c >> 8) as u8, c as u8], true), ctx.scene, ctx.ed);
+                done.push(format!("colored #{hex}"));
+            }
             if let Some(parts) = a.get("parts").and_then(Value::as_array) {
                 let ids = parts.iter().map(|p| find_part(ctx.scene, Some(p))).collect::<Result<Vec<_>>>()?;
                 ctx.scene.change_quiet(|w| w.set_layer(&ids, layer));

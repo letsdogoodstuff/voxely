@@ -26,6 +26,14 @@ pub enum TreeOp {
     LayerCurrent(i32),
     LayerName(i32, String),
     LayerSet(i32),
+    /// A new layer at the end, and new objects go on it.
+    LayerAdd,
+    LayerDelete(i32),
+    /// A layer's color; `true` starts an undo step (false continues a drag).
+    LayerColor(i32, [u8; 3], bool),
+    LayerSort,
+    /// Pick everything on a layer.
+    LayerPick(i32),
     /// Move by whole voxels [arrows, PageUp/PageDown].
     Move(IVec3),
     /// Quarter turns about a world axis [+/- for z, 9/0 for x].

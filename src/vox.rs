@@ -546,6 +546,8 @@ pub fn write_with(
         // MagicaVoxel always writes a name, "0".."7" by default.
         let mut attrs = Dict::new();
         attrs.insert("_name".into(), l.label());
+        let [r, g, b] = l.color;
+        attrs.insert("_color".into(), format!("{r} {g} {b}"));
         if l.hidden {
             attrs.insert("_hidden".into(), "1".into());
         }

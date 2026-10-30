@@ -705,6 +705,34 @@ pub(crate) fn tree_op(op: TreeOp, scene: &mut Scene, ed: &mut EditState) -> bool
             });
         }
         TreeOp::LayerSet(l) if !picked.is_empty() => scene.change_quiet(|w| w.set_layer(&picked, l)),
+        TreeOp::LayerAdd => {
+            let id = scene.change_quiet(|w| w.add_layer());
+            scene.world.current_layer = id;
+        }
+        TreeOp::LayerDelete(l) => {
+            let mut left = scene.world.clone();
+            if !left.delete_layer(l) {
+                return false;
+            }
+            scene.change_quiet(|w| *w = left);
+        }
+        TreeOp::LayerColor(l, color, begin) => {
+            let set = |w: &mut crate::world::World| {
+                if let Some(l) = w.layer_mut(l) {
+                    l.color = color;
+                }
+            };
+            if begin {
+                scene.change_quiet(set);
+            } else {
+                set(&mut scene.world);
+            }
+        }
+        TreeOp::LayerSort => scene.change_quiet(|w| w.sort_layers()),
+        TreeOp::LayerPick(l) => {
+            scene.picked = w.on_layer(l);
+            return true;
+        }
         TreeOp::Move(d) => scene.change(|w| picked.iter().for_each(|&p| w.translate(p, d))),
         TreeOp::Turn(axis, q) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::turn(axis, q)))),
         TreeOp::Flip(axis) => scene.change(|w| picked.iter().for_each(|&p| w.reorient(p, Rot::flip(axis)))),
@@ -1838,8 +1866,8 @@ pub fn model_boxes(scene: &Scene, layers: bool) -> Option<Vec<(IVec3, IVec3, [u8
         }
     };
     for id in w.models().into_iter().filter(|_| layers) {
-        let layer = w.node(id).map_or(0, |n| n.layer.rem_euclid(8) as usize);
-        add(id, crate::modeler::LAYER_COLORS[layer].map(|c| (c as u32 * 4 / 5) as u8));
+        let color = w.node(id).and_then(|n| w.layer(n.layer)).map_or(crate::modeler::LAYER_COLORS[0], |l| l.color);
+        add(id, color.map(|c| (c as u32 * 4 / 5) as u8));
     }
     for &id in &scene.picked {
         add(id, [229, 229, 229]);

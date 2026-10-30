@@ -265,19 +265,26 @@ impl Node {
     }
 }
 
-/// MagicaVoxel's layers: a fixed set of 8 (ids 0-7), each with a name and
-/// a hidden flag. Every node is on one; a hidden layer hides its nodes.
+/// MagicaVoxel's layers: tags with a name, a color and a hidden flag. Every
+/// node is on one; a hidden layer hides its nodes. A scene starts with 8
+/// (ids 0-7) and can have as many as it likes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
     pub id: i32,
     /// Empty shows the id, like MagicaVoxel's default names "0".."7".
     pub name: String,
     pub hidden: bool,
+    pub color: [u8; 3],
 }
 
+/// Layers in a new scene.
 pub const LAYERS: i32 = 8;
 
 impl Layer {
+    pub fn new(id: i32) -> Layer {
+        Layer { id, name: String::new(), hidden: false, color: crate::modeler::LAYER_COLORS[id.rem_euclid(8) as usize] }
+    }
+
     pub fn label(&self) -> String {
         if self.name.is_empty() { self.id.to_string() } else { self.name.clone() }
     }
@@ -314,7 +321,42 @@ impl World {
     }
 
     fn default_layers() -> Vec<Layer> {
-        (0..LAYERS).map(|id| Layer { id, name: String::new(), hidden: false }).collect()
+        (0..LAYERS).map(Layer::new).collect()
+    }
+
+    /// A new layer after the others; returns its id.
+    pub fn add_layer(&mut self) -> i32 {
+        let id = self.layers.iter().map(|l| l.id + 1).max().unwrap_or(0);
+        self.layers.push(Layer::new(id));
+        id
+    }
+
+    /// Remove a layer; what was on it moves to the first one left. The
+    /// last layer stays.
+    pub fn delete_layer(&mut self, id: i32) -> bool {
+        let Some(k) = self.layers.iter().position(|l| l.id == id).filter(|_| self.layers.len() > 1) else { return false };
+        self.layers.remove(k);
+        let to = self.layers[0].id;
+        self.nodes.iter_mut().flatten().filter(|n| n.layer == id).for_each(|n| n.layer = to);
+        if self.current_layer == id {
+            self.current_layer = to;
+        }
+        true
+    }
+
+    /// Order the layers by name (numbers in order: "2" before "10").
+    pub fn sort_layers(&mut self) {
+        self.layers.sort_by_cached_key(|l| {
+            let label = l.label().to_lowercase();
+            (label.parse::<i64>().map_or(1, |_| 0), label.parse::<i64>().unwrap_or(0), label)
+        });
+    }
+
+    /// The models and groups on `layer`, outermost first (a group's
+    /// contents aren't listed when the group is).
+    pub fn on_layer(&self, layer: i32) -> Vec<usize> {
+        let ids: Vec<usize> = (1..self.nodes.len()).filter(|&i| self.node(i).is_some_and(|n| n.layer == layer)).collect();
+        ids.iter().copied().filter(|&i| !ids.iter().any(|&o| o != i && self.is_ancestor(o, i))).collect()
     }
 
     pub fn layer(&self, id: i32) -> Option<&Layer> {
@@ -1143,14 +1185,24 @@ fn read_extras(n: &mut Node, attrs: &crate::vox::Dict) {
 impl World {
     pub fn from_vox(f: &VoxFile) -> World {
         let mut w = World::empty();
-        // Always the 8 layers; a name equal to the id is MagicaVoxel's
-        // default, kept empty.
+        // The file's layers in id order (at least one); a name equal to the
+        // id is MagicaVoxel's default, kept empty.
+        if !f.layers.is_empty() {
+            let mut ids: Vec<i32> = f.layers.keys().copied().collect();
+            ids.sort();
+            w.layers = ids.into_iter().map(Layer::new).collect();
+        }
         for l in &mut w.layers {
             if let Some(d) = f.layers.get(&l.id) {
                 l.name = d.get("_name").filter(|n| **n != l.id.to_string()).cloned().unwrap_or_default();
                 l.hidden = d.get("_hidden").is_some_and(|v| v == "1");
+                let rgb: Vec<u8> = d.get("_color").map(|c| c.split_whitespace().filter_map(|x| x.parse().ok()).collect()).unwrap_or_default();
+                if let [r, g, b] = rgb[..] {
+                    l.color = [r, g, b];
+                }
             }
         }
+        w.current_layer = w.layers[0].id;
         if f.nodes.is_empty() {
             // Old files: every model at the origin.
             for m in &f.models {
@@ -1551,6 +1603,40 @@ mod tests {
         let back = World::from_vox(&f);
         assert_eq!(back.layers, w.layers);
         assert!(!back.visible(back.find("a").unwrap()));
+    }
+
+    #[test]
+    fn layers_without_limit() {
+        let mut w = World::single(vol(IVec3::splat(3), &[(IVec3::ONE, 4)]));
+        let first = w.models()[0];
+        let ids: Vec<i32> = (0..12).map(|_| w.add_layer()).collect();
+        assert_eq!(ids, (8..20).collect::<Vec<_>>());
+        // Picking a layer gets a group, not its contents too.
+        w.current_layer = 15;
+        let a = w.add_model(ROOT, "a", vol(IVec3::ONE, &[(IVec3::ZERO, 1)]), IVec3::new(10, 0, 0));
+        let g = w.group(&[first, a]).unwrap();
+        w.set_layer(&[g], 15);
+        assert_eq!(w.on_layer(15), vec![g]);
+        // Deleting moves what was on it to the first layer.
+        assert!(w.delete_layer(15));
+        assert!(w.layer(15).is_none());
+        assert_eq!((w.node(a).unwrap().layer, w.current_layer), (0, 0));
+        w.layer_mut(19).unwrap().name = "alpha".into();
+        w.layer_mut(19).unwrap().color = [1, 2, 3];
+        w.sort_layers();
+        assert_eq!(w.layers.first().unwrap().id, 0);
+        assert_eq!(w.layers.last().unwrap().label(), "alpha");
+        assert!(w.layers.windows(2).take(18).all(|p| p[0].id < p[1].id), "numbers stay in number order");
+        let path = std::env::temp_dir().join(format!("voxely-layers-more-{}.vox", std::process::id()));
+        crate::vox::write(&path, &w, &crate::vox::default_palette(), &[], &[], &[]).unwrap();
+        let back = World::from_vox(&VoxFile::load(&path).unwrap());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(back.layers.len(), 19);
+        assert_eq!(back.layer(19).unwrap().color, [1, 2, 3]);
+        // The last one can't go.
+        let mut one = World::single(vol(IVec3::ONE, &[(IVec3::ZERO, 1)]));
+        one.layers.truncate(1);
+        assert!(!one.delete_layer(0));
     }
 
     #[test]
