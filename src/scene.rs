@@ -1660,7 +1660,7 @@ mod tests {
     #[test]
     fn edited_magicavoxel_file_keeps_changes() {
         // Open a file MagicaVoxel wrote, change settings, save, reopen.
-        let path = std::path::Path::new(env!("HOME")).join("Downloads/MagicaVoxel-0.99.6.2-macos-10.15/vox/monu10.vox");
+        let path = crate::app::magicavoxel_dir().unwrap_or_default().join("vox/monu10.vox");
         if !path.exists() {
             eprintln!("no MagicaVoxel samples; skipping");
             return;

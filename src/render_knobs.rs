@@ -45,7 +45,7 @@ fn case(name: &'static str, expect: Expect, setup: impl Fn(&mut RenderSettings, 
 fn none(_: &mut RenderSettings, _: &mut [GpuMaterial]) {}
 
 fn ibl() -> Option<std::path::PathBuf> {
-    let p = std::path::Path::new(env!("HOME")).join("Downloads/MagicaVoxel-0.99.6.2-macos-10.15/ibl/HDR_041_Path_Env.hdr");
+    let p = crate::app::magicavoxel_dir()?.join("ibl/HDR_041_Path_Env.hdr");
     p.exists().then_some(p)
 }
 

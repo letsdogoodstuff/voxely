@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn loads_sample_hdr() {
-        let p = Path::new(env!("HOME")).join("Downloads/MagicaVoxel-0.99.6.2-macos-10.15/ibl/HDR_041_Path_Env.hdr");
+        let Some(p) = crate::app::magicavoxel_dir().map(|d| d.join("ibl/HDR_041_Path_Env.hdr")) else { return };
         if !p.exists() {
             return;
         }
