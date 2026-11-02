@@ -1,5 +1,5 @@
 //! Arranging scenes and detailing surfaces: drop parts onto what's below
-//! them, project a small pixel pattern onto a curved surface (faces,
+//! them, clear the hidden cells where parts overlap, project a small pixel pattern onto a curved surface (faces,
 //! emblems, carved holes), hollow a model into a shell.
 
 use std::collections::{HashMap, VecDeque};
@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use super::{Ctx, NEIGHBORS, apply, color, edited, find_part, get, int, string, text, tool, tree_changed, xyz};
 use crate::scene::Volume;
+use crate::world::{Kind, World};
 
 pub const PART_TOOLS: &[&str] = &["project_pattern"];
 
@@ -21,6 +22,9 @@ pub fn tools() -> Vec<Value> {
             "parts": { "type": "array", "items": { "type": ["string", "integer"] }, "minItems": 1, "description": "Parts or groups to drop" },
             "onto": { "type": ["string", "integer"], "description": "Only land on this part or group (default: any other visible part below it)" },
         }), &["parts"]),
+        tool("clean_overlaps", "Where parts overlap, keep each shared cell only in the part that shows there (the later one) and remove the hidden copies, so every cell belongs to one part. The model looks exactly the same. One undo step. Parts that move in the animation (theirs or a parent's keys or drawings) and freely rotated parts that would lose voxels are left alone, as are parts that lie entirely inside another; the reply lists them.", json!({
+            "parts": { "type": "array", "items": { "type": ["string", "integer"] }, "minItems": 1, "description": "Only remove hidden voxels from these parts or groups (default: every visible part)" },
+        }), &[]),
         tool("project_pattern", "Draw a small pixel pattern onto the surface of the part, as seen from one side: each pattern cell is shot straight in from that side and changes the first voxel it hits, so it wraps around curved shapes. For faces (eyes, mouths, a jack-o'-lantern's carved face), emblems, buttons, windows and signs. Color 0 carves: with depth \"through\" it cuts a hole through the wall to the hollow inside.", json!({
             "rows": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The pattern, top row first, one character per cell; \".\" and \" \" leave the cell alone. E.g. [\"#.#\", \"...\", \"###\"]" },
             "colors": { "type": "object", "description": "What each character does: {\"#\": \"#1a1828\", \"o\": 12, \"x\": 0}; 0 carves the cell out" },
@@ -36,6 +40,7 @@ pub fn tools() -> Vec<Value> {
 pub fn dispatch(ctx: &mut Ctx, name: &str, args: &Value) -> Option<Result<Vec<Value>>> {
     Some(match name {
         "drop_part" => drop_parts(ctx, args),
+        "clean_overlaps" => clean_overlaps(ctx, args),
         "project_pattern" => project_pattern(ctx, args),
         _ => return None,
     })
@@ -116,6 +121,125 @@ fn drop_parts(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
             d if d < 0 => format!("dropped {}", -d),
             d => format!("raised {d}"),
         }, lo.to_array()));
+    }
+    Ok(vec![text(lines.join("\n"))])
+}
+
+// ---------------------------------------------------------------- overlaps
+
+/// What `clean_overlaps` would do: each part's voxels without its hidden
+/// cells (with how many go), and parts left alone with why.
+#[derive(Default)]
+struct Trims {
+    keep: Vec<(usize, Volume, usize)>,
+    skipped: Vec<(usize, String)>,
+}
+
+/// Does this node, or something it hangs from, change from frame to frame?
+fn moves(w: &World, id: usize) -> bool {
+    let mut at = Some(id);
+    while let Some(i) = at {
+        let Some(n) = w.node(i) else { break };
+        if !n.keys.is_empty() || !n.flip.is_empty() {
+            return true;
+        }
+        at = n.parent;
+    }
+    false
+}
+
+/// Hidden cells of the visible models in `only` (default all). A cell is
+/// hidden when the composite shows another model there; it is only removed
+/// when neither model moves, so no frame can uncover it.
+fn overlap_trims(w: &World, only: Option<&[usize]>) -> Trims {
+    let mut out = Trims::default();
+    let Some(comp) = w.composite(None) else { return out };
+    for m in w.models() {
+        if !w.visible(m) || only.is_some_and(|o| !o.contains(&m)) {
+            continue;
+        }
+        let Some(v) = w.node(m).and_then(|n| n.volume()) else { continue };
+        let place = w.place(m);
+        let mut keep = v.clone();
+        let (mut removed, mut held) = (0, None);
+        for (p, _) in v.filled() {
+            let owner = if w.tilted(m) {
+                // Sampled at world cell centers: no one cell to test.
+                None
+            } else {
+                Some(comp.owners.at(place.cell(v.dims, p) - comp.origin) as usize)
+            };
+            match owner {
+                Some(o) if o == m => {}
+                Some(o) if !moves(w, m) && !moves(w, o) => {
+                    keep.set(p, 0);
+                    removed += 1;
+                }
+                Some(o) => held = held.or(Some(o)),
+                None => {}
+            }
+        }
+        if w.tilted(m) {
+            let hidden = w.composite_where(|x| x == m).is_some_and(|own| own.volume.filled().any(|(p, _)| comp.owners.at(p + own.origin - comp.origin) as usize != m));
+            if hidden {
+                out.skipped.push((m, "is freely rotated".into()));
+            }
+            continue;
+        }
+        if let Some(o) = held {
+            out.skipped.push((m, format!("moves with the animation, or overlaps `{}`, which does", w.label(o))));
+        } else if removed > 0 && keep.count() == 0 {
+            out.skipped.push((m, "lies entirely inside other parts".into()));
+        } else if removed > 0 {
+            out.keep.push((m, keep, removed));
+        }
+    }
+    out
+}
+
+fn clean_overlaps(ctx: &mut Ctx, a: &Value) -> Result<Vec<Value>> {
+    let only = match get(a, "parts").and_then(Value::as_array) {
+        Some(list) => {
+            let mut ids = Vec::new();
+            for p in list {
+                let id = find_part(ctx.scene, Some(p))?;
+                ctx.scene.world.visit(id, &mut |i, _| ids.push(i));
+            }
+            Some(ids)
+        }
+        None => None,
+    };
+    let world = ctx.scene.synced_world().into_owned();
+    let before = world.composite(None);
+    let trims = overlap_trims(&world, only.as_deref());
+    let mut lines = Vec::new();
+    if !trims.keep.is_empty() {
+        let total: usize = trims.keep.iter().map(|t| t.2).sum();
+        let per: Vec<String> = trims.keep.iter().map(|(m, _, n)| format!("`{}` {n}", world.label(*m))).collect();
+        ctx.scene.change(|w| {
+            for (m, v, _) in trims.keep {
+                if let Some(n) = w.node_mut(m) {
+                    n.kind = Kind::Model(v);
+                }
+            }
+        });
+        tree_changed(ctx);
+        let after = ctx.scene.synced_world().composite(None);
+        let same = match (&before, &after) {
+            (Some(b), Some(a)) => b.origin == a.origin && b.volume.cells == a.volume.cells,
+            _ => false,
+        };
+        if !same {
+            ctx.scene.undo_tree(false);
+            tree_changed(ctx);
+            bail!("removing the hidden voxels would have changed how the model looks, so nothing was changed");
+        }
+        lines.push(format!("Removed {total} hidden voxel{} ({}); the model looks the same.", if total == 1 { "" } else { "s" }, per.join(", ")));
+    } else {
+        lines.push("No hidden voxels to remove.".to_string());
+    }
+    for (m, why) in &trims.skipped {
+        lines.push(format!("Left `{}` alone: it {why}.", world.label(*m)));
     }
     Ok(vec![text(lines.join("\n"))])
 }
@@ -346,6 +470,67 @@ mod tests {
             }
         }
         v
+    }
+
+    fn block(size: [i32; 3], c: u8) -> Volume {
+        let mut v = Volume::new(IVec3::from_array(size));
+        for (i, _) in v.clone().cells.iter().enumerate() {
+            v.set_index(i, c);
+        }
+        v
+    }
+
+    /// A 4x4x4 body and a 4x4x4 arm that overlaps it by two columns.
+    fn two_parts() -> (World, usize, usize) {
+        let mut w = World::empty();
+        let body = w.add_model(crate::world::ROOT, "body", block([4, 4, 4], 1), IVec3::ZERO);
+        let arm = w.add_model(crate::world::ROOT, "arm", block([4, 4, 4], 2), IVec3::new(2, 0, 0));
+        (w, body, arm)
+    }
+
+    fn apply_trims(w: &mut World, t: Trims) {
+        for (m, v, _) in t.keep {
+            w.node_mut(m).unwrap().kind = Kind::Model(v);
+        }
+    }
+
+    #[test]
+    fn overlaps_go_from_the_hidden_part_and_the_look_stays() {
+        let (mut w, body, arm) = two_parts();
+        let before = w.composite(None).unwrap();
+        let t = overlap_trims(&w, None);
+        assert_eq!(t.keep.iter().map(|k| (k.0, k.2)).collect::<Vec<_>>(), vec![(body, 32)], "the later arm shows, so the body loses 2x4x4");
+        assert!(t.skipped.is_empty());
+        apply_trims(&mut w, t);
+        let after = w.composite(None).unwrap();
+        assert_eq!((before.origin, &before.volume.cells), (after.origin, &after.volume.cells));
+        assert_eq!(w.node(arm).unwrap().volume().unwrap().count(), 64);
+        assert!(overlap_trims(&w, None).keep.is_empty(), "a second run has nothing to do");
+    }
+
+    #[test]
+    fn only_limits_which_parts_lose_voxels() {
+        let (w, _, arm) = two_parts();
+        assert!(overlap_trims(&w, Some(&[arm])).keep.is_empty(), "the arm hides nothing of its own");
+    }
+
+    #[test]
+    fn animated_parts_keep_their_overlaps() {
+        let (mut w, body, arm) = two_parts();
+        w.node_mut(arm).unwrap().keys.push(crate::anim::Key { frame: 4, rot: crate::world::Rot::IDENTITY, t: IVec3::new(5, 0, 0), tilt: glam::Vec3::ZERO });
+        let t = overlap_trims(&w, None);
+        assert!(t.keep.is_empty());
+        assert_eq!(t.skipped.iter().map(|s| s.0).collect::<Vec<_>>(), vec![body]);
+    }
+
+    #[test]
+    fn a_part_buried_inside_another_is_left_alone() {
+        let mut w = World::empty();
+        let core = w.add_model(crate::world::ROOT, "core", block([2, 2, 2], 3), IVec3::ONE);
+        w.add_model(crate::world::ROOT, "shell", block([4, 4, 4], 1), IVec3::ZERO);
+        let t = overlap_trims(&w, None);
+        assert!(t.keep.is_empty());
+        assert_eq!(t.skipped[0].0, core);
     }
 
     #[test]

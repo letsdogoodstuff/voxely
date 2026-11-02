@@ -118,7 +118,7 @@ pub fn report(scene: &Scene) -> Value {
     }
     if !over.is_empty() {
         summary.push(format!(
-            "{} of parts overlap ({}); where they do, the later part hides the earlier one.",
+            "{} of parts overlap ({}); where they do, the later part hides the earlier one (clean_overlaps removes the hidden copies).",
             plural(over.len(), "pair"),
             plural(over.values().sum::<usize>(), "cell")
         ));

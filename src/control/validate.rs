@@ -287,6 +287,7 @@ mod tests {
             ("set_view_mode", json!({ "mode": "render" })),
             ("list_parts", json!({})),
             ("drop_part", json!({ "parts": ["pumpkin", 3], "onto": "ground" })),
+            ("clean_overlaps", json!({ "parts": ["body", 2] })),
             ("project_pattern", json!({ "rows": ["#.#", "...", "ooo"], "colors": { "#": "#1a1828", "o": 0 }, "side": "front", "center": [8, 0, 9], "depth": "through", "scale": 2, "raise": false, "part": "pumpkin" })),
             ("set_layer", json!({ "layer": 9, "parts": ["roof"], "hidden": false, "name": "props", "current": true, "color": "#ff8800", "delete": false })),
             ("edit_part", json!({ "part": "world" })),
