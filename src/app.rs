@@ -3342,10 +3342,11 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let new = crate::ipc::Listener::bind(&path).unwrap();
         let new_ino = crate::ipc::file_id(&path).unwrap();
+        assert_ne!(old_ino, new_ino);
         remove_if_ours(&path, Some(old_ino));
-        assert!(path.exists());
+        assert!(crate::ipc::file_id(&path).is_some(), "the newer window's socket stays");
         remove_if_ours(&path, Some(new_ino));
-        assert!(!path.exists());
+        assert!(crate::ipc::file_id(&path).is_none());
         drop((old, new));
         let _ = std::fs::remove_dir_all(dir);
     }
