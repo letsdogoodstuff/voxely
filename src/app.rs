@@ -2254,22 +2254,18 @@ pub enum UserEvent {
 /// Returns the socket file's inode, for `release_control`.
 pub fn serve_control(proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Option<u64> {
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
     let path = crate::mcp::socket_path();
     // The newest window takes over the socket.
     let _ = std::fs::remove_file(&path);
-    let listener = match UnixListener::bind(&path) {
+    let listener = match crate::ipc::Listener::bind(&path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("control socket {}: {e}", path.display());
             return None;
         }
     };
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).ok()?);
+    crate::ipc::owner_only(&path);
+    let inode = crate::ipc::file_id(&path)?;
     let started = std::sync::Arc::new(crate::mcp::exe_stamp());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -2310,7 +2306,7 @@ pub fn release_control(inode: Option<u64>) {
 }
 
 fn remove_if_ours(path: &Path, inode: Option<u64>) {
-    let ours = std::fs::symlink_metadata(path).is_ok_and(|m| Some(std::os::unix::fs::MetadataExt::ino(&m)) == inode);
+    let ours = inode.is_some() && crate::ipc::file_id(path) == inode;
     if ours {
         let _ = std::fs::remove_file(path);
     }
@@ -3340,12 +3336,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("c.sock");
         let _ = std::fs::remove_file(&path);
-        let old = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let old_ino = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+        let old = crate::ipc::Listener::bind(&path).unwrap();
+        let old_ino = crate::ipc::file_id(&path).unwrap();
         // A newer window takes over the path.
         std::fs::remove_file(&path).unwrap();
-        let new = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let new_ino = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+        let new = crate::ipc::Listener::bind(&path).unwrap();
+        let new_ino = crate::ipc::file_id(&path).unwrap();
         remove_if_ours(&path, Some(old_ino));
         assert!(path.exists());
         remove_if_ours(&path, Some(new_ino));

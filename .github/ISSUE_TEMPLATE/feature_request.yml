@@ -1,0 +1,22 @@
+name: Feature request
+description: An idea for voxely
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you're trying to do
+      description: The task or model you're working on, and what gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: How you picture it working. If MagicaVoxel or another tool does it, say how.
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to build this myself (we'll agree on the approach in this issue first)

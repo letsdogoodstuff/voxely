@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=voxely
+GenericName=Voxel Editor
+Comment=Voxel editor and path tracer
+Exec=voxely %f
+Icon=voxely
+Terminal=false
+Categories=Graphics;3DGraphics;
+MimeType=application/x-vox;

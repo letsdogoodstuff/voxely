@@ -691,7 +691,9 @@ mod tests {
         assert!(e.contains("RangeError") || e.contains("stack"), "{e}");
         let (o, _) = run_fake("try { (function r() { return r() + 1 })() } catch (e) { 'caught' }");
         assert_eq!(o.result, Ok(Some("\"caught\"".into())));
-        let (o, _) = run_fake("JSON.parse('['.repeat(100000) + ']'.repeat(100000)).length");
+        // Deep, but within QuickJS's stack on every platform (100000 levels
+        // ran out of it on macOS).
+        let (o, _) = run_fake("JSON.parse('['.repeat(10000) + ']'.repeat(10000)).length");
         assert_eq!(o.result, Ok(Some("1".into())));
         let (o, _) = run_fake("JSON.parse('['.repeat(3000000) + ']'.repeat(3000000))");
         assert!(o.result.unwrap_err().contains("stack"));

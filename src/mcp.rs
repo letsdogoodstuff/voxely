@@ -4,7 +4,6 @@
 //! a headless session in this process.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -72,8 +71,7 @@ impl BuildCheck {
     /// A note for this call's reply from the window, if any: Some on the
     /// first call to a new window, and on errors while something is stale.
     fn window_note(&mut self, is_error: bool) -> Option<String> {
-        use std::os::unix::fs::MetadataExt;
-        let inode = std::fs::metadata(socket_path()).ok().map(|m| m.ino());
+        let inode = crate::ipc::file_id(&socket_path());
         let fresh = inode != self.socket;
         if fresh {
             self.socket = inode;
@@ -84,7 +82,7 @@ impl BuildCheck {
     }
 
     fn hello(&self) -> Option<String> {
-        let stream = UnixStream::connect(socket_path()).ok()?;
+        let stream = crate::ipc::Stream::connect(socket_path()).ok()?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
         let mut writer = stream.try_clone().ok()?;
         writeln!(writer, "{}", json!({ "hello": true })).ok()?;
@@ -253,7 +251,7 @@ pub(crate) fn call_guarded(ctx: &mut Ctx, name: &str, args: &Value) -> Value {
 
 /// Send a tool call to the open window. None if no window is listening.
 pub(crate) fn call_live(name: &str, args: &Value) -> Option<Result<Value>> {
-    let stream = UnixStream::connect(socket_path()).ok()?;
+    let stream = crate::ipc::Stream::connect(socket_path()).ok()?;
     Some((|| {
         let mut writer = stream.try_clone()?;
         writeln!(writer, "{}", json!({ "tool": name, "args": args, "detach": true }))?;

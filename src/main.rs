@@ -1,3 +1,6 @@
+// Windows release builds are GUI programs: no console window opens behind
+// the editor. Started from a console, they print to it (see attach_console).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 #![recursion_limit = "512"]
 mod agents;
 mod anim;
@@ -12,6 +15,7 @@ mod gizmo;
 mod gltf;
 mod gltf_import;
 mod gpu;
+mod ipc;
 mod import;
 mod layers;
 mod grid;
@@ -43,13 +47,16 @@ use gpu::Renderer;
 use scene::Scene;
 
 const USAGE: &str = "\
-usage: voxely <model.vox> [options]
+usage: voxely [<model.vox>] [options]
+                        with no model: the newest project in the workspace
        voxely --new [<w>x<h>x<d>] [options]
        voxely mcp [--headless] [--assets <MagicaVoxel folder>]
                         MCP server on stdio for agents; drives the open
                         window if there is one, otherwise runs headless
        voxely script <file.js> [--headless] [-- <args>...]
                         run a JavaScript script (see `voxely script --help`)
+       voxely update        install the latest release now (release builds)
+       voxely --version
 
   --new [size]         start from a solid block (default 40x40x40)
   --out <file.vox>     where Ctrl+S saves (default export/<name>.vox)
@@ -295,6 +302,19 @@ fn parse_args() -> Result<Args> {
         },
     };
     Ok(args)
+}
+
+/// A GUI program on Windows has no console; when one started it (a command
+/// line, not Explorer) and its output isn't redirected, print there.
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: plain Win32 calls with no pointers passed in.
+    unsafe {
+        if GetStdHandle(STD_OUTPUT_HANDLE).is_null() {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
 }
 
 /// The most recently changed `.vox` in the workspace.
@@ -597,9 +617,18 @@ fn list_ibl(model: &Path, current: Option<&PathBuf>) -> Vec<PathBuf> {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("voxely=info,wgpu=warn")).init();
+    #[cfg(windows)]
+    attach_console();
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|a| a == "--version" || a == "-V") {
+        println!("voxely {}", update::VERSION);
+        return Ok(());
+    }
     if argv.first().is_some_and(|a| a == "mcp") {
         return mcp::run(&argv[1..]);
+    }
+    if argv.first().is_some_and(|a| a == "update") {
+        return update::cli();
     }
     if argv.first().is_some_and(|a| a == "script") {
         return script::cli(&argv[1..]);

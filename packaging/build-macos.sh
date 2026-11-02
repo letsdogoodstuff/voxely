@@ -26,16 +26,18 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 # Old enough for every Mac that runs Metal 2 through wgpu.
 export MACOSX_DEPLOYMENT_TARGET=11.0
+# Marks a release build: only these update themselves (src/update.rs).
+export VOXELY_RELEASE=1
 if $native; then
   cargo build --release --locked
-  cp target/release/voxely "$app/Contents/MacOS/voxely"
+  cp "${CARGO_TARGET_DIR:-target}/release/voxely" "$app/Contents/MacOS/voxely"
 else
   for t in aarch64-apple-darwin x86_64-apple-darwin; do
     rustup target add "$t" >/dev/null 2>&1 || true
     cargo build --release --locked --target "$t"
   done
   lipo -create -output "$app/Contents/MacOS/voxely" \
-    target/aarch64-apple-darwin/release/voxely target/x86_64-apple-darwin/release/voxely
+    "${CARGO_TARGET_DIR:-target}/aarch64-apple-darwin/release/voxely" "${CARGO_TARGET_DIR:-target}/x86_64-apple-darwin/release/voxely"
 fi
 
 cp packaging/voxely.icns "$app/Contents/Resources/voxely.icns"

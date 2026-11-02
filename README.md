@@ -1,39 +1,77 @@
 # voxely
 
-A MagicaVoxel-style voxel editor and path tracer in Rust and wgpu.
+A MagicaVoxel-style voxel editor and path tracer, written in Rust on wgpu, that AI agents can drive
+too.
 
-## Install (macOS)
+- Model in MagicaVoxel's layout and hotkeys, with its `.vox` files (parts, groups, layers and
+  animation round-trip).
+- Render with a built-in path tracer: materials (metal, glass, emissive, clouds), sky, fog, depth
+  of field, denoising.
+- Build scenes from parts with pivots, sockets and attachments, then animate them: keyframes,
+  flipbook drawings, ready-made rigs and motions, and imported glTF clips.
+- Import other voxel formats, meshes, heightmaps and pictures; export glTF for game engines, plus
+  MagicaVoxel's formats.
+- Let Claude Code, Codex or any [MCP](https://modelcontextprotocol.io) client build with you in
+  the open window, or script it in JavaScript.
 
-Download `voxely-<version>-macos.dmg` from the
-[latest release](https://github.com/letsdogoodstuff/voxely/releases/latest), open it and drag
-voxely to Applications. It runs on macOS 11 or later, Apple Silicon and Intel.
+## Install
 
-Until releases are signed with an Apple Developer ID, macOS asks before the first launch:
-open voxely once, then in System Settings > Privacy & Security click **Open Anyway** (or run
-`xattr -dr com.apple.quarantine /Applications/voxely.app`).
+Download the file for your computer from the
+[latest release](https://github.com/letsdogoodstuff/voxely/releases/latest). voxely needs a GPU
+with Metal (macOS), Vulkan (Linux) or Direct3D 12 / Vulkan (Windows).
 
-voxely checks GitHub for a new release when it starts and once a day, installs it in the
-background and shows **Restart for voxely x.y.z** in the status bar. Turn it off, or check now,
-in Preferences.
+| | Download | Then |
+|---|---|---|
+| **macOS** 11+, Apple Silicon or Intel | `voxely-<version>-macos.dmg` | Open it and drag voxely to Applications. |
+| **Windows** 10+, x64 | `voxely-<version>-windows-x86_64.zip` | Unzip it somewhere you can write to (your user folder, not Program Files) and run `voxely\voxely.exe`. |
+| **Linux** x64, glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 36+) | `voxely-<version>-linux-x86_64.tar.gz` | Unpack it and run `./install.sh`, which puts voxely in `~/.local/bin` and your app menu (`./install.sh --uninstall` removes it). Or run `./voxely` from the folder. |
 
-### Releasing
+Releases aren't code-signed yet, so the first launch asks for permission:
 
-Bump `version` in `Cargo.toml`, commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
-The Release workflow builds a universal app (`packaging/build-macos.sh`) and publishes the
-disk image; its comments list the secrets that turn on Developer ID signing and notarization.
-`packaging/build-macos.sh --native` builds `dist/` locally.
+- **macOS**: open voxely once, then click **Open Anyway** in System Settings > Privacy & Security
+  (or run `xattr -dr com.apple.quarantine /Applications/voxely.app`).
+- **Windows**: SmartScreen says it protected your PC; click **More info**, then **Run anyway**.
 
-## Building
+### Updates
+
+voxely checks GitHub for a new release when it starts and once a day. It downloads it in the
+background, checks it against GitHub's checksum, puts it in place of the installed copy and shows
+**Restart for voxely x.y.z** in the status bar. Turn this off, or check now, in Preferences.
+`voxely update` installs the latest release from a terminal, and `voxely --version` prints the
+version. A copy that can't replace itself (still on the disk image, or in a folder you can't write
+to) links to the release page instead. Builds from source never update themselves.
+
+## Getting started
+
+Open voxely (from Applications on macOS, `voxely.exe` on Windows, the app menu on Linux). It opens your newest project, or
+a new one. Projects live in `~/Documents/voxely` (see [Projects](#projects)).
+
+**Ctrl+K** (Cmd+K on macOS) opens the command palette: type a few letters of any command, project,
+sample or export format, arrow to it and press Enter. **Preferences** (top right) sets the interface
+scale, autosave and updates. `voxely --help` lists every option and hotkey.
+
+From a terminal:
 
 ```sh
-cargo build --release
-./target/release/voxely path/to/model.vox     # open a model
-./target/release/voxely --new                 # start from a 40x40x40 block
-./target/release/voxely --help                # all options and controls
+voxely path/to/model.vox     # open a model
+voxely --new                 # start from a 40x40x40 block
+voxely --help                # all options and controls
 ```
 
-**Ctrl+K** (Cmd+K on macOS) opens the command palette: type a few letters of any command,
-project, sample or export format, arrow to it and press Enter. `voxely --help` lists the hotkeys.
+## Building from source
+
+You need [Rust](https://rustup.rs) (stable) and a C compiler: Xcode's command line tools on macOS,
+`build-essential` (or your distribution's equivalent) on Linux, and the Visual Studio C++ build
+tools on Windows.
+
+```sh
+git clone https://github.com/letsdogoodstuff/voxely
+cd voxely
+cargo build --release
+./target/release/voxely
+```
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers tests, pull requests and making releases.
 
 ## Driving voxely from an agent (MCP)
 
@@ -62,14 +100,28 @@ Click **Agents** in the bottom bar to open the Agents panel under the 3D view:
 There is no server to start or stop: agents launch `voxely mcp` themselves for each session.
 Agent edits go through normal undo, so Cmd+Z steps back through them.
 
+### Where voxely is
+
+The easiest setup is the Agents panel's buttons, which fill in this copy's path. By hand, the
+program is:
+
+| Installed from | Path |
+|---|---|
+| macOS app | `/Applications/voxely.app/Contents/MacOS/voxely` |
+| Linux `install.sh` | `~/.local/bin/voxely` |
+| Windows zip | where you unzipped it, e.g. `C:\Users\you\voxely\voxely.exe` |
+| A source build | `target/release/voxely` in your clone |
+
+Updates replace the program in place, so the path keeps working.
+
 ### Claude Code
 
-This repo's `.mcp.json` registers the server for Claude Code sessions started here
-(build first with `cargo build --release`). To use it from anywhere:
-
 ```sh
-claude mcp add voxely -- /path/to/voxely/target/release/voxely mcp
+claude mcp add --scope user voxely -- /Applications/voxely.app/Contents/MacOS/voxely mcp
 ```
+
+In a clone of this repo, `.mcp.json` already registers `./target/release/voxely` for Claude Code
+sessions started there (build it first with `cargo build --release`).
 
 ### Codex
 
@@ -77,7 +129,7 @@ Add to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.voxely]
-command = "/path/to/voxely/target/release/voxely"
+command = "/Applications/voxely.app/Contents/MacOS/voxely"
 args = ["mcp"]
 ```
 
@@ -93,6 +145,7 @@ Options:
 ### Projects
 
 Projects live in a workspace folder, `~/Documents/voxely` (set `VOXELY_WORKSPACE` to change it).
+Opened without a model, voxely opens the newest project there.
 The window's Project column lists them under **My projects**, above MagicaVoxel's **Samples**, and
 re-reads the folder every second, so projects an agent creates show up while you watch. Ctrl+S saves
 the current project there; opening a sample and saving makes a copy, leaving the original alone.
@@ -134,9 +187,9 @@ their pinned scale. Agents' screenshots leave it out.
 | Projects | `new_project`, `list_projects`, `open_project`, `save_file` |
 | Animation | `set_animation`, `go_to_frame`, `play` (plays it in the window), `set_keyframe`, `delete_keyframe`, `new_drawing`, `remove_drawing`, `frame_strip` (several frames in one image) |
 | Rigs | `create_rig` (humanoid, quadruped), `apply_motion` (idle, walk, run, jump, attack, wave, death, quad_walk, quad_idle), `import_animation` (glTF clips) |
-| Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup, detach), `group_parts` |
+| Parts | `list_parts`, `create_part`, `edit_part` (or `"world"`), `transform_part` (move, 90° rotate, flip, free rotation, attach), `set_pivot`, `set_socket`, `modify_part` (rename, duplicate, delete, hide, show, ungroup, detach), `group_parts`, `drop_part` (settle parts onto what's below them), `set_layer` (MagicaVoxel layers) |
 | Scene | `get_scene_info`, `new_scene`, `open_file`, `import_file` (other voxel formats, meshes, heightmaps, slice sheets, pictures; as parts or a new project), `resize_canvas` |
-| Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid, frustum, torus, capsule, rounded_box, wedge; any `rotation`), `draw_line`, `draw_tube` (curves with tapering radius), `extrude_polygon`, `set_symmetry` (mirror every edit) |
+| Drawing | `set_voxels`, `fill_box`, `draw_shape` (box, ellipsoid, cylinder, cone, pyramid, frustum, torus, capsule, rounded_box, wedge; any `rotation`), `draw_line`, `draw_tube` (curves with tapering radius), `extrude_polygon`, `project_pattern` (a pixel pattern wrapped onto a surface: faces, emblems, carved holes), `set_symmetry` (mirror every edit) |
 | Stamps | `save_stamp`, `list_stamps`, `place_stamp`, `delete_stamp` (reusable pieces saved in `<workspace>/stamps`) |
 | Surface | `vary_colors` (noise/dither color variation) and `shade_edges` (edge darkening, highlights, cavity AO), both callable by name but not listed to agents since they fight the flat house style; `paint_faces` (snow on top, moss on north faces …), `voxelize_image` |
 | Reading | `get_voxels`, `get_slice` (text maps of one or more layers), `get_projection` (color/height map seen along an axis) |
@@ -145,7 +198,7 @@ their pinned scale. Agents' screenshots leave it out.
 | Guidance | `get_guide` (voxel-art craft notes by topic); MCP prompts `build_from_reference`, `build_character`, `build_prop`, `build_environment`, `review_model` (each takes one free-text request) |
 | Model tools | `edit_model` (MagicaVoxel's Edit panel: fill, hull, mirror, rotate, …), `transform_model` (scale/shear/rotate/repeat) |
 | Shaders | `list_shaders`, `run_shader` (MagicaVoxel voxel shaders, or inline GLSL) |
-| Color | `get_palette`, `set_palette_colors`, `load_palette`, `list_palette_presets`, `apply_palette_preset` (PICO-8, DawnBringer, Endesga …), `set_material` (metal, glass, emit, …) |
+| Color | `get_palette`, `set_palette_colors`, `load_palette`, `edit_palette` (swap, move, copy, gradient, sort, pack, save, name ramps), `list_palette_presets`, `apply_palette_preset` (PICO-8, DawnBringer, Endesga …), `set_material` (metal, glass, emit, …) |
 | Selection | `select`, `move_selection` |
 | History | `undo`, `redo` |
 | Viewing | `set_camera`, `screenshot` (fast modeler image; `views: "quad"` for front/side/top/3-4 with rulers and gizmo, `highlight_last_edit`), `set_render_settings`, `render` (path traced), `set_view_mode` |
@@ -265,7 +318,8 @@ voxely script --types > voxely.d.ts    # TypeScript declarations for editor auto
   (`--timeout <s>`, or `timeout` on `run_script`).
 - **Agents:** the `run_script` MCP tool runs a script in one call (`source` or `path`, plus `args`).
 - **Several windows:** the newest window takes the control socket. Set `VOXELY_SOCKET` to a path for
-  a window and for the `voxely script` / `voxely mcp` that should drive it, to keep them apart.
+  a window and for the `voxely script` / `voxely mcp` that should drive it, to keep them apart
+  (keep the path short: sockets allow about 100 characters).
 
 ## glTF export
 
@@ -296,3 +350,13 @@ Name the file `.gltf` instead to get readable JSON with the data embedded.
 
 Exports pass the Khronos glTF Validator with no errors or warnings (it can't yet check
 `KHR_materials_diffuse_transmission`, which is newer than the validator).
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to
+build, test and send changes, and [SECURITY.md](SECURITY.md) for reporting a vulnerability.
+
+## License
+
+voxely is free software under the [GNU General Public License v3.0](LICENSE). Contributions are
+accepted under the same license.

@@ -1,0 +1,48 @@
+# Every pull request and push to main: build, lint and test on Linux, macOS
+# and Windows.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # No GPU on the runners: Mesa's software Vulkan runs the GPU tests.
+      - name: Software Vulkan (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+
+      # Warnings show on the run but don't fail it yet: older code has some
+      # (about 100). New code shouldn't add more.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets
+
+      - name: Tests
+        if: runner.os != 'Windows'
+        run: cargo test --locked
+
+      # Windows runners have no GPU that wgpu is sure to find; skip the GPU
+      # tests there (Linux and macOS run them).
+      - name: Tests (no GPU)
+        if: runner.os == 'Windows'
+        run: cargo test --locked -- --skip gpu

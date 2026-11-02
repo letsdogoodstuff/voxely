@@ -1,8 +1,9 @@
-# Push a tag like v0.2.0 (matching Cargo.toml's version) to build the macOS
-# app and publish it as a GitHub release. Installed apps find it through
-# the releases API and update themselves (src/update.rs).
+# Push a tag like v0.2.0 (matching Cargo.toml's version) to build voxely for
+# macOS, Linux and Windows and publish them as one GitHub release. Installed
+# copies find it through the releases API and update themselves
+# (src/update.rs), so the release is only published once every build is in.
 #
-# Optional secrets, for a signed and notarized app (without them the app is
+# Optional secrets, for a signed and notarized macOS app (without them it is
 # ad-hoc signed and Gatekeeper asks before the first launch):
 #   MACOS_CERT_P12        base64 of a "Developer ID Application" .p12
 #   MACOS_CERT_PASSWORD   its password
@@ -18,8 +19,21 @@ permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml's version is $v"
+            exit 1
+          fi
+
   macos:
-    runs-on: macos-14
+    needs: check
+    runs-on: macos-latest
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -29,21 +43,10 @@ jobs:
       VOXELY_NOTARY_PASSWORD: ${{ secrets.VOXELY_NOTARY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Tag matches Cargo.toml
-        run: |
-          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml's version is $v"
-            exit 1
-          fi
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-
       - uses: Swatinem/rust-cache@v2
-
       - name: Signing certificate
         if: env.MACOS_CERT_P12 != ''
         run: |
@@ -57,11 +60,59 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc"
           security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
           rm "$RUNNER_TEMP/cert.p12"
-
       - name: Build the app and disk image
         run: packaging/build-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.dmg
 
+  linux:
+    needs: check
+    runs-on: ubuntu-latest
+    # Built on Ubuntu 22.04: the program runs on Linux with its glibc (2.35)
+    # or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+).
+    container: ubuntu:22.04
+    steps:
+      - name: Build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y curl build-essential
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Build the archive
+        run: packaging/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the zip
+        shell: pwsh
+        run: packaging/build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+
+  publish:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.dmg --title "voxely ${GITHUB_REF_NAME#v}" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "voxely ${GITHUB_REF_NAME#v}" --generate-notes
