@@ -2133,6 +2133,7 @@ pub fn build_ui(
     if ui::preferences_window(ui.ctx(), &mut ed.prefs_open, &mut ed.prefs, ed.ui_scale, &mut autosave) {
         ed.tools.inspect.set_autosave_config(autosave.0, autosave.1);
         (ed.prefs.autosave, ed.prefs.autosave_every) = autosave;
+        crate::update::set_enabled(ed.prefs.check_updates);
         ed.prefs.save();
     }
     crate::palette_lib::window(ui.ctx(), scene, ed, cmds);

@@ -2,6 +2,29 @@
 
 A MagicaVoxel-style voxel editor and path tracer in Rust and wgpu.
 
+## Install (macOS)
+
+Download `voxely-<version>-macos.dmg` from the
+[latest release](https://github.com/letsdogoodstuff/voxely/releases/latest), open it and drag
+voxely to Applications. It runs on macOS 11 or later, Apple Silicon and Intel.
+
+Until releases are signed with an Apple Developer ID, macOS asks before the first launch:
+open voxely once, then in System Settings > Privacy & Security click **Open Anyway** (or run
+`xattr -dr com.apple.quarantine /Applications/voxely.app`).
+
+voxely checks GitHub for a new release when it starts and once a day, installs it in the
+background and shows **Restart for voxely x.y.z** in the status bar. Turn it off, or check now,
+in Preferences.
+
+### Releasing
+
+Bump `version` in `Cargo.toml`, commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+The Release workflow builds a universal app (`packaging/build-macos.sh`) and publishes the
+disk image; its comments list the secrets that turn on Developer ID signing and notarization.
+`packaging/build-macos.sh --native` builds `dist/` locally.
+
+## Building
+
 ```sh
 cargo build --release
 ./target/release/voxely path/to/model.vox     # open a model

@@ -29,6 +29,7 @@ mod scene;
 mod script;
 mod timeline;
 mod ui;
+mod update;
 mod vox;
 mod world;
 mod xs;
@@ -273,6 +274,8 @@ fn parse_args() -> Result<Args> {
                 println!("{USAGE}");
                 std::process::exit(0);
             }
+            // macOS once passed a process serial number to apps.
+            _ if a.starts_with("-psn_") => {}
             _ if a.starts_with("--") => bail!("unknown option {a}\n\n{USAGE}"),
             _ if model.is_some() => bail!("more than one model given ({} and {a})", model.unwrap_or_default().display()),
             _ => model = Some(PathBuf::from(a)),
@@ -281,9 +284,22 @@ fn parse_args() -> Result<Args> {
     args.model = match (model, args.new) {
         (Some(m), _) => m,
         (None, Some(_)) => PathBuf::from("project.vox"),
-        (None, None) => bail!("{USAGE}"),
+        // Opened from the Finder or the Dock: the newest project in the
+        // workspace, or a new one.
+        (None, None) => match newest_project() {
+            Some(m) => m,
+            None => {
+                args.new = Some(glam::IVec3::splat(40));
+                PathBuf::from("project.vox")
+            }
+        },
     };
     Ok(args)
+}
+
+/// The most recently changed `.vox` in the workspace.
+fn newest_project() -> Option<PathBuf> {
+    app::list_vox(&app::workspace_dir()).into_iter().max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
 /// Environment images: the `ibl` folder next to the model's `vox` folder
@@ -603,6 +619,7 @@ fn main() -> Result<()> {
     let save_path = args.out.clone().unwrap_or_else(|| app::default_save_path(source.as_deref()));
     println!("Ctrl+S saves to {}", save_path.display());
     let panel = ui::PanelState { ibl_files: list_ibl(&args.model, scene.settings.ibl_path.as_ref()) };
+    update::set_enabled(prefs::Prefs::load().check_updates);
     let event_loop = EventLoop::<app::UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     // Agents connect through `voxely mcp`, which talks to this socket.
@@ -610,6 +627,9 @@ fn main() -> Result<()> {
     let mut app = app::App::new(scene, panel, source, save_path);
     let result = event_loop.run_app(&mut app);
     app::release_control(control);
+    if result.is_ok() {
+        update::relaunch_if_asked();
+    }
     result?;
     Ok(())
 }

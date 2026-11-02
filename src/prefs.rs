@@ -25,11 +25,13 @@ pub struct Prefs {
     /// Save the project after every `autosave_every` edits.
     pub autosave: bool,
     pub autosave_every: usize,
+    /// Look for new releases on GitHub and install them (the macOS app).
+    pub check_updates: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { ui_scale: 1.0, palette_favorites: Vec::new(), autosave: true, autosave_every: 25 }
+        Prefs { ui_scale: 1.0, palette_favorites: Vec::new(), autosave: true, autosave_every: 25, check_updates: true }
     }
 }
 
@@ -69,6 +71,9 @@ impl Prefs {
             if let Some(on) = v["autosave"].as_bool() {
                 p.autosave = on;
             }
+            if let Some(on) = v["check_updates"].as_bool() {
+                p.check_updates = on;
+            }
             if let Some(n) = v["autosave_every"].as_u64() {
                 p.autosave_every = n.clamp(1, 100_000) as usize;
             }
@@ -78,7 +83,7 @@ impl Prefs {
 
     pub fn save(&self) {
         let Some(path) = Self::path() else { return };
-        let text = serde_json::to_string_pretty(&json!({ "ui_scale": self.ui_scale, "palette_favorites": self.palette_favorites, "autosave": self.autosave, "autosave_every": self.autosave_every })).unwrap_or_default();
+        let text = serde_json::to_string_pretty(&json!({ "ui_scale": self.ui_scale, "palette_favorites": self.palette_favorites, "autosave": self.autosave, "autosave_every": self.autosave_every, "check_updates": self.check_updates })).unwrap_or_default();
         let res = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, text));
         if let Err(e) = res {
             eprintln!("saving preferences to {}: {e}", path.display());

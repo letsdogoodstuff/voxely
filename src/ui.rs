@@ -707,6 +707,15 @@ pub fn preferences_window(ctx: &egui::Context, open: &mut bool, prefs: &mut crat
             ui.label("edits");
         });
         ui.label(egui::RichText::new("Counts your edits and agents' alike; saves to the project's file").weak().small());
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Updates").strong());
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut prefs.check_updates, "Install new versions automatically");
+            if ui.small_button("Check now").clicked() {
+                crate::update::check_now();
+            }
+        });
+        ui.label(egui::RichText::new(crate::update::describe()).weak().small());
     });
     (prefs.clone(), *autosave) != before
 }
@@ -783,6 +792,10 @@ pub fn status_bar(ui: &mut Ui, s: Status, cmds: &mut Vec<Command>) -> bool {
         ui.separator();
         ui.toggle_value(s.timeline, "Anim").on_hover_text("Animation timeline");
         crate::agents::badge(ui, s.agent);
+        if crate::update::badge(ui) {
+            crate::update::request_relaunch();
+            cmds.push(Command::Quit);
+        }
         ui.separator();
         if s.notice.as_ref().is_some_and(|n| !n.error && n.at.elapsed().as_secs() >= NOTICE_SECS) {
             *s.notice = None;

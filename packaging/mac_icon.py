@@ -1,9 +1,11 @@
-# Usage: python3 packaging/mac_icon.py packaging/icon-source.png assets/icon.png
+# Usage: python3 packaging/mac_icon.py <source.png> <out.png> [size, default 512]
+# packaging/make-icons.sh runs it for assets/icon.png and packaging/voxely.icns.
 # macOS (Big Sur+) app icon: art on an 824/1024 rounded square
 # (superellipse, like Apple's continuous corners) with a soft shadow.
 import sys
 from PIL import Image, ImageDraw, ImageFilter
 src, out = sys.argv[1], sys.argv[2]
+size = int(sys.argv[3]) if len(sys.argv) > 3 else 512
 C, T, SS = 1024, 824, 4            # canvas, tile, supersampling
 off = (C - T) // 2
 n = 5.0                            # superellipse exponent
@@ -27,4 +29,4 @@ shadow = Image.new("RGBA", (C, C), (0, 0, 0, 0))
 shadow.paste(Image.new("RGBA", (T, T), (0, 0, 0, 90)), (off, off + 12), mask)
 canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(14)))
 canvas.alpha_composite(tile, (off, off))
-canvas.resize((512, 512), Image.LANCZOS).save(out, optimize=True)
+canvas.resize((size, size), Image.LANCZOS).save(out, optimize=True)

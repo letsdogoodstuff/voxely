@@ -1,0 +1,67 @@
+# Push a tag like v0.2.0 (matching Cargo.toml's version) to build the macOS
+# app and publish it as a GitHub release. Installed apps find it through
+# the releases API and update themselves (src/update.rs).
+#
+# Optional secrets, for a signed and notarized app (without them the app is
+# ad-hoc signed and Gatekeeper asks before the first launch):
+#   MACOS_CERT_P12        base64 of a "Developer ID Application" .p12
+#   MACOS_CERT_PASSWORD   its password
+#   VOXELY_SIGN_IDENTITY  e.g. "Developer ID Application: Name (TEAMID)"
+#   VOXELY_NOTARY_APPLE_ID, VOXELY_NOTARY_TEAM_ID, VOXELY_NOTARY_PASSWORD
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      VOXELY_SIGN_IDENTITY: ${{ secrets.VOXELY_SIGN_IDENTITY }}
+      VOXELY_NOTARY_APPLE_ID: ${{ secrets.VOXELY_NOTARY_APPLE_ID }}
+      VOXELY_NOTARY_TEAM_ID: ${{ secrets.VOXELY_NOTARY_TEAM_ID }}
+      VOXELY_NOTARY_PASSWORD: ${{ secrets.VOXELY_NOTARY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml's version is $v"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          kc="$RUNNER_TEMP/build.keychain-db"
+          pw=$(uuidgen)
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc"
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Build the app and disk image
+        run: packaging/build-macos.sh
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.dmg --title "voxely ${GITHUB_REF_NAME#v}" --generate-notes
