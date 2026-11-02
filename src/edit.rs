@@ -1450,7 +1450,14 @@ impl Editor {
         let cell = match marquee {
             Some(MarqueeMode::Box) => hit.and_then(|h| target(Tool::Paint, h)).or_else(|| plane_cell(ro, rd, axis, anchor[axis])),
             Some(_) => hit.and_then(|h| target(Tool::Paint, h)),
-            None if planar => plane_cell(ro, rd, axis, anchor[axis]),
+            // The press ray meets the attach plane at the layer's middle,
+            // which on a slanted view can be a cell beside the one placed;
+            // until the cursor leaves that cell, stay on the placed voxel.
+            None if planar => {
+                let (ro0, rd0) = self.stroke.as_ref().unwrap().ray0;
+                let c = plane_cell(ro, rd, axis, anchor[axis]);
+                if c.is_some() && c == plane_cell(ro0, rd0, axis, anchor[axis]) { Some(anchor) } else { c }
+            }
             None if boxed => hit.and_then(|h| target(self.tool, h)).or_else(|| plane_cell(ro, rd, axis, anchor[axis])),
             None => hit.and_then(|h| target(self.tool, h)),
         };
