@@ -2349,10 +2349,13 @@ impl App {
     }
 
     fn init(&mut self, el: &ActiveEventLoop) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        set_dock_icon();
         let window = Arc::new(
             el.create_window(
                 Window::default_attributes()
                     .with_title(format!("voxely — {}", self.edit.name()))
+                    .with_window_icon(window_icon())
                     .with_inner_size(winit::dpi::LogicalSize::new(1280, 800))
                     .with_min_inner_size(winit::dpi::LogicalSize::new(crate::prefs::MIN_WINDOW.0, crate::prefs::MIN_WINDOW.1)),
             )?,
@@ -3169,6 +3172,34 @@ impl ApplicationHandler<UserEvent> for App {
         if self.edit.quit {
             el.exit();
         }
+    }
+}
+
+
+/// The app icon: on the window (Windows, Linux) and in the Dock (macOS).
+const APP_ICON: &[u8] = include_bytes!("../assets/icon.png");
+
+fn window_icon() -> Option<winit::window::Icon> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(APP_ICON));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    winit::window::Icon::from_rgba(buf, info.width, info.height).ok()
+}
+
+/// macOS ignores window icons; an app run outside a bundle shows this in
+/// the Dock and app switcher instead.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let data = NSData::with_bytes(APP_ICON);
+    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
     }
 }
 

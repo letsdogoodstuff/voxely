@@ -25,3 +25,8 @@ trash = "5.2.9"
 wgpu = { version = "30.0.1", features = ["naga-ir"] }
 winit = "0.30.13"
 zune-jpeg = "0.5.15"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
